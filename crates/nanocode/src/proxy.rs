@@ -124,7 +124,8 @@ pub fn parse_proxy_response(
         };
         ordinal += 1;
         match parse_proxy_block(&block, &block_kind, tool_specs, ordinal) {
-            Ok(segment) => segments.push(segment),
+            Ok(Some(segment)) => segments.push(segment),
+            Ok(None) => {}
             Err(_) => segments.push(ProxySegment::Text(block)),
         }
         cursor = consumed_end;
@@ -140,6 +141,7 @@ pub fn parse_proxy_response(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProxyBlockKind {
     ToolCall,
+    ToolResult,
     DirectTool(String),
 }
 
@@ -148,7 +150,14 @@ fn find_next_proxy_block(
     cursor: usize,
     tool_specs: &[ToolSpec],
 ) -> Option<(usize, ProxyBlockKind)> {
-    let mut best = find_tag_start(text, cursor, "tool_call").map(|start| (start, ProxyBlockKind::ToolCall));
+    let mut best =
+        find_tag_start(text, cursor, "tool_call").map(|start| (start, ProxyBlockKind::ToolCall));
+    if let Some(start) = find_tag_start(text, cursor, "tool_result") {
+        match &best {
+            Some((best_start, _)) if *best_start <= start => {}
+            _ => best = Some((start, ProxyBlockKind::ToolResult)),
+        }
+    }
     for tool_spec in tool_specs {
         if let Some(start) = find_tag_start(text, cursor, &tool_spec.name) {
             let candidate = (start, ProxyBlockKind::DirectTool(tool_spec.name.to_string()));
@@ -184,6 +193,7 @@ fn recover_proxy_block(
 ) -> Option<(String, usize)> {
     let tag_name = match block_kind {
         ProxyBlockKind::ToolCall => "tool_call",
+        ProxyBlockKind::ToolResult => "tool_result",
         ProxyBlockKind::DirectTool(name) => name.as_str(),
     };
     recover_named_block(text, start, open_end, tag_name, tool_specs)
@@ -355,10 +365,13 @@ fn parse_proxy_block(
     block_kind: &ProxyBlockKind,
     tool_specs: &[ToolSpec],
     ordinal: usize,
-) -> Result<ProxySegment, String> {
+) -> Result<Option<ProxySegment>, String> {
     match block_kind {
-        ProxyBlockKind::ToolCall => parse_tool_call_block(block, tool_specs, ordinal),
-        ProxyBlockKind::DirectTool(name) => parse_direct_tool_block(block, name, tool_specs, ordinal),
+        ProxyBlockKind::ToolCall => parse_tool_call_block(block, tool_specs, ordinal).map(Some),
+        ProxyBlockKind::ToolResult => Ok(None),
+        ProxyBlockKind::DirectTool(name) => {
+            parse_direct_tool_block(block, name, tool_specs, ordinal).map(Some)
+        }
     }
 }
 
@@ -792,6 +805,20 @@ mod tests {
     }
 
     #[test]
+    fn recovers_tool_call_when_closing_tag_uses_slash_before_bracket() {
+        let text = "<tool_call name=\"write_file\">\n  <arg name=\"path\">test.md</arg>\n  <arg name=\"content\">hello</arg>\n</tool_call />";
+        let segments = parse_proxy_response(text, &specs()).expect("proxy response should parse");
+        assert_eq!(
+            segments,
+            vec![ProxySegment::ToolUse {
+                id: "proxy-tool-1".to_string(),
+                name: "write_file".to_string(),
+                input: json!({"path":"test.md","content":"hello"}).to_string(),
+            }]
+        );
+    }
+
+    #[test]
     fn recovers_tool_call_when_closing_tag_has_named_suffix() {
         let text =
             "<tool_call name=\"read_file\" id=\"proxy-tool-3\">\n  <arg name=\"path\">README.md</arg>\n</tool_call_Name>";
@@ -897,6 +924,23 @@ mod tests {
                 name: "read_file".to_string(),
                 input: json!({"path":"readme.md"}).to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn ignores_assistant_emitted_tool_result_blocks() {
+        let text = "<tool_call name=\"write_file\"><arg name=\"path\">test.md</arg><arg name=\"content\">hello</arg></tool_call><tool_result id=\"proxy-tool-1\" name=\"write_file\" error=\"false\">{\"path\":\"test.md\"}</tool_result>\nDone.";
+        let segments = parse_proxy_response(text, &specs()).expect("proxy response should parse");
+        assert_eq!(
+            segments,
+            vec![
+                ProxySegment::ToolUse {
+                    id: "proxy-tool-1".to_string(),
+                    name: "write_file".to_string(),
+                    input: json!({"path":"test.md","content":"hello"}).to_string(),
+                },
+                ProxySegment::Text("\nDone.".to_string()),
+            ]
         );
     }
 

@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "reqwest",
  "serde",
@@ -99,14 +99,14 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "commands"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "runtime",
 ]
 
 [[package]]
 name = "compat-harness"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "commands",
  "runtime",
@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "nanocode"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "api",
  "commands",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glob",
  "regex",
@@ -1056,7 +1056,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1431,7 +1431,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "reqwest",
  "runtime",
@@ -1723,6 +1723,15 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
+dependencies = [
+ "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.59.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets 0.52.6",
 ]
