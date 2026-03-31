@@ -1043,9 +1043,7 @@ fn nanocode_config_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
 mod tests {
     use api::ModelInfo;
 
-    use super::{
-        filtered_model_indices, toggle_favorite, update_output_token_cache, ModelState,
-    };
+    use super::{filtered_model_indices, toggle_favorite, update_output_token_cache, ModelState};
 
     #[test]
     fn toggles_favorite_membership() {

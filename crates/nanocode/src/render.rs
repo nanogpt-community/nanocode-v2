@@ -4,9 +4,9 @@ use std::thread;
 use std::time::Duration;
 
 use crossterm::cursor::MoveToColumn;
+use crossterm::execute;
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
 use crossterm::terminal::{Clear, ClearType};
-use crossterm::execute;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
@@ -81,7 +81,12 @@ impl Spinner {
         out: &mut impl Write,
     ) -> io::Result<()> {
         self.frame_index = 0;
-        execute!(out, SetForegroundColor(theme.spinner_done), Print(format!("\n✔ {label}\n")), ResetColor)?;
+        execute!(
+            out,
+            SetForegroundColor(theme.spinner_done),
+            Print(format!("\n✔ {label}\n")),
+            ResetColor
+        )?;
         out.flush()
     }
 
@@ -92,7 +97,12 @@ impl Spinner {
         out: &mut impl Write,
     ) -> io::Result<()> {
         self.frame_index = 0;
-        execute!(out, SetForegroundColor(theme.spinner_failed), Print(format!("\n✘ {label}\n")), ResetColor)?;
+        execute!(
+            out,
+            SetForegroundColor(theme.spinner_failed),
+            Print(format!("\n✘ {label}\n")),
+            ResetColor
+        )?;
         out.flush()
     }
 }

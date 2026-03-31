@@ -64,6 +64,12 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "mcp",
+        summary: "Inspect configured MCP servers or list exposed MCP tools",
+        argument_hint: Some("[status|tools|reload]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "permissions",
         summary: "Show or switch the active permission mode",
         argument_hint: Some("[read-only|workspace-write|danger-full-access]"),
@@ -105,6 +111,30 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         argument_hint: None,
         resume_supported: true,
     },
+    SlashCommandSpec {
+        name: "diff",
+        summary: "Show git diff for current workspace changes",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "version",
+        summary: "Show CLI version and build information",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "export",
+        summary: "Export the current conversation to a file",
+        argument_hint: Some("[file]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "session",
+        summary: "List or switch managed local sessions",
+        argument_hint: Some("[list|switch <session-id>]"),
+        resume_supported: false,
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,14 +142,36 @@ pub enum SlashCommand {
     Help,
     Status,
     Compact,
-    Model { model: Option<String> },
-    Permissions { mode: Option<String> },
-    Clear { confirm: bool },
+    Model {
+        model: Option<String>,
+    },
+    Mcp {
+        action: Option<String>,
+    },
+    Permissions {
+        mode: Option<String>,
+    },
+    Clear {
+        confirm: bool,
+    },
     Cost,
-    Resume { session_path: Option<String> },
-    Config { section: Option<String> },
+    Resume {
+        session_path: Option<String>,
+    },
+    Config {
+        section: Option<String>,
+    },
     Memory,
     Init,
+    Diff,
+    Version,
+    Export {
+        path: Option<String>,
+    },
+    Session {
+        action: Option<String>,
+        target: Option<String>,
+    },
     Unknown(String),
 }
 
@@ -140,6 +192,9 @@ impl SlashCommand {
             "model" => Self::Model {
                 model: parts.next().map(ToOwned::to_owned),
             },
+            "mcp" => Self::Mcp {
+                action: parts.next().map(ToOwned::to_owned),
+            },
             "permissions" => Self::Permissions {
                 mode: parts.next().map(ToOwned::to_owned),
             },
@@ -155,6 +210,15 @@ impl SlashCommand {
             },
             "memory" => Self::Memory,
             "init" => Self::Init,
+            "diff" => Self::Diff,
+            "version" => Self::Version,
+            "export" => Self::Export {
+                path: parts.next().map(ToOwned::to_owned),
+            },
+            "session" => Self::Session {
+                action: parts.next().map(ToOwned::to_owned),
+                target: parts.next().map(ToOwned::to_owned),
+            },
             other => Self::Unknown(other.to_string()),
         })
     }
@@ -228,6 +292,7 @@ pub fn handle_slash_command(
         }),
         SlashCommand::Status
         | SlashCommand::Model { .. }
+        | SlashCommand::Mcp { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Clear { .. }
         | SlashCommand::Cost
@@ -235,6 +300,10 @@ pub fn handle_slash_command(
         | SlashCommand::Config { .. }
         | SlashCommand::Memory
         | SlashCommand::Init
+        | SlashCommand::Diff
+        | SlashCommand::Version
+        | SlashCommand::Export { .. }
+        | SlashCommand::Session { .. }
         | SlashCommand::Unknown(_) => None,
     }
 }
@@ -294,6 +363,21 @@ mod tests {
         );
         assert_eq!(SlashCommand::parse("/memory"), Some(SlashCommand::Memory));
         assert_eq!(SlashCommand::parse("/init"), Some(SlashCommand::Init));
+        assert_eq!(SlashCommand::parse("/diff"), Some(SlashCommand::Diff));
+        assert_eq!(SlashCommand::parse("/version"), Some(SlashCommand::Version));
+        assert_eq!(
+            SlashCommand::parse("/export notes.txt"),
+            Some(SlashCommand::Export {
+                path: Some("notes.txt".to_string())
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/session switch abc123"),
+            Some(SlashCommand::Session {
+                action: Some("switch".to_string()),
+                target: Some("abc123".to_string())
+            })
+        );
     }
 
     #[test]
@@ -304,6 +388,7 @@ mod tests {
         assert!(help.contains("/status"));
         assert!(help.contains("/compact"));
         assert!(help.contains("/model [model]"));
+        assert!(help.contains("/mcp [status|tools|reload]"));
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
@@ -311,8 +396,12 @@ mod tests {
         assert!(help.contains("/config [env|hooks|model]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
-        assert_eq!(slash_command_specs().len(), 11);
-        assert_eq!(resume_supported_slash_commands().len(), 8);
+        assert!(help.contains("/diff"));
+        assert!(help.contains("/version"));
+        assert!(help.contains("/export [file]"));
+        assert!(help.contains("/session [list|switch <session-id>]"));
+        assert_eq!(slash_command_specs().len(), 16);
+        assert_eq!(resume_supported_slash_commands().len(), 11);
     }
 
     #[test]
@@ -383,6 +472,15 @@ mod tests {
         assert!(handle_slash_command("/config", &session, CompactionConfig::default()).is_none());
         assert!(
             handle_slash_command("/config env", &session, CompactionConfig::default()).is_none()
+        );
+        assert!(handle_slash_command("/diff", &session, CompactionConfig::default()).is_none());
+        assert!(handle_slash_command("/version", &session, CompactionConfig::default()).is_none());
+        assert!(
+            handle_slash_command("/export note.txt", &session, CompactionConfig::default())
+                .is_none()
+        );
+        assert!(
+            handle_slash_command("/session list", &session, CompactionConfig::default()).is_none()
         );
     }
 }

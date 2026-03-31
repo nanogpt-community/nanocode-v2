@@ -7,16 +7,19 @@ use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use api::{
-    ApiError, ChatCompletionAssistantMessage, ChatCompletionMessage, ChatCompletionRequest,
-    ChatCompletionResponse, ChatCompletionTool, ChatCompletionToolChoice, ContentBlockDelta,
-    InputContentBlock, InputMessage, MessageRequest, MessageResponse, NanoGptClient,
-    OutputContentBlock, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    resolve_api_key as resolve_nanogpt_api_key, ApiError, ChatCompletionAssistantMessage,
+    ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionTool,
+    ChatCompletionToolChoice, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
+    MessageResponse, NanoGptClient, OutputContentBlock, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use reqwest::header::{HeaderName, HeaderValue};
+use serde_json::Value as JsonValue;
 
 use commands::handle_slash_command;
 use compat_harness::{extract_manifest, UpstreamPaths};
@@ -27,13 +30,17 @@ use models::{
 };
 use proxy::{
     build_proxy_system_prompt, convert_messages_for_proxy, parse_proxy_response, parse_proxy_value,
-    ProxyCommand, ProxyMessage, ProxySegment,
+    ProxyCommand, ProxyMessage, ProxySegment, RuntimeToolSpec,
 };
 use render::{Spinner, TerminalRenderer};
 use runtime::{
-    load_system_prompt, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ContentBlock,
-    ConversationMessage, ConversationRuntime, MessageRole, PermissionMode, PermissionPolicy,
-    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    load_system_prompt, mcp_tool_name, spawn_mcp_stdio_process, ApiClient, ApiRequest,
+    AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
+    ConversationMessage, ConversationRuntime, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
+    McpClientAuth, McpClientBootstrap, McpClientTransport, McpInitializeClientInfo,
+    McpInitializeParams, McpListToolsParams, McpListToolsResult, McpToolCallParams,
+    McpToolCallResult, McpTransport, MessageRole, PermissionMode, PermissionPolicy, RuntimeError,
+    ScopedMcpServerConfig, Session, TokenUsage, ToolError, ToolExecutor,
 };
 use tools::{execute_tool, mvp_tool_specs};
 
@@ -42,6 +49,7 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 const DEFAULT_DATE: &str = "2026-03-31";
 const MAX_TOOL_PREVIEW_CHARS: usize = 4_000;
 const MAX_TOOL_PREVIEW_LINES: usize = 48;
+const MCP_DISCOVERY_TIMEOUT_SECS: u64 = 30;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
@@ -60,6 +68,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Model { model } => handle_model_action(model)?,
         CliAction::Provider { provider } => handle_provider_action(provider)?,
         CliAction::Proxy { mode } => handle_proxy_action(mode)?,
+        CliAction::Mcp { action } => handle_mcp_action(action)?,
         CliAction::ResumeSession {
             session_path,
             command,
@@ -90,6 +99,9 @@ enum CliAction {
     Proxy {
         mode: ProxyCommand,
     },
+    Mcp {
+        action: McpCommand,
+    },
     ResumeSession {
         session_path: PathBuf,
         command: Option<String>,
@@ -106,6 +118,39 @@ enum CliAction {
     },
     Help,
     Version,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpCommand {
+    Status,
+    Tools,
+    Reload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpServerStatus {
+    server_name: String,
+    scope: ConfigSource,
+    transport: McpTransport,
+    loaded: bool,
+    tool_count: usize,
+    note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpToolBinding {
+    exposed_name: String,
+    server_name: String,
+    upstream_name: String,
+    description: String,
+    input_schema: JsonValue,
+    config: ScopedMcpServerConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct McpCatalog {
+    servers: Vec<McpServerStatus>,
+    tools: Vec<McpToolBinding>,
 }
 
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
@@ -154,6 +199,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "model" | "models" => parse_model_args(&rest[1..]),
         "provider" | "providers" => parse_provider_args(&rest[1..]),
         "proxy" => parse_proxy_args(&rest[1..]),
+        "mcp" => parse_mcp_args(&rest[1..]),
         "prompt" => {
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
@@ -246,6 +292,23 @@ fn parse_proxy_args(args: &[String]) -> Result<CliAction, String> {
     Ok(CliAction::Proxy {
         mode: parse_proxy_value(args.first().map(String::as_str))?,
     })
+}
+
+fn parse_mcp_args(args: &[String]) -> Result<CliAction, String> {
+    if args.len() > 1 {
+        return Err("mcp accepts at most one optional argument".to_string());
+    }
+    let action = match args.first().map(String::as_str) {
+        None | Some("status") => McpCommand::Status,
+        Some("tools") => McpCommand::Tools,
+        Some("reload") => McpCommand::Reload,
+        Some(other) => {
+            return Err(format!(
+                "mcp accepts one optional argument: status, tools, or reload (got {other})"
+            ));
+        }
+    };
+    Ok(CliAction::Mcp { action })
 }
 
 fn parse_resume_args(args: &[String]) -> Result<CliAction, String> {
@@ -410,6 +473,21 @@ fn handle_proxy_action(mode: ProxyCommand) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+fn handle_mcp_action(action: McpCommand) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let catalog = load_mcp_catalog(&cwd)?;
+    match action {
+        McpCommand::Status | McpCommand::Reload => {
+            if matches!(action, McpCommand::Reload) {
+                println!("Reloaded MCP config from {}", cwd.display());
+            }
+            print_mcp_status(&catalog);
+        }
+        McpCommand::Tools => print_mcp_tools(&catalog),
+    }
+    Ok(())
+}
+
 fn resolve_api_key(api_key: Option<String>) -> Result<String, Box<dyn std::error::Error>> {
     match api_key {
         Some(api_key) if !api_key.trim().is_empty() => Ok(api_key),
@@ -510,6 +588,24 @@ fn parse_proxy_command(input: &str) -> Option<Result<ProxyCommand, String>> {
     ))
 }
 
+fn parse_mcp_command(input: &str) -> Option<Result<McpCommand, String>> {
+    let mut parts = input.split_whitespace();
+    let command = parts.next()?;
+    if command != "/mcp" {
+        return None;
+    }
+
+    let remainder = parts.collect::<Vec<_>>().join(" ");
+    Some(match remainder.trim() {
+        "" | "status" => Ok(McpCommand::Status),
+        "tools" => Ok(McpCommand::Tools),
+        "reload" => Ok(McpCommand::Reload),
+        other => Err(format!(
+            "/mcp accepts one optional argument: status, tools, or reload (got {other})"
+        )),
+    })
+}
+
 fn is_clear_provider_arg(value: &str) -> bool {
     matches!(value, "default" | "none" | "clear")
 }
@@ -572,6 +668,665 @@ fn read_secret_raw(out: &mut impl Write) -> io::Result<String> {
     }
 }
 
+fn base_runtime_tool_specs() -> Vec<RuntimeToolSpec> {
+    mvp_tool_specs()
+        .into_iter()
+        .map(RuntimeToolSpec::from)
+        .collect()
+}
+
+fn available_runtime_tool_specs(mcp_catalog: &McpCatalog) -> Vec<RuntimeToolSpec> {
+    let mut specs = base_runtime_tool_specs();
+    specs.extend(mcp_catalog.tool_specs());
+    specs
+}
+
+fn load_mcp_catalog(cwd: &Path) -> Result<McpCatalog, Box<dyn std::error::Error>> {
+    let config = ConfigLoader::default_for(cwd).load()?;
+    let mut catalog = McpCatalog::default();
+    let servers = configured_mcp_servers(&config)?;
+
+    for (server_name, scoped) in servers {
+        let mut status = McpServerStatus {
+            server_name: server_name.clone(),
+            scope: scoped.scope,
+            transport: scoped.transport(),
+            loaded: false,
+            tool_count: 0,
+            note: String::new(),
+        };
+
+        match scoped.transport() {
+            McpTransport::Stdio => match load_stdio_mcp_tools(&server_name, &scoped) {
+                Ok(tools) => {
+                    status.loaded = true;
+                    status.tool_count = tools.len();
+                    status.note = "stdio tools loaded".to_string();
+                    catalog.tools.extend(tools);
+                }
+                Err(error) => {
+                    status.note = format!("load failed: {error}");
+                }
+            },
+            McpTransport::Http => match load_http_mcp_tools(&server_name, &scoped) {
+                Ok(tools) => {
+                    status.loaded = true;
+                    status.tool_count = tools.len();
+                    status.note = "http tools loaded".to_string();
+                    catalog.tools.extend(tools);
+                }
+                Err(error) => {
+                    status.note = format!("load failed: {error}");
+                }
+            },
+            other => {
+                status.note = format!(
+                    "{:?} transport is configured but not executable in NanoCode yet",
+                    other
+                );
+            }
+        }
+
+        catalog.servers.push(status);
+    }
+
+    catalog
+        .servers
+        .sort_by(|left, right| left.server_name.cmp(&right.server_name));
+    catalog
+        .tools
+        .sort_by(|left, right| left.exposed_name.cmp(&right.exposed_name));
+
+    Ok(catalog)
+}
+
+fn configured_mcp_servers(
+    config: &runtime::RuntimeConfig,
+) -> Result<Vec<(String, ScopedMcpServerConfig)>, Box<dyn std::error::Error>> {
+    let mut servers = config
+        .mcp()
+        .servers()
+        .iter()
+        .map(|(name, scoped)| (name.clone(), scoped.clone()))
+        .collect::<Vec<_>>();
+
+    if !config.mcp().servers().contains_key("nanogpt") {
+        if let Some(server) = built_in_nanogpt_mcp_server()? {
+            servers.push(("nanogpt".to_string(), server));
+        }
+    }
+
+    servers.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(servers)
+}
+
+fn built_in_nanogpt_mcp_server() -> Result<Option<ScopedMcpServerConfig>, Box<dyn std::error::Error>>
+{
+    let api_key = match resolve_nanogpt_api_key() {
+        Ok(api_key) => api_key,
+        Err(ApiError::MissingApiKey) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+
+    let (command, args) = ensure_nanogpt_mcp_launcher()?;
+
+    let mut env = std::collections::BTreeMap::from([("NANOGPT_API_KEY".to_string(), api_key)]);
+    env.entry("NANOGPT_LOG_LEVEL".to_string())
+        .or_insert_with(|| "error".to_string());
+    for key in [
+        "NANOGPT_TIMEOUT_MS",
+        "NANOGPT_DEFAULT_MODEL",
+        "NANOGPT_BASE_URL",
+        "NANOGPT_AUTH_MODE",
+        "NANOGPT_MAX_RETRIES",
+    ] {
+        if let Ok(value) = env::var(key) {
+            if !value.is_empty() {
+                env.insert(key.to_string(), value);
+            }
+        }
+    }
+
+    let config = runtime::McpServerConfig::Stdio(runtime::McpStdioServerConfig {
+        command,
+        args,
+        env,
+        stderr: runtime::McpStdioStderrMode::Null,
+    });
+
+    Ok(Some(ScopedMcpServerConfig {
+        scope: ConfigSource::User,
+        config,
+    }))
+}
+
+fn ensure_nanogpt_mcp_launcher() -> Result<(String, Vec<String>), Box<dyn std::error::Error>> {
+    if let Some(path) = find_path_executable("nanogpt-mcp") {
+        return Ok(command_for_binary(&path));
+    }
+
+    let install_root = managed_nanogpt_mcp_root()?;
+    let binary = managed_nanogpt_mcp_binary_path(&install_root);
+    if !binary.exists() {
+        install_managed_nanogpt_mcp(&install_root)?;
+    }
+    if !binary.exists() {
+        return Err(format!(
+            "NanoGPT MCP launcher was not installed at {}",
+            binary.display()
+        )
+        .into());
+    }
+    Ok(command_for_binary(&binary))
+}
+
+fn managed_nanogpt_mcp_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let preferred = nanocode_config_home()?.join("mcp").join("nanogpt");
+    if fs::create_dir_all(&preferred).is_ok() {
+        return Ok(preferred);
+    }
+
+    let fallback = std::env::temp_dir().join("nanocode-mcp").join("nanogpt");
+    fs::create_dir_all(&fallback)?;
+    Ok(fallback)
+}
+
+fn managed_nanogpt_mcp_binary_path(root: &Path) -> PathBuf {
+    let binary_name = if cfg!(windows) {
+        "nanogpt-mcp.cmd"
+    } else {
+        "nanogpt-mcp"
+    };
+    root.join("node_modules").join(".bin").join(binary_name)
+}
+
+fn install_managed_nanogpt_mcp(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let npm_cache = std::env::temp_dir().join(format!(
+        "nanocode-npm-cache-install-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&npm_cache)?;
+
+    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
+    let output = Command::new(npm)
+        .arg("install")
+        .arg("--prefix")
+        .arg(root)
+        .arg("@nanogpt/mcp")
+        .env("npm_config_cache", &npm_cache)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr.trim();
+    if detail.is_empty() {
+        Err(format!("failed to install @nanogpt/mcp into {}", root.display()).into())
+    } else {
+        Err(format!("failed to install @nanogpt/mcp: {detail}").into())
+    }
+}
+
+fn find_path_executable(name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn command_for_binary(binary: &Path) -> (String, Vec<String>) {
+    if cfg!(windows) {
+        (
+            "cmd".to_string(),
+            vec!["/c".to_string(), binary.to_string_lossy().into_owned()],
+        )
+    } else {
+        (binary.to_string_lossy().into_owned(), Vec::new())
+    }
+}
+
+fn load_stdio_mcp_tools(
+    server_name: &str,
+    scoped: &ScopedMcpServerConfig,
+) -> Result<Vec<McpToolBinding>, Box<dyn std::error::Error>> {
+    let bootstrap = McpClientBootstrap::from_scoped_config(server_name, scoped);
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async move {
+        let mut process = spawn_mcp_stdio_process(&bootstrap)?;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(MCP_DISCOVERY_TIMEOUT_SECS),
+            async {
+                let initialize = process
+                    .initialize(
+                        JsonRpcId::Number(1),
+                        McpInitializeParams {
+                            protocol_version: "2025-03-26".to_string(),
+                            capabilities: serde_json::json!({"roots": {}}),
+                            client_info: McpInitializeClientInfo {
+                                name: "nanocode".to_string(),
+                                version: VERSION.to_string(),
+                            },
+                        },
+                    )
+                    .await?;
+                if let Some(error) = initialize.error {
+                    return Err::<Vec<McpToolBinding>, Box<dyn std::error::Error>>(
+                        format!("initialize failed: {}", error.message).into(),
+                    );
+                }
+                process.send_initialized_notification().await?;
+
+                let mut next_cursor = None;
+                let mut bindings = Vec::new();
+                let mut next_id = 2u64;
+                loop {
+                    let response = process
+                        .list_tools(
+                            JsonRpcId::Number(next_id),
+                            Some(McpListToolsParams {
+                                cursor: next_cursor.clone(),
+                            }),
+                        )
+                        .await?;
+                    next_id += 1;
+                    if let Some(error) = response.error {
+                        return Err(format!("tools/list failed: {}", error.message).into());
+                    }
+                    let Some(result) = response.result else {
+                        break;
+                    };
+                    for tool in result.tools {
+                        bindings.push(McpToolBinding {
+                            exposed_name: mcp_tool_name(server_name, &tool.name),
+                            server_name: server_name.to_string(),
+                            upstream_name: tool.name,
+                            description: tool.description.unwrap_or_else(|| "MCP tool".to_string()),
+                            input_schema: tool
+                                .input_schema
+                                .unwrap_or_else(|| serde_json::json!({"type":"object"})),
+                            config: scoped.clone(),
+                        });
+                    }
+                    if result.next_cursor.is_none() {
+                        break;
+                    }
+                    next_cursor = result.next_cursor;
+                }
+
+                Ok(bindings)
+            },
+        )
+        .await;
+        let _ = process.terminate().await;
+        let _ = process.wait().await;
+
+        match result {
+            Ok(result) => result,
+            Err(_) => Err::<Vec<McpToolBinding>, Box<dyn std::error::Error>>(
+                format!(
+                    "timed out after {}s during stdio MCP discovery",
+                    MCP_DISCOVERY_TIMEOUT_SECS
+                )
+                .into(),
+            ),
+        }
+    })
+}
+
+fn load_http_mcp_tools(
+    server_name: &str,
+    scoped: &ScopedMcpServerConfig,
+) -> Result<Vec<McpToolBinding>, Box<dyn std::error::Error>> {
+    let McpClientTransport::Http(transport) =
+        McpClientBootstrap::from_scoped_config(server_name, scoped).transport
+    else {
+        return Err("server is not an HTTP MCP transport".into());
+    };
+
+    if transport.headers_helper.is_some() {
+        return Err("headers_helper for remote MCP servers is not wired yet".into());
+    }
+    if transport.auth != McpClientAuth::None {
+        return Err("OAuth-backed remote MCP servers are not wired yet".into());
+    }
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let server_name = server_name.to_string();
+    let scoped = scoped.clone();
+    runtime.block_on(async move {
+        let initialize = http_jsonrpc_request::<JsonValue>(
+            &transport.url,
+            &transport.headers,
+            JsonRpcId::Number(1),
+            "initialize",
+            Some(serde_json::json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"roots": {}},
+                "clientInfo": {"name": "nanocode", "version": VERSION}
+            })),
+        )
+        .await?;
+        if let Some(error) = initialize.error {
+            return Err::<Vec<McpToolBinding>, Box<dyn std::error::Error>>(
+                format!("initialize failed: {}", error.message).into(),
+            );
+        }
+        http_jsonrpc_notification(
+            &transport.url,
+            &transport.headers,
+            "notifications/initialized",
+            Some(serde_json::json!({})),
+        )
+        .await?;
+
+        let mut next_cursor = None;
+        let mut bindings = Vec::new();
+        let mut next_id = 2_u64;
+        loop {
+            let response = http_jsonrpc_request::<McpListToolsResult>(
+                &transport.url,
+                &transport.headers,
+                JsonRpcId::Number(next_id),
+                "tools/list",
+                Some(serde_json::to_value(McpListToolsParams {
+                    cursor: next_cursor.clone(),
+                })?),
+            )
+            .await?;
+            next_id += 1;
+            if let Some(error) = response.error {
+                return Err(format!("tools/list failed: {}", error.message).into());
+            }
+            let Some(result) = response.result else {
+                break;
+            };
+            for tool in result.tools {
+                bindings.push(McpToolBinding {
+                    exposed_name: mcp_tool_name(&server_name, &tool.name),
+                    server_name: server_name.clone(),
+                    upstream_name: tool.name,
+                    description: tool.description.unwrap_or_else(|| "MCP tool".to_string()),
+                    input_schema: tool
+                        .input_schema
+                        .unwrap_or_else(|| serde_json::json!({"type":"object"})),
+                    config: scoped.clone(),
+                });
+            }
+            if result.next_cursor.is_none() {
+                break;
+            }
+            next_cursor = result.next_cursor;
+        }
+
+        Ok(bindings)
+    })
+}
+
+fn call_mcp_tool(
+    binding: &McpToolBinding,
+    input: &JsonValue,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match binding.config.transport() {
+        McpTransport::Stdio => call_stdio_mcp_tool(binding, input),
+        McpTransport::Http => call_http_mcp_tool(binding, input),
+        other => Err(format!(
+            "MCP transport {:?} is not executable in NanoCode yet",
+            other
+        )
+        .into()),
+    }
+}
+
+fn call_stdio_mcp_tool(
+    binding: &McpToolBinding,
+    input: &JsonValue,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let bootstrap = McpClientBootstrap::from_scoped_config(&binding.server_name, &binding.config);
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async move {
+        let mut process = spawn_mcp_stdio_process(&bootstrap)?;
+        let initialize = process
+            .initialize(
+                JsonRpcId::Number(1),
+                McpInitializeParams {
+                    protocol_version: "2025-03-26".to_string(),
+                    capabilities: serde_json::json!({"roots": {}}),
+                    client_info: McpInitializeClientInfo {
+                        name: "nanocode".to_string(),
+                        version: VERSION.to_string(),
+                    },
+                },
+            )
+            .await?;
+        if let Some(error) = initialize.error {
+            let _ = process.terminate().await;
+            let _ = process.wait().await;
+            return Err::<String, Box<dyn std::error::Error>>(
+                format!("initialize failed: {}", error.message).into(),
+            );
+        }
+        process.send_initialized_notification().await?;
+
+        let response = process
+            .call_tool(
+                JsonRpcId::Number(2),
+                McpToolCallParams {
+                    name: binding.upstream_name.clone(),
+                    arguments: Some(input.clone()),
+                    meta: None,
+                },
+            )
+            .await?;
+        let _ = process.terminate().await;
+        let _ = process.wait().await;
+
+        format_mcp_call_result(&binding.server_name, &binding.upstream_name, response)
+    })
+}
+
+fn call_http_mcp_tool(
+    binding: &McpToolBinding,
+    input: &JsonValue,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let McpClientTransport::Http(transport) =
+        McpClientBootstrap::from_scoped_config(&binding.server_name, &binding.config).transport
+    else {
+        return Err("server is not an HTTP MCP transport".into());
+    };
+    if transport.headers_helper.is_some() {
+        return Err("headers_helper for remote MCP servers is not wired yet".into());
+    }
+    if transport.auth != McpClientAuth::None {
+        return Err("OAuth-backed remote MCP servers are not wired yet".into());
+    }
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let server_name = binding.server_name.clone();
+    let upstream_name = binding.upstream_name.clone();
+    let input = input.clone();
+    runtime.block_on(async move {
+        let initialize = http_jsonrpc_request::<JsonValue>(
+            &transport.url,
+            &transport.headers,
+            JsonRpcId::Number(1),
+            "initialize",
+            Some(serde_json::json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": {"roots": {}},
+                "clientInfo": {"name": "nanocode", "version": VERSION}
+            })),
+        )
+        .await?;
+        if let Some(error) = initialize.error {
+            return Err::<String, Box<dyn std::error::Error>>(
+                format!("initialize failed: {}", error.message).into(),
+            );
+        }
+        http_jsonrpc_notification(
+            &transport.url,
+            &transport.headers,
+            "notifications/initialized",
+            Some(serde_json::json!({})),
+        )
+        .await?;
+
+        let response = http_jsonrpc_request::<McpToolCallResult>(
+            &transport.url,
+            &transport.headers,
+            JsonRpcId::Number(2),
+            "tools/call",
+            Some(serde_json::to_value(McpToolCallParams {
+                name: upstream_name.clone(),
+                arguments: Some(input),
+                meta: None,
+            })?),
+        )
+        .await?;
+        format_mcp_call_result(&server_name, &upstream_name, response)
+    })
+}
+
+async fn http_jsonrpc_request<TResult: serde::de::DeserializeOwned>(
+    url: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+    id: JsonRpcId,
+    method: &str,
+    params: Option<JsonValue>,
+) -> Result<JsonRpcResponse<TResult>, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let mut request = client.post(url).header("content-type", "application/json");
+    for (key, value) in headers {
+        request = request.header(
+            HeaderName::from_bytes(key.as_bytes())?,
+            HeaderValue::from_str(value)?,
+        );
+    }
+    let response = request
+        .json(&JsonRpcRequest::new(id, method.to_string(), params))
+        .send()
+        .await?;
+    Ok(response.json::<JsonRpcResponse<TResult>>().await?)
+}
+
+async fn http_jsonrpc_notification(
+    url: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+    method: &str,
+    params: Option<JsonValue>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let mut request = client
+        .post(url)
+        .header("content-type", "application/json");
+    for (key, value) in headers {
+        request = request.header(
+            HeaderName::from_bytes(key.as_bytes())?,
+            HeaderValue::from_str(value)?,
+        );
+    }
+    request
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params.unwrap_or_else(|| serde_json::json!({}))
+        }))
+        .send()
+        .await?;
+    Ok(())
+}
+
+fn format_mcp_call_result(
+    server_name: &str,
+    upstream_name: &str,
+    response: JsonRpcResponse<McpToolCallResult>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(error) = response.error {
+        return Err(format!("tools/call failed: {}", error.message).into());
+    }
+    let Some(result) = response.result else {
+        return Err("tools/call returned no result".into());
+    };
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "server": server_name,
+        "tool": upstream_name,
+        "content": result.content,
+        "structuredContent": result.structured_content,
+        "isError": result.is_error.unwrap_or(false),
+    }))?)
+}
+
+fn print_mcp_status(catalog: &McpCatalog) {
+    if catalog.servers.is_empty() {
+        println!("MCP: no servers configured.");
+        println!("Add `mcpServers` to `.nanocode/settings.json` to expose MCP tools.");
+        return;
+    }
+
+    println!(
+        "MCP: {} configured server(s), {} exposed MCP tool(s).",
+        catalog.servers.len(),
+        catalog.tools.len()
+    );
+    for server in &catalog.servers {
+        println!(
+            " - {} [{} {:?}] {} tool(s): {}",
+            server.server_name,
+            config_source_label(server.scope),
+            server.transport,
+            server.tool_count,
+            server.note
+        );
+    }
+}
+
+fn print_mcp_tools(catalog: &McpCatalog) {
+    if catalog.tools.is_empty() {
+        print_mcp_status(catalog);
+        return;
+    }
+
+    println!("MCP tools:");
+    for tool in &catalog.tools {
+        println!(
+            " - {} -> {}::{}",
+            tool.exposed_name, tool.server_name, tool.upstream_name
+        );
+    }
+}
+
+fn config_source_label(source: ConfigSource) -> &'static str {
+    match source {
+        ConfigSource::User => "user",
+        ConfigSource::Project => "project",
+        ConfigSource::Local => "local",
+    }
+}
+
+impl McpCatalog {
+    fn tool_specs(&self) -> Vec<RuntimeToolSpec> {
+        self.tools
+            .iter()
+            .map(|tool| RuntimeToolSpec {
+                name: tool.exposed_name.clone(),
+                description: format!(
+                    "MCP {}::{} - {}",
+                    tool.server_name, tool.upstream_name, tool.description
+                ),
+                input_schema: tool.input_schema.clone(),
+            })
+            .collect()
+    }
+
+    fn find_tool(&self, name: &str) -> Option<&McpToolBinding> {
+        self.tools.iter().find(|tool| tool.exposed_name == name)
+    }
+}
+
 fn run_repl(model: String) -> Result<(), Box<dyn std::error::Error>> {
     let mut cli = LiveCli::new(model, true)?;
     let editor = input::LineEditor::new("› ");
@@ -613,6 +1368,10 @@ fn run_repl(model: String) -> Result<(), Box<dyn std::error::Error>> {
             handle_proxy_runtime_command(&mut cli, mode?)?;
             continue;
         }
+        if let Some(command) = parse_mcp_command(trimmed) {
+            handle_mcp_runtime_command(&mut cli, command?)?;
+            continue;
+        }
         match trimmed {
             "/exit" | "/quit" => break,
             "/help" => {
@@ -623,6 +1382,7 @@ fn run_repl(model: String) -> Result<(), Box<dyn std::error::Error>> {
                 println!("  /model   Choose the active NanoGPT model");
                 println!("  /provider Choose a provider override for the current model only");
                 println!("  /proxy   Toggle XML tool-call proxy mode (or /proxy on|off|status)");
+                println!("  /mcp     Show MCP status, tools, or reload config (/mcp [status|tools|reload])");
                 println!("  /status  Show session status");
                 println!("  /compact Compact session history");
                 println!("  /exit    Quit the REPL");
@@ -640,6 +1400,7 @@ struct LiveCli {
     model: String,
     system_prompt: Vec<String>,
     proxy_tool_calls: bool,
+    mcp_catalog: McpCatalog,
     runtime: ConversationRuntime<NanoCodeRuntimeClient, CliToolExecutor>,
 }
 
@@ -647,17 +1408,20 @@ impl LiveCli {
     fn new(model: String, enable_tools: bool) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let proxy_tool_calls = proxy_tool_calls_enabled();
+        let mcp_catalog = load_mcp_catalog(&env::current_dir()?)?;
         let runtime = build_runtime(
             Session::new(),
             model.clone(),
             system_prompt.clone(),
             enable_tools,
             proxy_tool_calls,
+            mcp_catalog.clone(),
         )?;
         Ok(Self {
             model,
             system_prompt,
             proxy_tool_calls,
+            mcp_catalog,
             runtime,
         })
     }
@@ -710,6 +1474,11 @@ impl LiveCli {
             usage.input_tokens,
             usage.output_tokens
         );
+        println!(
+            "status: mcp_servers={} mcp_tools={}",
+            self.mcp_catalog.servers.len(),
+            self.mcp_catalog.tools.len()
+        );
         if self.model == DEFAULT_MODEL {
             println!("status: active model is the default fallback model.");
         } else {
@@ -726,6 +1495,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             self.proxy_tool_calls,
+            self.mcp_catalog.clone(),
         )?;
         println!("Compacted {removed} messages.");
         Ok(())
@@ -740,6 +1510,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             self.proxy_tool_calls,
+            self.mcp_catalog.clone(),
         )?;
         self.model = model.clone();
         let provider =
@@ -764,6 +1535,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             self.proxy_tool_calls,
+            self.mcp_catalog.clone(),
         )?;
         if provider_label == "<platform default>" {
             println!(
@@ -788,6 +1560,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             enabled,
+            self.mcp_catalog.clone(),
         )?;
         self.proxy_tool_calls = enabled;
         println!(
@@ -800,6 +1573,31 @@ impl LiveCli {
             );
         }
         Ok(())
+    }
+
+    fn reload_mcp(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let session = self.runtime.session().clone();
+        let catalog = load_mcp_catalog(&env::current_dir()?)?;
+        self.runtime = build_runtime(
+            session,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            self.proxy_tool_calls,
+            catalog.clone(),
+        )?;
+        self.mcp_catalog = catalog;
+        println!("Reloaded MCP config.");
+        self.print_mcp_status();
+        Ok(())
+    }
+
+    fn print_mcp_status(&self) {
+        print_mcp_status(&self.mcp_catalog);
+    }
+
+    fn print_mcp_tools(&self) {
+        print_mcp_tools(&self.mcp_catalog);
     }
 }
 
@@ -825,6 +1623,23 @@ fn handle_proxy_runtime_command(
     }
 }
 
+fn handle_mcp_runtime_command(
+    cli: &mut LiveCli,
+    command: McpCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        McpCommand::Status => {
+            cli.print_mcp_status();
+            Ok(())
+        }
+        McpCommand::Tools => {
+            cli.print_mcp_tools();
+            Ok(())
+        }
+        McpCommand::Reload => cli.reload_mcp(),
+    }
+}
+
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     Ok(load_system_prompt(
         env::current_dir()?,
@@ -840,11 +1655,17 @@ fn build_runtime(
     system_prompt: Vec<String>,
     enable_tools: bool,
     proxy_tool_calls: bool,
+    mcp_catalog: McpCatalog,
 ) -> Result<ConversationRuntime<NanoCodeRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
+    let tool_specs = if enable_tools {
+        available_runtime_tool_specs(&mcp_catalog)
+    } else {
+        Vec::new()
+    };
     let mut runtime_prompt = system_prompt;
     if enable_tools && proxy_tool_calls {
-        runtime_prompt.push(build_proxy_system_prompt(&mvp_tool_specs()));
+        runtime_prompt.push(build_proxy_system_prompt(&tool_specs));
     }
     Ok(ConversationRuntime::new(
         session,
@@ -853,8 +1674,9 @@ fn build_runtime(
             provider_for_model(&model),
             enable_tools,
             proxy_tool_calls,
+            tool_specs.clone(),
         )?,
-        CliToolExecutor::new(),
+        CliToolExecutor::new(mcp_catalog, tool_specs),
         permission_policy_from_env(),
         runtime_prompt,
     ))
@@ -867,6 +1689,7 @@ struct NanoCodeRuntimeClient {
     max_output_tokens: u32,
     enable_tools: bool,
     proxy_tool_calls: bool,
+    tool_specs: Vec<RuntimeToolSpec>,
 }
 
 impl NanoCodeRuntimeClient {
@@ -875,6 +1698,7 @@ impl NanoCodeRuntimeClient {
         provider: Option<String>,
         enable_tools: bool,
         proxy_tool_calls: bool,
+        tool_specs: Vec<RuntimeToolSpec>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
@@ -883,6 +1707,7 @@ impl NanoCodeRuntimeClient {
             model,
             enable_tools,
             proxy_tool_calls,
+            tool_specs,
         })
     }
 }
@@ -902,12 +1727,12 @@ impl ApiClient for NanoCodeRuntimeClient {
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: self.enable_tools.then(|| {
-                mvp_tool_specs()
-                    .into_iter()
+                self.tool_specs
+                    .iter()
                     .map(|spec| ToolDefinition {
-                        name: spec.name.to_string(),
-                        description: Some(spec.description.to_string()),
-                        input_schema: spec.input_schema,
+                        name: spec.name.clone(),
+                        description: Some(spec.description.clone()),
+                        input_schema: spec.input_schema.clone(),
                     })
                     .collect()
             }),
@@ -1061,7 +1886,8 @@ impl NanoCodeRuntimeClient {
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             let mut first_render = Vec::new();
-            let first_events = proxy_response_to_events(response, &mut first_render)?;
+            let first_events =
+                proxy_response_to_events(response, &mut first_render, &self.tool_specs)?;
 
             if should_retry_proxy_tool_prompt(&first_events) {
                 messages.push(InputMessage::user_text(proxy_retry_reminder()));
@@ -1075,7 +1901,7 @@ impl NanoCodeRuntimeClient {
                     .await
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 let mut stdout = io::stdout();
-                return proxy_response_to_events(retry_response, &mut stdout);
+                return proxy_response_to_events(retry_response, &mut stdout, &self.tool_specs);
             }
 
             let mut stdout = io::stdout();
@@ -1099,14 +1925,14 @@ impl NanoCodeRuntimeClient {
             ),
             max_tokens: Some(self.max_output_tokens),
             tools: self.enable_tools.then(|| {
-                mvp_tool_specs()
-                    .into_iter()
+                self.tool_specs
+                    .iter()
                     .map(|spec| ChatCompletionTool {
                         kind: "function".to_string(),
                         function: api::ChatCompletionFunction {
-                            name: spec.name.to_string(),
-                            description: Some(spec.description.to_string()),
-                            parameters: Some(spec.input_schema),
+                            name: spec.name.clone(),
+                            description: Some(spec.description.clone()),
+                            parameters: Some(spec.input_schema.clone()),
                         },
                     })
                     .collect()
@@ -1153,7 +1979,11 @@ impl NanoCodeRuntimeClient {
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             let mut first_render = Vec::new();
-            let first_events = proxy_chat_completion_response_to_events(response, &mut first_render)?;
+            let first_events = proxy_chat_completion_response_to_events(
+                response,
+                &mut first_render,
+                &self.tool_specs,
+            )?;
 
             if should_retry_proxy_tool_prompt(&first_events) {
                 messages.push(ChatCompletionMessage {
@@ -1172,7 +2002,11 @@ impl NanoCodeRuntimeClient {
                     .await
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 let mut stdout = io::stdout();
-                return proxy_chat_completion_response_to_events(retry_response, &mut stdout);
+                return proxy_chat_completion_response_to_events(
+                    retry_response,
+                    &mut stdout,
+                    &self.tool_specs,
+                );
             }
 
             let mut stdout = io::stdout();
@@ -1210,7 +2044,14 @@ fn should_retry_proxy_tool_prompt(events: &[AssistantEvent]) -> bool {
     }
 
     let normalized = trimmed.to_ascii_lowercase();
-    let intent_prefix = ["let me ", "i'll ", "i will ", "first, i'll", "first i ", "let's "];
+    let intent_prefix = [
+        "let me ",
+        "i'll ",
+        "i will ",
+        "first, i'll",
+        "first i ",
+        "let's ",
+    ];
     let tool_intent = [
         "explore",
         "inspect",
@@ -1225,9 +2066,7 @@ fn should_retry_proxy_tool_prompt(events: &[AssistantEvent]) -> bool {
     intent_prefix
         .iter()
         .any(|prefix| normalized.starts_with(prefix))
-        && tool_intent
-            .iter()
-            .any(|phrase| normalized.contains(phrase))
+        && tool_intent.iter().any(|phrase| normalized.contains(phrase))
 }
 
 fn push_output_block(
@@ -1279,12 +2118,13 @@ fn response_to_events(
 fn proxy_response_to_events(
     response: MessageResponse,
     out: &mut impl Write,
+    tool_specs: &[RuntimeToolSpec],
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     for block in response.content {
         match block {
             OutputContentBlock::Text { text } => {
-                append_proxy_text_events(&text, out, &mut events)?;
+                append_proxy_text_events(&text, out, &mut events, tool_specs)?;
             }
             OutputContentBlock::ToolUse { id, name, input } => {
                 events.push(AssistantEvent::ToolUse {
@@ -1355,6 +2195,7 @@ fn chat_completion_response_to_events(
 fn proxy_chat_completion_response_to_events(
     response: ChatCompletionResponse,
     out: &mut impl Write,
+    tool_specs: &[RuntimeToolSpec],
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let Some(choice) = response.choices.into_iter().next() else {
@@ -1367,7 +2208,12 @@ fn proxy_chat_completion_response_to_events(
         tool_calls,
         ..
     } = choice.message;
-    append_proxy_text_events(content.as_deref().unwrap_or_default(), out, &mut events)?;
+    append_proxy_text_events(
+        content.as_deref().unwrap_or_default(),
+        out,
+        &mut events,
+        tool_specs,
+    )?;
     if let Some(tool_calls) = tool_calls {
         for tool_call in tool_calls {
             events.push(AssistantEvent::ToolUse {
@@ -1393,8 +2239,9 @@ fn append_proxy_text_events(
     text: &str,
     out: &mut impl Write,
     events: &mut Vec<AssistantEvent>,
+    tool_specs: &[RuntimeToolSpec],
 ) -> Result<(), RuntimeError> {
-    for segment in parse_proxy_response(text, &mvp_tool_specs()).map_err(RuntimeError::new)? {
+    for segment in parse_proxy_response(text, tool_specs).map_err(RuntimeError::new)? {
         match segment {
             ProxySegment::Text(text) => {
                 if !text.is_empty() {
@@ -1414,29 +2261,33 @@ fn append_proxy_text_events(
 
 struct CliToolExecutor {
     renderer: TerminalRenderer,
+    mcp_catalog: McpCatalog,
+    tool_specs: Vec<RuntimeToolSpec>,
 }
 
 impl CliToolExecutor {
-    fn new() -> Self {
+    fn new(mcp_catalog: McpCatalog, tool_specs: Vec<RuntimeToolSpec>) -> Self {
         Self {
             renderer: TerminalRenderer::new(),
+            mcp_catalog,
+            tool_specs,
         }
     }
 }
 
 impl ToolExecutor for CliToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
-        let value = parse_tool_input_value(tool_name, input)?;
-        match execute_tool(tool_name, &value) {
-            Ok(output) => {
-                let markdown = render_tool_result_markdown(tool_name, &output);
-                self.renderer
-                    .stream_markdown(&markdown, &mut io::stdout())
-                    .map_err(|error| ToolError::new(error.to_string()))?;
-                Ok(output)
-            }
-            Err(error) => Err(ToolError::new(error)),
-        }
+        let value = parse_tool_input_value(tool_name, input, &self.tool_specs)?;
+        let output = if let Some(tool) = self.mcp_catalog.find_tool(tool_name) {
+            call_mcp_tool(tool, &value).map_err(|error| ToolError::new(error.to_string()))
+        } else {
+            execute_tool(tool_name, &value).map_err(ToolError::new)
+        }?;
+        let markdown = render_tool_result_markdown(tool_name, &output);
+        self.renderer
+            .stream_markdown(&markdown, &mut io::stdout())
+            .map_err(|error| ToolError::new(error.to_string()))?;
+        Ok(output)
     }
 }
 
@@ -1472,7 +2323,10 @@ fn render_read_file_preview(value: &serde_json::Value) -> Option<String> {
     let start_line = file.get("startLine").and_then(serde_json::Value::as_u64);
     let num_lines = file.get("numLines").and_then(serde_json::Value::as_u64);
     let total_lines = file.get("totalLines").and_then(serde_json::Value::as_u64);
-    let content = file.get("content").and_then(serde_json::Value::as_str).unwrap_or("");
+    let content = file
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     let preview = truncate_tool_text(content, MAX_TOOL_PREVIEW_LINES, MAX_TOOL_PREVIEW_CHARS);
     let end_line = match (start_line, num_lines) {
         (Some(start), Some(count)) if count > 0 => Some(start + count - 1),
@@ -1480,7 +2334,11 @@ fn render_read_file_preview(value: &serde_json::Value) -> Option<String> {
     };
     Some(format!(
         "### Tool `read_file`\n\n{} lines {}-{} of {}.\nPath: `{}`\n{}\n```text\n{}\n```\n",
-        if preview == content { "Showing" } else { "Previewing" },
+        if preview == content {
+            "Showing"
+        } else {
+            "Previewing"
+        },
         start_line.unwrap_or(1),
         end_line.unwrap_or(start_line.unwrap_or(1)),
         total_lines.unwrap_or(num_lines.unwrap_or(0)),
@@ -1503,7 +2361,8 @@ fn render_glob_search_preview(value: &serde_json::Value) -> Option<String> {
         .take(20)
         .collect::<Vec<_>>()
         .join("\n");
-    let truncated = filenames.len() > 20 || value.get("truncated").and_then(serde_json::Value::as_bool) == Some(true);
+    let truncated = filenames.len() > 20
+        || value.get("truncated").and_then(serde_json::Value::as_bool) == Some(true);
     Some(format!(
         "### Tool `glob_search`\n\nMatched {} files.\n{}\n```text\n{}\n```\n",
         num_files,
@@ -1519,7 +2378,10 @@ fn render_glob_search_preview(value: &serde_json::Value) -> Option<String> {
 fn render_grep_search_preview(value: &serde_json::Value) -> Option<String> {
     let num_files = value.get("numFiles").and_then(serde_json::Value::as_u64)?;
     let num_matches = value.get("numMatches").and_then(serde_json::Value::as_u64);
-    let content = value.get("content").and_then(serde_json::Value::as_str).unwrap_or("");
+    let content = value
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     let preview = truncate_tool_text(content, MAX_TOOL_PREVIEW_LINES, MAX_TOOL_PREVIEW_CHARS);
     Some(format!(
         "### Tool `grep_search`\n\nMatched {} files{}.\n{}\n```text\n{}\n```\n",
@@ -1537,25 +2399,31 @@ fn render_grep_search_preview(value: &serde_json::Value) -> Option<String> {
 }
 
 fn render_bash_preview(value: &serde_json::Value) -> Option<String> {
-    let stdout = value.get("stdout").and_then(serde_json::Value::as_str).unwrap_or("");
-    let stderr = value.get("stderr").and_then(serde_json::Value::as_str).unwrap_or("");
+    let stdout = value
+        .get("stdout")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let stderr = value
+        .get("stderr")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     let mut sections = Vec::new();
     if !stdout.trim().is_empty() {
         let preview = truncate_tool_text(stdout, MAX_TOOL_PREVIEW_LINES, MAX_TOOL_PREVIEW_CHARS);
-        sections.push(format!(
-            "**stdout**\n```text\n{}\n```",
-            preview
-        ));
+        sections.push(format!("**stdout**\n```text\n{}\n```", preview));
         if preview != stdout {
-            sections.push("_stdout truncated in TUI; full result kept in conversation context._".to_string());
+            sections.push(
+                "_stdout truncated in TUI; full result kept in conversation context._".to_string(),
+            );
         }
     }
     if !stderr.trim().is_empty() {
-        let preview = truncate_tool_text(stderr, MAX_TOOL_PREVIEW_LINES / 2, MAX_TOOL_PREVIEW_CHARS / 2);
-        sections.push(format!(
-            "**stderr**\n```text\n{}\n```",
-            preview
-        ));
+        let preview = truncate_tool_text(
+            stderr,
+            MAX_TOOL_PREVIEW_LINES / 2,
+            MAX_TOOL_PREVIEW_CHARS / 2,
+        );
+        sections.push(format!("**stderr**\n```text\n{}\n```", preview));
     }
     if sections.is_empty() {
         return None;
@@ -1588,7 +2456,12 @@ fn truncate_tool_text(input: &str, max_lines: usize, max_chars: usize) -> String
                 if !output.is_empty() {
                     output.push('\n');
                 }
-                output.push_str(&line.chars().take(remaining.saturating_sub(1)).collect::<String>());
+                output.push_str(
+                    &line
+                        .chars()
+                        .take(remaining.saturating_sub(1))
+                        .collect::<String>(),
+                );
             }
             truncated = true;
             break;
@@ -1614,7 +2487,11 @@ fn truncate_tool_text(input: &str, max_lines: usize, max_chars: usize) -> String
     output
 }
 
-fn parse_tool_input_value(tool_name: &str, input: &str) -> Result<serde_json::Value, ToolError> {
+fn parse_tool_input_value(
+    tool_name: &str,
+    input: &str,
+    tool_specs: &[RuntimeToolSpec],
+) -> Result<serde_json::Value, ToolError> {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(input) {
         return Ok(value);
     }
@@ -1624,7 +2501,7 @@ fn parse_tool_input_value(tool_name: &str, input: &str) -> Result<serde_json::Va
     }
 
     if input.contains("<tool_call") {
-        let tool_use = parse_proxy_response(input, &mvp_tool_specs())
+        let tool_use = parse_proxy_response(input, tool_specs)
             .map_err(ToolError::new)?
             .into_iter()
             .find_map(|segment| match segment {
@@ -1632,13 +2509,14 @@ fn parse_tool_input_value(tool_name: &str, input: &str) -> Result<serde_json::Va
                 _ => None,
             })
             .ok_or_else(|| ToolError::new("proxy tool call did not contain a matching tool"))?;
-        return serde_json::from_str(&tool_use)
-            .map_err(|error| ToolError::new(format!("invalid recovered proxy tool JSON: {error}")));
+        return serde_json::from_str(&tool_use).map_err(|error| {
+            ToolError::new(format!("invalid recovered proxy tool JSON: {error}"))
+        });
     }
 
     if input.contains("<arg") {
         let wrapped = format!("<tool_call name=\"{tool_name}\">{input}</tool_call>");
-        let tool_use = parse_proxy_response(&wrapped, &mvp_tool_specs())
+        let tool_use = parse_proxy_response(&wrapped, tool_specs)
             .map_err(ToolError::new)?
             .into_iter()
             .find_map(|segment| match segment {
@@ -1892,6 +2770,9 @@ fn print_help() {
     );
     println!("  nanocode proxy [on|off|status]              Toggle XML tool-call proxy mode");
     println!(
+        "  nanocode mcp [status|tools|reload]          Inspect configured MCP servers and tools"
+    );
+    println!(
         "  nanocode [--model MODEL] prompt TEXT        Send one prompt and stream the response"
     );
     println!("  nanocode dump-manifests");
@@ -1907,19 +2788,19 @@ fn print_version() {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        available_runtime_tool_specs, extract_first_json_object, parse_args, parse_auth_command,
+        parse_mcp_command, parse_model_command, parse_provider_command, parse_proxy_command,
+        parse_tool_input_value, proxy_chat_completion_response_to_events, proxy_response_to_events,
+        render_tool_result_markdown, should_retry_proxy_tool_prompt, AssistantEvent, CliAction,
+        McpCatalog, McpCommand, RuntimeToolSpec, DEFAULT_MODEL,
+    };
+    use crate::proxy::ProxyCommand;
     use api::{
         ChatCompletionAssistantMessage, ChatCompletionChoice, ChatCompletionFunctionCall,
         ChatCompletionResponse, ChatCompletionToolCall, ChatCompletionUsage, MessageResponse,
         OutputContentBlock, Usage,
     };
-    use super::{
-        extract_first_json_object, parse_args, parse_auth_command, parse_model_command,
-        parse_provider_command, parse_proxy_command, parse_tool_input_value,
-        proxy_chat_completion_response_to_events, proxy_response_to_events,
-        render_tool_result_markdown, AssistantEvent, should_retry_proxy_tool_prompt, CliAction,
-        DEFAULT_MODEL,
-    };
-    use crate::proxy::ProxyCommand;
     use runtime::{ContentBlock, ConversationMessage, MessageRole};
     use serde_json::json;
     use std::path::PathBuf;
@@ -1948,6 +2829,10 @@ mod tests {
         std::env::remove_var("NANOCODE_CONFIG_HOME");
         std::fs::remove_dir_all(root).expect("temp config dir should be removed");
         output
+    }
+
+    fn tool_specs() -> Vec<RuntimeToolSpec> {
+        available_runtime_tool_specs(&McpCatalog::default())
     }
 
     #[test]
@@ -2027,6 +2912,19 @@ mod tests {
                 parse_args(&args).expect("args should parse"),
                 CliAction::Proxy {
                     mode: ProxyCommand::Enable,
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn parses_mcp_subcommand() {
+        with_isolated_config_home(|| {
+            let args = vec!["mcp".to_string(), "tools".to_string()];
+            assert_eq!(
+                parse_args(&args).expect("args should parse"),
+                CliAction::Mcp {
+                    action: McpCommand::Tools,
                 }
             );
         });
@@ -2125,6 +3023,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_mcp_slash_command() {
+        assert_eq!(
+            parse_mcp_command("/mcp tools").expect("mcp command should parse"),
+            Ok(McpCommand::Tools)
+        );
+        assert_eq!(
+            parse_mcp_command("/mcp").expect("mcp default should parse"),
+            Ok(McpCommand::Status)
+        );
+        assert!(parse_mcp_command("/status").is_none());
+    }
+
+    #[test]
     fn recovers_json_object_from_noisy_proxy_input() {
         let recovered = extract_first_json_object(
             "Here you go {\"path\":\"README.md\",\"offset\":0} and then some commentary",
@@ -2141,6 +3052,7 @@ mod tests {
         let value = parse_tool_input_value(
             "read_file",
             "<arg name=\"path\">README.md</arg><arg name=\"offset\" type=\"integer\">0</arg>",
+            &tool_specs(),
         )
         .expect("proxy arg fragment should parse");
         assert_eq!(value, serde_json::json!({"path":"README.md","offset":0}));
@@ -2201,7 +3113,7 @@ mod tests {
             request_id: None,
         };
 
-        let events = proxy_response_to_events(response, &mut Vec::new())
+        let events = proxy_response_to_events(response, &mut Vec::new(), &tool_specs())
             .expect("proxy response should convert");
         assert!(matches!(
             &events[0],
@@ -2246,8 +3158,9 @@ mod tests {
             service_tier: None,
         };
 
-        let events = proxy_chat_completion_response_to_events(response, &mut Vec::new())
-            .expect("proxy chat completion should convert");
+        let events =
+            proxy_chat_completion_response_to_events(response, &mut Vec::new(), &tool_specs())
+                .expect("proxy chat completion should convert");
         assert!(matches!(
             &events[0],
             AssistantEvent::TextDelta(text) if text == "I will inspect this.\n\n"

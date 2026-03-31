@@ -207,6 +207,7 @@ mod tests {
 
     use crate::config::{
         ConfigSource, McpRemoteServerConfig, McpServerConfig, McpStdioServerConfig,
+        McpStdioStderrMode,
         McpWebSocketServerConfig, ScopedMcpServerConfig,
     };
 
@@ -245,6 +246,7 @@ mod tests {
             command: "uvx".to_string(),
             args: vec!["mcp-server".to_string()],
             env: BTreeMap::from([("TOKEN".to_string(), "secret".to_string())]),
+            stderr: McpStdioStderrMode::Inherit,
         });
         assert_eq!(
             mcp_server_signature(&stdio),

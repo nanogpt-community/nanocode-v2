@@ -2,7 +2,23 @@ use std::collections::BTreeMap;
 
 use runtime::{ContentBlock, ConversationMessage, MessageRole};
 use serde_json::{Map, Number, Value};
-use tools::ToolSpec;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeToolSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+impl From<tools::ToolSpec> for RuntimeToolSpec {
+    fn from(value: tools::ToolSpec) -> Self {
+        Self {
+            name: value.name.to_string(),
+            description: value.description.to_string(),
+            input_schema: value.input_schema,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyCommand {
@@ -34,7 +50,7 @@ pub fn parse_proxy_value(value: Option<&str>) -> Result<ProxyCommand, String> {
     }
 }
 
-pub fn build_proxy_system_prompt(tool_specs: &[ToolSpec]) -> String {
+pub fn build_proxy_system_prompt(tool_specs: &[RuntimeToolSpec]) -> String {
     let mut lines = vec![
         "# XML Tool Proxy".to_string(),
         "Native tool calling is disabled for this session.".to_string(),
@@ -99,7 +115,7 @@ pub fn convert_messages_for_proxy(
 
 pub fn parse_proxy_response(
     text: &str,
-    tool_specs: &[ToolSpec],
+    tool_specs: &[RuntimeToolSpec],
 ) -> Result<Vec<ProxySegment>, String> {
     let mut segments = Vec::new();
     let mut cursor = 0;
@@ -148,7 +164,7 @@ enum ProxyBlockKind {
 fn find_next_proxy_block(
     text: &str,
     cursor: usize,
-    tool_specs: &[ToolSpec],
+    tool_specs: &[RuntimeToolSpec],
 ) -> Option<(usize, ProxyBlockKind)> {
     let mut best =
         find_tag_start(text, cursor, "tool_call").map(|start| (start, ProxyBlockKind::ToolCall));
@@ -160,7 +176,10 @@ fn find_next_proxy_block(
     }
     for tool_spec in tool_specs {
         if let Some(start) = find_tag_start(text, cursor, &tool_spec.name) {
-            let candidate = (start, ProxyBlockKind::DirectTool(tool_spec.name.to_string()));
+            let candidate = (
+                start,
+                ProxyBlockKind::DirectTool(tool_spec.name.to_string()),
+            );
             match &best {
                 Some((best_start, _)) if *best_start <= start => {}
                 _ => best = Some(candidate),
@@ -189,7 +208,7 @@ fn recover_proxy_block(
     start: usize,
     open_end: usize,
     block_kind: &ProxyBlockKind,
-    tool_specs: &[ToolSpec],
+    tool_specs: &[RuntimeToolSpec],
 ) -> Option<(String, usize)> {
     let tag_name = match block_kind {
         ProxyBlockKind::ToolCall => "tool_call",
@@ -204,7 +223,7 @@ fn recover_named_block(
     start: usize,
     open_end: usize,
     tag_name: &str,
-    tool_specs: &[ToolSpec],
+    tool_specs: &[RuntimeToolSpec],
 ) -> Option<(String, usize)> {
     let exact_close = format!("</{tag_name}>");
     if let Some(close_start) = text[open_end..]
@@ -273,13 +292,34 @@ fn is_arg_trailing_noise(input: &str) -> bool {
         ch.is_whitespace()
             || matches!(
                 ch,
-                '(' | ')' | '[' | ']' | '{' | '}' | '>' | '〉' | '＞' | ',' | '.' | ':' | ';'
-                    | '!' | '?' | '_' | '-' | '/' | '\\' | '|'
+                '(' | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '>'
+                    | '〉'
+                    | '＞'
+                    | ','
+                    | '.'
+                    | ':'
+                    | ';'
+                    | '!'
+                    | '?'
+                    | '_'
+                    | '-'
+                    | '/'
+                    | '\\'
+                    | '|'
             )
     })
 }
 
-fn find_next_proxy_block_start(text: &str, cursor: usize, tool_specs: &[ToolSpec]) -> Option<usize> {
+fn find_next_proxy_block_start(
+    text: &str,
+    cursor: usize,
+    tool_specs: &[RuntimeToolSpec],
+) -> Option<usize> {
     find_next_proxy_block(text, cursor, tool_specs).map(|(start, _)| start)
 }
 
@@ -363,7 +403,7 @@ fn render_tool_result_xml(
 fn parse_proxy_block(
     block: &str,
     block_kind: &ProxyBlockKind,
-    tool_specs: &[ToolSpec],
+    tool_specs: &[RuntimeToolSpec],
     ordinal: usize,
 ) -> Result<Option<ProxySegment>, String> {
     match block_kind {
@@ -377,7 +417,7 @@ fn parse_proxy_block(
 
 fn parse_tool_call_block(
     block: &str,
-    tool_specs: &[ToolSpec],
+    tool_specs: &[RuntimeToolSpec],
     ordinal: usize,
 ) -> Result<ProxySegment, String> {
     let open_end = find_tag_end(block, 0)?;
@@ -407,7 +447,7 @@ fn parse_tool_call_block(
 fn parse_direct_tool_block(
     block: &str,
     tool_name: &str,
-    tool_specs: &[ToolSpec],
+    tool_specs: &[RuntimeToolSpec],
     ordinal: usize,
 ) -> Result<ProxySegment, String> {
     let open_end = find_tag_end(block, 0)?;
@@ -431,7 +471,7 @@ fn parse_direct_tool_block(
     })
 }
 
-fn parse_tool_args(body: &str, tool_spec: &ToolSpec) -> Result<Map<String, Value>, String> {
+fn parse_tool_args(body: &str, tool_spec: &RuntimeToolSpec) -> Result<Map<String, Value>, String> {
     let mut result = Map::new();
     let mut cursor = 0;
 
@@ -495,9 +535,8 @@ fn orphan_closing_tag_len(input: &str) -> Option<usize> {
     input.find('>').map(|index| index + 1)
 }
 
-
 fn coerce_proxy_arg_value(
-    tool_spec: &ToolSpec,
+    tool_spec: &RuntimeToolSpec,
     name: &str,
     declared_type: Option<&str>,
     raw: &str,
@@ -672,11 +711,14 @@ mod tests {
 
     use super::{
         build_proxy_system_prompt, convert_messages_for_proxy, parse_proxy_response,
-        parse_proxy_value, ProxyCommand, ProxySegment,
+        parse_proxy_value, ProxyCommand, ProxySegment, RuntimeToolSpec,
     };
 
-    fn specs() -> Vec<tools::ToolSpec> {
+    fn specs() -> Vec<RuntimeToolSpec> {
         tools::mvp_tool_specs()
+            .into_iter()
+            .map(RuntimeToolSpec::from)
+            .collect()
     }
 
     #[test]

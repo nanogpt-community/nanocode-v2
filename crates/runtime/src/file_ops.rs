@@ -296,12 +296,12 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
             continue;
         }
 
-        let Ok(file_content) = fs::read_to_string(&file_path) else {
+        let Ok(file_contents) = fs::read_to_string(&file_path) else {
             continue;
         };
 
         if output_mode == "count" {
-            let count = regex.find_iter(&file_content).count();
+            let count = regex.find_iter(&file_contents).count();
             if count > 0 {
                 filenames.push(file_path.to_string_lossy().into_owned());
                 total_matches += count;
@@ -309,7 +309,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
             continue;
         }
 
-        let lines: Vec<&str> = file_content.lines().collect();
+        let lines: Vec<&str> = file_contents.lines().collect();
         let mut matched_lines = Vec::new();
         for (index, line) in lines.iter().enumerate() {
             if regex.is_match(line) {
@@ -327,13 +327,13 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
             for index in matched_lines {
                 let start = index.saturating_sub(input.before.unwrap_or(context));
                 let end = (index + input.after.unwrap_or(context) + 1).min(lines.len());
-                for (current, line_content) in lines.iter().enumerate().take(end).skip(start) {
+                for (current, line) in lines.iter().enumerate().take(end).skip(start) {
                     let prefix = if input.line_numbers.unwrap_or(true) {
                         format!("{}:{}:", file_path.to_string_lossy(), current + 1)
                     } else {
                         format!("{}:", file_path.to_string_lossy())
                     };
-                    content_lines.push(format!("{prefix}{line_content}"));
+                    content_lines.push(format!("{prefix}{line}"));
                 }
             }
         }
@@ -341,7 +341,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
 
     let (filenames, applied_limit, applied_offset) =
         apply_limit(filenames, input.head_limit, input.offset);
-    let rendered_content = if output_mode == "content" {
+    let content_output = if output_mode == "content" {
         let (lines, limit, offset) = apply_limit(content_lines, input.head_limit, input.offset);
         return Ok(GrepSearchOutput {
             mode: Some(output_mode),
@@ -361,7 +361,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
         mode: Some(output_mode.clone()),
         num_files: filenames.len(),
         filenames,
-        content: rendered_content,
+        content: content_output,
         num_lines: None,
         num_matches: (output_mode == "count").then_some(total_matches),
         applied_limit,

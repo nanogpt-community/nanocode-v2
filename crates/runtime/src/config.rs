@@ -69,6 +69,14 @@ pub struct McpStdioServerConfig {
     pub command: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    pub stderr: McpStdioStderrMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum McpStdioStderrMode {
+    #[default]
+    Inherit,
+    Null,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,6 +400,7 @@ fn parse_mcp_server_config(
             command: expect_string(object, "command", context)?.to_string(),
             args: optional_string_array(object, "args", context)?.unwrap_or_default(),
             env: optional_string_map(object, "env", context)?.unwrap_or_default(),
+            stderr: parse_optional_stdio_stderr_mode(object, context)?,
         })),
         "sse" => Ok(McpServerConfig::Sse(parse_mcp_remote_server_config(
             object, context,
@@ -446,6 +455,19 @@ fn parse_optional_mcp_oauth_config(
             .map(str::to_string),
         xaa: optional_bool(oauth, "xaa", context)?,
     }))
+}
+
+fn parse_optional_stdio_stderr_mode(
+    object: &BTreeMap<String, JsonValue>,
+    context: &str,
+) -> Result<McpStdioStderrMode, ConfigError> {
+    match optional_string(object, "stderr", context)? {
+        None | Some("inherit") => Ok(McpStdioStderrMode::Inherit),
+        Some("null" | "quiet" | "discard") => Ok(McpStdioStderrMode::Null),
+        Some(other) => Err(ConfigError::Parse(format!(
+            "{context}: unsupported stdio stderr mode {other} (expected inherit or null)"
+        ))),
+    }
 }
 
 fn expect_object<'a>(

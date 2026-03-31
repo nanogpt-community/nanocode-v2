@@ -100,7 +100,11 @@ impl LineEditor {
     }
 
     pub fn read_line(&self) -> io::Result<Option<String>> {
-        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        let use_raw_editor = std::env::var("NANOCODE_RAW_REPL")
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"));
+
+        if !use_raw_editor || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return self.read_line_fallback();
         }
 

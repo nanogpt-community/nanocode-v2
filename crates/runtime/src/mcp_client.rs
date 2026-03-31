@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use crate::config::{McpOAuthConfig, McpServerConfig, ScopedMcpServerConfig};
+use crate::config::{
+    McpOAuthConfig, McpServerConfig, McpStdioStderrMode, ScopedMcpServerConfig,
+};
 use crate::mcp::{mcp_server_signature, mcp_tool_prefix, normalize_name_for_mcp};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +20,7 @@ pub struct McpStdioTransport {
     pub command: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    pub stderr: McpStdioStderrMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +78,7 @@ impl McpClientTransport {
                 command: config.command.clone(),
                 args: config.args.clone(),
                 env: config.env.clone(),
+                stderr: config.stderr,
             }),
             McpServerConfig::Sse(config) => Self::Sse(McpRemoteTransport {
                 url: config.url.clone(),
@@ -125,7 +129,8 @@ mod tests {
 
     use crate::config::{
         ConfigSource, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig,
-        McpStdioServerConfig, McpWebSocketServerConfig, ScopedMcpServerConfig,
+        McpStdioServerConfig, McpStdioStderrMode, McpWebSocketServerConfig,
+        ScopedMcpServerConfig,
     };
 
     use super::{McpClientAuth, McpClientBootstrap, McpClientTransport};
@@ -138,6 +143,7 @@ mod tests {
                 command: "uvx".to_string(),
                 args: vec!["mcp-server".to_string()],
                 env: BTreeMap::from([("TOKEN".to_string(), "secret".to_string())]),
+                stderr: McpStdioStderrMode::Inherit,
             }),
         };
 
@@ -156,6 +162,7 @@ mod tests {
                     transport.env.get("TOKEN").map(String::as_str),
                     Some("secret")
                 );
+                assert_eq!(transport.stderr, McpStdioStderrMode::Inherit);
             }
             other => panic!("expected stdio transport, got {other:?}"),
         }

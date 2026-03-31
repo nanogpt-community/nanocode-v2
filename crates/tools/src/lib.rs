@@ -1,4 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
@@ -46,6 +48,7 @@ pub struct ToolSpec {
 }
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
@@ -276,6 +279,63 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "SendUserMessage",
+            description: "Send a message to the user.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string" },
+                    "attachments": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["normal", "proactive"]
+                    }
+                },
+                "required": ["message", "status"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: "Config",
+            description: "Get or set Claude Code settings.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "setting": { "type": "string" },
+                    "value": {
+                        "type": ["string", "boolean", "number"]
+                    }
+                },
+                "required": ["setting"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: "StructuredOutput",
+            description: "Return structured output in the requested format.",
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": true
+            }),
+        },
+        ToolSpec {
+            name: "REPL",
+            description: "Execute code in a REPL-like subprocess.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "code": { "type": "string" },
+                    "language": { "type": "string" },
+                    "timeout_ms": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["code", "language"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
             name: "PowerShell",
             description: "Execute a PowerShell command with optional timeout.",
             input_schema: json!({
@@ -309,6 +369,12 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
         "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
+        "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
+        "Config" => from_value::<ConfigInput>(input).and_then(run_config),
+        "StructuredOutput" => {
+            from_value::<StructuredOutputInput>(input).and_then(run_structured_output)
+        }
+        "REPL" => from_value::<ReplInput>(input).and_then(run_repl),
         "PowerShell" => from_value::<PowerShellInput>(input).and_then(run_powershell),
         _ => Err(format!("unsupported tool: {name}")),
     }
@@ -323,14 +389,17 @@ fn run_bash(input: BashCommandInput) -> Result<String, String> {
         .map_err(|error| error.to_string())
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn run_read_file(input: ReadFileInput) -> Result<String, String> {
     to_pretty_json(read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?)
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn run_write_file(input: WriteFileInput) -> Result<String, String> {
     to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?)
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn run_edit_file(input: EditFileInput) -> Result<String, String> {
     to_pretty_json(
         edit_file(
@@ -343,18 +412,22 @@ fn run_edit_file(input: EditFileInput) -> Result<String, String> {
     )
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn run_glob_search(input: GlobSearchInputValue) -> Result<String, String> {
     to_pretty_json(glob_search(&input.pattern, input.path.as_deref()).map_err(io_to_string)?)
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn run_grep_search(input: GrepSearchInput) -> Result<String, String> {
     to_pretty_json(grep_search(&input).map_err(io_to_string)?)
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn run_web_fetch(input: WebFetchInput) -> Result<String, String> {
     to_pretty_json(execute_web_fetch(&input)?)
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn run_web_search(input: WebSearchInput) -> Result<String, String> {
     to_pretty_json(execute_web_search(&input)?)
 }
@@ -383,6 +456,22 @@ fn run_sleep(input: SleepInput) -> Result<String, String> {
     to_pretty_json(execute_sleep(input))
 }
 
+fn run_brief(input: BriefInput) -> Result<String, String> {
+    to_pretty_json(execute_brief(input)?)
+}
+
+fn run_config(input: ConfigInput) -> Result<String, String> {
+    to_pretty_json(execute_config(input)?)
+}
+
+fn run_structured_output(input: StructuredOutputInput) -> Result<String, String> {
+    to_pretty_json(execute_structured_output(input))
+}
+
+fn run_repl(input: ReplInput) -> Result<String, String> {
+    to_pretty_json(execute_repl(input)?)
+}
+
 fn run_powershell(input: PowerShellInput) -> Result<String, String> {
     to_pretty_json(execute_powershell(input).map_err(|error| error.to_string())?)
 }
@@ -391,6 +480,7 @@ fn to_pretty_json<T: serde::Serialize>(value: T) -> Result<String, String> {
     serde_json::to_string_pretty(&value).map_err(|error| error.to_string())
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn io_to_string(error: std::io::Error) -> String {
     error.to_string()
 }
@@ -507,6 +597,45 @@ struct SleepInput {
 }
 
 #[derive(Debug, Deserialize)]
+struct BriefInput {
+    message: String,
+    attachments: Option<Vec<String>>,
+    status: BriefStatus,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum BriefStatus {
+    Normal,
+    Proactive,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigInput {
+    setting: String,
+    value: Option<ConfigValue>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ConfigValue {
+    String(String),
+    Bool(bool),
+    Number(f64),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(transparent)]
+struct StructuredOutputInput(BTreeMap<String, Value>);
+
+#[derive(Debug, Deserialize)]
+struct ReplInput {
+    code: String,
+    language: String,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct PowerShellInput {
     command: String,
     timeout: Option<u64>,
@@ -599,6 +728,52 @@ struct NotebookEditOutput {
 struct SleepOutput {
     duration_ms: u64,
     message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BriefOutput {
+    message: String,
+    attachments: Option<Vec<ResolvedAttachment>>,
+    #[serde(rename = "sentAt")]
+    sent_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolvedAttachment {
+    path: String,
+    size: u64,
+    #[serde(rename = "isImage")]
+    is_image: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigOutput {
+    success: bool,
+    operation: Option<String>,
+    setting: Option<String>,
+    value: Option<Value>,
+    #[serde(rename = "previousValue")]
+    previous_value: Option<Value>,
+    #[serde(rename = "newValue")]
+    new_value: Option<Value>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct StructuredOutputResult {
+    data: String,
+    structured_output: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplOutput {
+    language: String,
+    stdout: String,
+    stderr: String,
+    #[serde(rename = "exitCode")]
+    exit_code: i32,
+    #[serde(rename = "durationMs")]
+    duration_ms: u128,
 }
 
 #[derive(Debug, Serialize)]
@@ -722,7 +897,7 @@ fn normalize_fetch_url(url: &str) -> Result<String, String> {
             let mut upgraded = parsed;
             upgraded
                 .set_scheme("https")
-                .map_err(|_| String::from("failed to upgrade URL to https"))?;
+                .map_err(|()| String::from("failed to upgrade URL to https"))?;
             return Ok(upgraded.to_string());
         }
     }
@@ -761,9 +936,10 @@ fn summarize_web_fetch(
     let compact = collapse_whitespace(content);
 
     let detail = if lower_prompt.contains("title") {
-        extract_title(content, raw_body, content_type)
-            .map(|title| format!("Title: {title}"))
-            .unwrap_or_else(|| preview_text(&compact, 600))
+        extract_title(content, raw_body, content_type).map_or_else(
+            || preview_text(&compact, 600),
+            |title| format!("Title: {title}"),
+        )
     } else if lower_prompt.contains("summary") || lower_prompt.contains("summarize") {
         preview_text(&compact, 900)
     } else {
@@ -1186,6 +1362,7 @@ fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
     Ok(manifest)
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn execute_tool_search(input: ToolSearchInput) -> ToolSearchOutput {
     let deferred = deferred_tool_specs();
     let max_results = input.max_results.unwrap_or(5).max(1);
@@ -1312,7 +1489,7 @@ fn normalize_tool_search_query(query: &str) -> String {
 fn canonical_tool_token(value: &str) -> String {
     let mut canonical = value
         .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .flat_map(char::to_lowercase)
         .collect::<String>();
     if let Some(stripped) = canonical.strip_suffix("tool") {
@@ -1384,6 +1561,7 @@ fn iso8601_now() -> String {
         .to_string()
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_notebook_edit(input: NotebookEditInput) -> Result<NotebookEditOutput, String> {
     let path = std::path::PathBuf::from(&input.notebook_path);
     if path.extension().and_then(|ext| ext.to_str()) != Some("ipynb") {
@@ -1466,7 +1644,7 @@ fn execute_notebook_edit(input: NotebookEditInput) -> Result<NotebookEditOutput,
                     if !cell.get("outputs").is_some_and(serde_json::Value::is_array) {
                         cell["outputs"] = json!([]);
                     }
-                    if !cell.get("execution_count").is_some() {
+                    if cell.get("execution_count").is_none() {
                         cell["execution_count"] = serde_json::Value::Null;
                     }
                 }
@@ -1545,6 +1723,7 @@ fn cell_kind(cell: &serde_json::Value) -> Option<NotebookCellType> {
         })
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn execute_sleep(input: SleepInput) -> SleepOutput {
     std::thread::sleep(Duration::from_millis(input.duration_ms));
     SleepOutput {
@@ -1553,6 +1732,403 @@ fn execute_sleep(input: SleepInput) -> SleepOutput {
     }
 }
 
+fn execute_brief(input: BriefInput) -> Result<BriefOutput, String> {
+    if input.message.trim().is_empty() {
+        return Err(String::from("message must not be empty"));
+    }
+
+    let attachments = input
+        .attachments
+        .as_ref()
+        .map(|paths| {
+            paths
+                .iter()
+                .map(|path| resolve_attachment(path))
+                .collect::<Result<Vec<_>, String>>()
+        })
+        .transpose()?;
+
+    let message = match input.status {
+        BriefStatus::Normal | BriefStatus::Proactive => input.message,
+    };
+
+    Ok(BriefOutput {
+        message,
+        attachments,
+        sent_at: iso8601_timestamp(),
+    })
+}
+
+fn resolve_attachment(path: &str) -> Result<ResolvedAttachment, String> {
+    let resolved = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+    let metadata = std::fs::metadata(&resolved).map_err(|error| error.to_string())?;
+    Ok(ResolvedAttachment {
+        path: resolved.display().to_string(),
+        size: metadata.len(),
+        is_image: is_image_path(&resolved),
+    })
+}
+
+fn is_image_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg")
+    )
+}
+
+fn execute_config(input: ConfigInput) -> Result<ConfigOutput, String> {
+    let setting = input.setting.trim();
+    if setting.is_empty() {
+        return Err(String::from("setting must not be empty"));
+    }
+    let Some(spec) = supported_config_setting(setting) else {
+        return Ok(ConfigOutput {
+            success: false,
+            operation: None,
+            setting: None,
+            value: None,
+            previous_value: None,
+            new_value: None,
+            error: Some(format!("Unknown setting: \"{setting}\"")),
+        });
+    };
+
+    let path = config_file_for_scope(spec.scope)?;
+    let mut document = read_json_object(&path)?;
+
+    if let Some(value) = input.value {
+        let normalized = normalize_config_value(spec, value)?;
+        let previous_value = get_nested_value(&document, spec.path).cloned();
+        set_nested_value(&mut document, spec.path, normalized.clone());
+        write_json_object(&path, &document)?;
+        Ok(ConfigOutput {
+            success: true,
+            operation: Some(String::from("set")),
+            setting: Some(setting.to_string()),
+            value: Some(normalized.clone()),
+            previous_value,
+            new_value: Some(normalized),
+            error: None,
+        })
+    } else {
+        Ok(ConfigOutput {
+            success: true,
+            operation: Some(String::from("get")),
+            setting: Some(setting.to_string()),
+            value: get_nested_value(&document, spec.path).cloned(),
+            previous_value: None,
+            new_value: None,
+            error: None,
+        })
+    }
+}
+
+fn execute_structured_output(input: StructuredOutputInput) -> StructuredOutputResult {
+    StructuredOutputResult {
+        data: String::from("Structured output provided successfully"),
+        structured_output: input.0,
+    }
+}
+
+fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
+    if input.code.trim().is_empty() {
+        return Err(String::from("code must not be empty"));
+    }
+    let _ = input.timeout_ms;
+    let runtime = resolve_repl_runtime(&input.language)?;
+    let started = Instant::now();
+    let output = Command::new(runtime.program)
+        .args(runtime.args)
+        .arg(&input.code)
+        .output()
+        .map_err(|error| error.to_string())?;
+
+    Ok(ReplOutput {
+        language: input.language,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        exit_code: output.status.code().unwrap_or(1),
+        duration_ms: started.elapsed().as_millis(),
+    })
+}
+
+struct ReplRuntime {
+    program: &'static str,
+    args: &'static [&'static str],
+}
+
+fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
+    match language.trim().to_ascii_lowercase().as_str() {
+        "python" | "py" => Ok(ReplRuntime {
+            program: detect_first_command(&["python3", "python"])
+                .ok_or_else(|| String::from("python runtime not found"))?,
+            args: &["-c"],
+        }),
+        "javascript" | "js" | "node" => Ok(ReplRuntime {
+            program: detect_first_command(&["node"])
+                .ok_or_else(|| String::from("node runtime not found"))?,
+            args: &["-e"],
+        }),
+        "sh" | "shell" | "bash" => Ok(ReplRuntime {
+            program: detect_first_command(&["bash", "sh"])
+                .ok_or_else(|| String::from("shell runtime not found"))?,
+            args: &["-lc"],
+        }),
+        other => Err(format!("unsupported REPL language: {other}")),
+    }
+}
+
+fn detect_first_command(commands: &[&'static str]) -> Option<&'static str> {
+    commands
+        .iter()
+        .copied()
+        .find(|command| command_exists(command))
+}
+
+#[derive(Clone, Copy)]
+enum ConfigScope {
+    Global,
+    Settings,
+}
+
+#[derive(Clone, Copy)]
+struct ConfigSettingSpec {
+    scope: ConfigScope,
+    kind: ConfigKind,
+    path: &'static [&'static str],
+    options: Option<&'static [&'static str]>,
+}
+
+#[derive(Clone, Copy)]
+enum ConfigKind {
+    Boolean,
+    String,
+}
+
+fn supported_config_setting(setting: &str) -> Option<ConfigSettingSpec> {
+    Some(match setting {
+        "theme" => ConfigSettingSpec {
+            scope: ConfigScope::Global,
+            kind: ConfigKind::String,
+            path: &["theme"],
+            options: None,
+        },
+        "editorMode" => ConfigSettingSpec {
+            scope: ConfigScope::Global,
+            kind: ConfigKind::String,
+            path: &["editorMode"],
+            options: Some(&["default", "vim", "emacs"]),
+        },
+        "verbose" => ConfigSettingSpec {
+            scope: ConfigScope::Global,
+            kind: ConfigKind::Boolean,
+            path: &["verbose"],
+            options: None,
+        },
+        "preferredNotifChannel" => ConfigSettingSpec {
+            scope: ConfigScope::Global,
+            kind: ConfigKind::String,
+            path: &["preferredNotifChannel"],
+            options: None,
+        },
+        "autoCompactEnabled" => ConfigSettingSpec {
+            scope: ConfigScope::Global,
+            kind: ConfigKind::Boolean,
+            path: &["autoCompactEnabled"],
+            options: None,
+        },
+        "autoMemoryEnabled" => ConfigSettingSpec {
+            scope: ConfigScope::Settings,
+            kind: ConfigKind::Boolean,
+            path: &["autoMemoryEnabled"],
+            options: None,
+        },
+        "autoDreamEnabled" => ConfigSettingSpec {
+            scope: ConfigScope::Settings,
+            kind: ConfigKind::Boolean,
+            path: &["autoDreamEnabled"],
+            options: None,
+        },
+        "fileCheckpointingEnabled" => ConfigSettingSpec {
+            scope: ConfigScope::Global,
+            kind: ConfigKind::Boolean,
+            path: &["fileCheckpointingEnabled"],
+            options: None,
+        },
+        "showTurnDuration" => ConfigSettingSpec {
+            scope: ConfigScope::Global,
+            kind: ConfigKind::Boolean,
+            path: &["showTurnDuration"],
+            options: None,
+        },
+        "terminalProgressBarEnabled" => ConfigSettingSpec {
+            scope: ConfigScope::Global,
+            kind: ConfigKind::Boolean,
+            path: &["terminalProgressBarEnabled"],
+            options: None,
+        },
+        "todoFeatureEnabled" => ConfigSettingSpec {
+            scope: ConfigScope::Global,
+            kind: ConfigKind::Boolean,
+            path: &["todoFeatureEnabled"],
+            options: None,
+        },
+        "model" => ConfigSettingSpec {
+            scope: ConfigScope::Settings,
+            kind: ConfigKind::String,
+            path: &["model"],
+            options: None,
+        },
+        "alwaysThinkingEnabled" => ConfigSettingSpec {
+            scope: ConfigScope::Settings,
+            kind: ConfigKind::Boolean,
+            path: &["alwaysThinkingEnabled"],
+            options: None,
+        },
+        "permissions.defaultMode" => ConfigSettingSpec {
+            scope: ConfigScope::Settings,
+            kind: ConfigKind::String,
+            path: &["permissions", "defaultMode"],
+            options: Some(&["default", "plan", "acceptEdits", "dontAsk", "auto"]),
+        },
+        "language" => ConfigSettingSpec {
+            scope: ConfigScope::Settings,
+            kind: ConfigKind::String,
+            path: &["language"],
+            options: None,
+        },
+        "teammateMode" => ConfigSettingSpec {
+            scope: ConfigScope::Global,
+            kind: ConfigKind::String,
+            path: &["teammateMode"],
+            options: Some(&["tmux", "in-process", "auto"]),
+        },
+        _ => return None,
+    })
+}
+
+fn normalize_config_value(spec: ConfigSettingSpec, value: ConfigValue) -> Result<Value, String> {
+    let normalized = match (spec.kind, value) {
+        (ConfigKind::Boolean, ConfigValue::Bool(value)) => Value::Bool(value),
+        (ConfigKind::Boolean, ConfigValue::String(value)) => {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "true" => Value::Bool(true),
+                "false" => Value::Bool(false),
+                _ => return Err(String::from("setting requires true or false")),
+            }
+        }
+        (ConfigKind::Boolean, ConfigValue::Number(_)) => {
+            return Err(String::from("setting requires true or false"))
+        }
+        (ConfigKind::String, ConfigValue::String(value)) => Value::String(value),
+        (ConfigKind::String, ConfigValue::Bool(value)) => Value::String(value.to_string()),
+        (ConfigKind::String, ConfigValue::Number(value)) => json!(value),
+    };
+
+    if let Some(options) = spec.options {
+        let Some(as_str) = normalized.as_str() else {
+            return Err(String::from("setting requires a string value"));
+        };
+        if !options.iter().any(|option| option == &as_str) {
+            return Err(format!(
+                "Invalid value \"{as_str}\". Options: {}",
+                options.join(", ")
+            ));
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn config_file_for_scope(scope: ConfigScope) -> Result<PathBuf, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    Ok(match scope {
+        ConfigScope::Global => config_home_dir()?.join("settings.json"),
+        ConfigScope::Settings => cwd.join(".claude").join("settings.local.json"),
+    })
+}
+
+fn config_home_dir() -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("CLAUDE_CONFIG_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = std::env::var("HOME").map_err(|_| String::from("HOME is not set"))?;
+    Ok(PathBuf::from(home).join(".claude"))
+}
+
+fn read_json_object(path: &Path) -> Result<serde_json::Map<String, Value>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => {
+            if contents.trim().is_empty() {
+                return Ok(serde_json::Map::new());
+            }
+            serde_json::from_str::<Value>(&contents)
+                .map_err(|error| error.to_string())?
+                .as_object()
+                .cloned()
+                .ok_or_else(|| String::from("config file must contain a JSON object"))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::Map::new()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn write_json_object(path: &Path, value: &serde_json::Map<String, Value>) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(value).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn get_nested_value<'a>(
+    value: &'a serde_json::Map<String, Value>,
+    path: &[&str],
+) -> Option<&'a Value> {
+    let (first, rest) = path.split_first()?;
+    let mut current = value.get(*first)?;
+    for key in rest {
+        current = current.as_object()?.get(*key)?;
+    }
+    Some(current)
+}
+
+fn set_nested_value(root: &mut serde_json::Map<String, Value>, path: &[&str], new_value: Value) {
+    let (first, rest) = path.split_first().expect("config path must not be empty");
+    if rest.is_empty() {
+        root.insert((*first).to_string(), new_value);
+        return;
+    }
+
+    let entry = root
+        .entry((*first).to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !entry.is_object() {
+        *entry = Value::Object(serde_json::Map::new());
+    }
+    let map = entry.as_object_mut().expect("object inserted");
+    set_nested_value(map, rest, new_value);
+}
+
+fn iso8601_timestamp() -> String {
+    if let Ok(output) = Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+    {
+        if output.status.success() {
+            return String::from_utf8_lossy(&output.stdout).trim().to_string();
+        }
+    }
+    iso8601_now()
+}
+
+#[allow(clippy::needless_pass_by_value)]
 fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCommandOutput> {
     let _ = &input.description;
     let shell = detect_powershell_shell()?;
@@ -1586,6 +2162,7 @@ fn command_exists(command: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_shell_command(
     shell: &str,
     command: &str,
@@ -1802,6 +2379,10 @@ mod tests {
         assert!(names.contains(&"ToolSearch"));
         assert!(names.contains(&"NotebookEdit"));
         assert!(names.contains(&"Sleep"));
+        assert!(names.contains(&"SendUserMessage"));
+        assert!(names.contains(&"Config"));
+        assert!(names.contains(&"StructuredOutput"));
+        assert!(names.contains(&"REPL"));
         assert!(names.contains(&"PowerShell"));
     }
 
@@ -2202,8 +2783,127 @@ mod tests {
     }
 
     #[test]
+    fn brief_returns_sent_message_and_attachment_metadata() {
+        let attachment = std::env::temp_dir().join(format!(
+            "clawd-brief-{}.png",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::write(&attachment, b"png-data").expect("write attachment");
+
+        let result = execute_tool(
+            "SendUserMessage",
+            &json!({
+                "message": "hello user",
+                "attachments": [attachment.display().to_string()],
+                "status": "normal"
+            }),
+        )
+        .expect("SendUserMessage should succeed");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["message"], "hello user");
+        assert!(output["sentAt"].as_str().is_some());
+        assert_eq!(output["attachments"][0]["isImage"], true);
+        let _ = std::fs::remove_file(attachment);
+    }
+
+    #[test]
+    fn config_reads_and_writes_supported_values() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "clawd-config-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let home = root.join("home");
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(home.join(".claude")).expect("home dir");
+        std::fs::create_dir_all(cwd.join(".claude")).expect("cwd dir");
+        std::fs::write(
+            home.join(".claude").join("settings.json"),
+            r#"{"verbose":false}"#,
+        )
+        .expect("write global settings");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_claude_home = std::env::var("CLAUDE_CONFIG_HOME").ok();
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAUDE_CONFIG_HOME");
+        std::env::set_current_dir(&cwd).expect("set cwd");
+
+        let get = execute_tool("Config", &json!({"setting": "verbose"})).expect("get config");
+        let get_output: serde_json::Value = serde_json::from_str(&get).expect("json");
+        assert_eq!(get_output["value"], false);
+
+        let set = execute_tool(
+            "Config",
+            &json!({"setting": "permissions.defaultMode", "value": "plan"}),
+        )
+        .expect("set config");
+        let set_output: serde_json::Value = serde_json::from_str(&set).expect("json");
+        assert_eq!(set_output["operation"], "set");
+        assert_eq!(set_output["newValue"], "plan");
+
+        let invalid = execute_tool(
+            "Config",
+            &json!({"setting": "permissions.defaultMode", "value": "bogus"}),
+        )
+        .expect_err("invalid config value should error");
+        assert!(invalid.contains("Invalid value"));
+
+        let unknown =
+            execute_tool("Config", &json!({"setting": "nope"})).expect("unknown setting result");
+        let unknown_output: serde_json::Value = serde_json::from_str(&unknown).expect("json");
+        assert_eq!(unknown_output["success"], false);
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_claude_home {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn structured_output_echoes_input_payload() {
+        let result = execute_tool("StructuredOutput", &json!({"ok": true, "items": [1, 2, 3]}))
+            .expect("StructuredOutput should succeed");
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["data"], "Structured output provided successfully");
+        assert_eq!(output["structured_output"]["ok"], true);
+        assert_eq!(output["structured_output"]["items"][1], 2);
+    }
+
+    #[test]
+    fn repl_executes_python_code() {
+        let result = execute_tool(
+            "REPL",
+            &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 500}),
+        )
+        .expect("REPL should succeed");
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["language"], "python");
+        assert_eq!(output["exitCode"], 0);
+        assert!(output["stdout"].as_str().expect("stdout").contains('2'));
+    }
+
+    #[test]
     fn powershell_runs_via_stub_shell() {
-        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = std::env::temp_dir().join(format!(
             "clawd-pwsh-bin-{}",
             std::time::SystemTime::now()
@@ -2257,7 +2957,9 @@ printf 'pwsh:%s' "$1"
 
     #[test]
     fn powershell_errors_when_shell_is_missing() {
-        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let original_path = std::env::var("PATH").unwrap_or_default();
         let empty_dir = std::env::temp_dir().join(format!(
             "clawd-empty-bin-{}",

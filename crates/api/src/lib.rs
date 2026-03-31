@@ -3,7 +3,7 @@ mod error;
 mod sse;
 mod types;
 
-pub use client::{MessageStream, NanoGptClient};
+pub use client::{resolve_api_key, MessageStream, NanoGptClient};
 pub use error::ApiError;
 pub use sse::{parse_frame, SseParser};
 pub use types::{

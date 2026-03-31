@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "api"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "reqwest",
  "serde",
@@ -99,14 +99,14 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "commands"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "runtime",
 ]
 
 [[package]]
 name = "compat-harness"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "commands",
  "runtime",
@@ -672,13 +672,14 @@ dependencies = [
 
 [[package]]
 name = "nanocode"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "api",
  "commands",
  "compat-harness",
  "crossterm",
  "pulldown-cmark",
+ "reqwest",
  "runtime",
  "serde",
  "serde_json",
@@ -1029,7 +1030,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "glob",
  "regex",
@@ -1431,7 +1432,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "reqwest",
  "runtime",

@@ -303,6 +303,10 @@ fn read_api_key() -> Result<String, ApiError> {
     }
 }
 
+pub fn resolve_api_key() -> Result<String, ApiError> {
+    read_api_key()
+}
+
 fn read_base_url() -> String {
     std::env::var("NANOGPT_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
 }
