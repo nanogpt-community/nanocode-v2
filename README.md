@@ -6,7 +6,7 @@ NanoCode v2 is a rust based agentic coding harness for the nanogpt API
 
 - XML tool calling via /proxy command
 - Select any nanogpt model via /model
-- Provider selection (WIP - This currently uses openai api instead of anthropic v1)
+- Provider selection via /provider (WIP - This currently uses openai api instead of anthropic v1)
 
 ## Prerequisites
 
