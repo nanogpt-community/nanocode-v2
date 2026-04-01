@@ -9,12 +9,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use api::{
-    resolve_api_key as resolve_nanogpt_api_key, ApiError, ChatCompletionAssistantMessage,
-    ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionTool,
-    ChatCompletionToolChoice, ContentBlockDelta, ImageSource, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, NanoGptClient, OutputContentBlock,
-    StreamEvent as ApiStreamEvent, ThinkingConfig, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    resolve_api_key as resolve_nanogpt_api_key, ApiError, ContentBlockDelta, ImageSource,
+    InputContentBlock, InputMessage, MessageRequest, MessageResponse, NanoGptClient,
+    OutputContentBlock, StreamEvent as ApiStreamEvent, ThinkingConfig, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -3419,9 +3417,6 @@ impl ApiClient for NanoCodeRuntimeClient {
         if self.proxy_tool_calls {
             return self.stream_via_proxy(request);
         }
-        if self.client_provider_active() {
-            return self.stream_via_chat_completions(request);
-        }
 
         let message_request = MessageRequest {
             model: self.model.clone(),
@@ -3597,18 +3592,10 @@ impl ApiClient for NanoCodeRuntimeClient {
 }
 
 impl NanoCodeRuntimeClient {
-    fn client_provider_active(&self) -> bool {
-        provider_for_model(&self.model).is_some()
-    }
-
     fn stream_via_proxy(
         &mut self,
         request: ApiRequest,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        if self.client_provider_active() {
-            return self.stream_proxy_via_chat_completions(request);
-        }
-
         let mut messages = convert_proxy_messages_to_input_messages(
             convert_messages_for_proxy(&request.messages).map_err(RuntimeError::new)?,
         );
@@ -3652,124 +3639,6 @@ impl NanoCodeRuntimeClient {
                     Box::new(io::sink())
                 };
                 return proxy_response_to_events(retry_response, output.as_mut(), &self.tool_specs);
-            }
-
-            let mut output: Box<dyn Write> = if self.render_output {
-                Box::new(io::stdout())
-            } else {
-                Box::new(io::sink())
-            };
-            output
-                .write_all(&first_render)
-                .and_then(|_| output.flush())
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
-            Ok(first_events)
-        })
-    }
-
-    fn stream_via_chat_completions(
-        &mut self,
-        request: ApiRequest,
-    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let completion_request = ChatCompletionRequest {
-            model: self.model.clone(),
-            messages: convert_messages_to_chat_completions(
-                &request.messages,
-                &request.system_prompt,
-            ),
-            max_tokens: Some(self.max_output_tokens),
-            tools: self.enable_tools.then(|| {
-                self.tool_specs
-                    .iter()
-                    .map(|spec| ChatCompletionTool {
-                        kind: "function".to_string(),
-                        function: api::ChatCompletionFunction {
-                            name: spec.name.clone(),
-                            description: Some(spec.description.clone()),
-                            parameters: Some(spec.input_schema.clone()),
-                        },
-                    })
-                    .collect()
-            }),
-            tool_choice: self
-                .enable_tools
-                .then_some(ChatCompletionToolChoice::Mode("auto".to_string())),
-            billing_mode: provider_for_model(&self.model).map(|_| "paygo".to_string()),
-            stream: false,
-        };
-
-        self.runtime.block_on(async {
-            let response = self
-                .client
-                .send_chat_completion(&completion_request)
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
-            let mut output: Box<dyn Write> = if self.render_output {
-                Box::new(io::stdout())
-            } else {
-                Box::new(io::sink())
-            };
-            chat_completion_response_to_events(response, output.as_mut())
-        })
-    }
-
-    fn stream_proxy_via_chat_completions(
-        &mut self,
-        request: ApiRequest,
-    ) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        let mut messages = convert_proxy_messages_to_chat_completions(
-            &request.system_prompt,
-            convert_messages_for_proxy(&request.messages).map_err(RuntimeError::new)?,
-        );
-        let base_completion_request = ChatCompletionRequest {
-            model: self.model.clone(),
-            messages: messages.clone(),
-            max_tokens: Some(self.max_output_tokens),
-            tools: None,
-            tool_choice: None,
-            billing_mode: provider_for_model(&self.model).map(|_| "paygo".to_string()),
-            stream: false,
-        };
-
-        self.runtime.block_on(async {
-            let response = self
-                .client
-                .send_chat_completion(&base_completion_request)
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
-            let mut first_render = Vec::new();
-            let first_events = proxy_chat_completion_response_to_events(
-                response,
-                &mut first_render,
-                &self.tool_specs,
-            )?;
-
-            if should_retry_proxy_tool_prompt(&first_events) {
-                messages.push(ChatCompletionMessage {
-                    role: "user".to_string(),
-                    content: Some(proxy_retry_reminder().to_string()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                });
-                let retry_request = ChatCompletionRequest {
-                    messages,
-                    ..base_completion_request
-                };
-                let retry_response = self
-                    .client
-                    .send_chat_completion(&retry_request)
-                    .await
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
-                let mut output: Box<dyn Write> = if self.render_output {
-                    Box::new(io::stdout())
-                } else {
-                    Box::new(io::sink())
-                };
-                return proxy_chat_completion_response_to_events(
-                    retry_response,
-                    output.as_mut(),
-                    &self.tool_specs,
-                );
             }
 
             let mut output: Box<dyn Write> = if self.render_output {
@@ -4018,95 +3887,6 @@ fn proxy_response_to_events(
         cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
         cache_read_input_tokens: response.usage.cache_read_input_tokens,
     }));
-    events.push(AssistantEvent::MessageStop);
-    Ok(events)
-}
-
-fn chat_completion_response_to_events(
-    response: ChatCompletionResponse,
-    out: &mut (impl Write + ?Sized),
-) -> Result<Vec<AssistantEvent>, RuntimeError> {
-    let mut events = Vec::new();
-    let Some(choice) = response.choices.into_iter().next() else {
-        return Err(RuntimeError::new(
-            "nanogpt chat completion returned no choices".to_string(),
-        ));
-    };
-
-    let ChatCompletionAssistantMessage {
-        content,
-        tool_calls,
-        ..
-    } = choice.message;
-
-    if let Some(content) = content.filter(|content| !content.is_empty()) {
-        write!(out, "{content}")
-            .and_then(|_| out.flush())
-            .map_err(|error| RuntimeError::new(error.to_string()))?;
-        events.push(AssistantEvent::TextDelta(content));
-    }
-
-    if let Some(tool_calls) = tool_calls {
-        for tool_call in tool_calls {
-            events.push(AssistantEvent::ToolUse {
-                id: tool_call.id,
-                name: tool_call.function.name,
-                input: tool_call.function.arguments,
-            });
-        }
-    }
-
-    if let Some(usage) = response.usage {
-        events.push(AssistantEvent::Usage(TokenUsage {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        }));
-    }
-    events.push(AssistantEvent::MessageStop);
-    Ok(events)
-}
-
-fn proxy_chat_completion_response_to_events(
-    response: ChatCompletionResponse,
-    out: &mut (impl Write + ?Sized),
-    tool_specs: &[RuntimeToolSpec],
-) -> Result<Vec<AssistantEvent>, RuntimeError> {
-    let mut events = Vec::new();
-    let Some(choice) = response.choices.into_iter().next() else {
-        return Err(RuntimeError::new(
-            "nanogpt chat completion returned no choices".to_string(),
-        ));
-    };
-    let ChatCompletionAssistantMessage {
-        content,
-        tool_calls,
-        ..
-    } = choice.message;
-    append_proxy_text_events(
-        content.as_deref().unwrap_or_default(),
-        out,
-        &mut events,
-        tool_specs,
-    )?;
-    if let Some(tool_calls) = tool_calls {
-        for tool_call in tool_calls {
-            events.push(AssistantEvent::ToolUse {
-                id: tool_call.id,
-                name: tool_call.function.name,
-                input: tool_call.function.arguments,
-            });
-        }
-    }
-    if let Some(usage) = response.usage {
-        events.push(AssistantEvent::Usage(TokenUsage {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        }));
-    }
     events.push(AssistantEvent::MessageStop);
     Ok(events)
 }
@@ -4770,130 +4550,6 @@ fn convert_proxy_messages_to_input_messages(messages: Vec<ProxyMessage>) -> Vec<
             }],
         })
         .collect()
-}
-
-fn convert_messages_to_chat_completions(
-    messages: &[ConversationMessage],
-    system_prompt: &[String],
-) -> Vec<ChatCompletionMessage> {
-    let mut converted = Vec::new();
-    if !system_prompt.is_empty() {
-        converted.push(ChatCompletionMessage {
-            role: "system".to_string(),
-            content: Some(system_prompt.join("\n\n")),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-    }
-
-    for message in messages {
-        match message.role {
-            MessageRole::System => {
-                let content = collect_text_blocks(&message.blocks);
-                if !content.is_empty() {
-                    converted.push(ChatCompletionMessage {
-                        role: "system".to_string(),
-                        content: Some(content),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    });
-                }
-            }
-            MessageRole::User => {
-                let content = collect_text_blocks(&message.blocks);
-                if !content.is_empty() {
-                    converted.push(ChatCompletionMessage {
-                        role: "user".to_string(),
-                        content: Some(content),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    });
-                }
-            }
-            MessageRole::Assistant => {
-                let content = collect_text_blocks(&message.blocks);
-                let tool_calls = message
-                    .blocks
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::ToolUse { id, name, input } => {
-                            Some(api::ChatCompletionToolCall {
-                                id: id.clone(),
-                                kind: "function".to_string(),
-                                function: api::ChatCompletionFunctionCall {
-                                    name: name.clone(),
-                                    arguments: input.clone(),
-                                },
-                            })
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                if !content.is_empty() || !tool_calls.is_empty() {
-                    converted.push(ChatCompletionMessage {
-                        role: "assistant".to_string(),
-                        content: (!content.is_empty()).then_some(content),
-                        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
-                        tool_call_id: None,
-                    });
-                }
-            }
-            MessageRole::Tool => {
-                for block in &message.blocks {
-                    if let ContentBlock::ToolResult {
-                        tool_use_id,
-                        output,
-                        ..
-                    } = block
-                    {
-                        converted.push(ChatCompletionMessage {
-                            role: "tool".to_string(),
-                            content: Some(output.clone()),
-                            tool_calls: None,
-                            tool_call_id: Some(tool_use_id.clone()),
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    converted
-}
-
-fn convert_proxy_messages_to_chat_completions(
-    system_prompt: &[String],
-    messages: Vec<ProxyMessage>,
-) -> Vec<ChatCompletionMessage> {
-    let mut converted = Vec::new();
-    if !system_prompt.is_empty() {
-        converted.push(ChatCompletionMessage {
-            role: "system".to_string(),
-            content: Some(system_prompt.join("\n\n")),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-    }
-
-    converted.extend(messages.into_iter().map(|message| ChatCompletionMessage {
-        role: message.role,
-        content: Some(message.content),
-        tool_calls: None,
-        tool_call_id: None,
-    }));
-    converted
-}
-
-fn collect_text_blocks(blocks: &[ContentBlock]) -> String {
-    blocks
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            ContentBlock::Thinking { .. } => None,
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
 }
 
 fn format_thinking_report(enabled: bool) -> String {
@@ -6042,17 +5698,16 @@ mod tests {
         append_proxy_text_events, available_runtime_tool_specs, extract_first_json_object,
         filter_runtime_tool_specs, parse_args, parse_auth_command, parse_checksum_for_asset,
         parse_mcp_command, parse_model_command, parse_provider_command, parse_proxy_command,
-        parse_tool_input_value, prompt_to_content_blocks, proxy_chat_completion_response_to_events,
-        proxy_response_to_events, push_output_block, render_streamed_tool_call_start,
-        render_tool_result_markdown, render_update_report, resolve_model_alias, response_to_events,
-        should_retry_proxy_tool_prompt, AssistantEvent, CliAction, CliOutputFormat, GitHubRelease,
-        GitHubReleaseAsset, McpCatalog, McpCommand, RuntimeToolSpec, DEFAULT_MODEL,
+        parse_tool_input_value, prompt_to_content_blocks, proxy_response_to_events,
+        push_output_block, render_streamed_tool_call_start, render_tool_result_markdown,
+        render_update_report, resolve_model_alias, response_to_events,
+        should_retry_proxy_tool_prompt, AssistantEvent, CliAction, CliOutputFormat,
+        GitHubRelease, GitHubReleaseAsset, McpCatalog, McpCommand, RuntimeToolSpec,
+        DEFAULT_MODEL,
     };
     use crate::proxy::ProxyCommand;
     use api::{
-        ChatCompletionAssistantMessage, ChatCompletionChoice, ChatCompletionFunctionCall,
-        ChatCompletionResponse, ChatCompletionToolCall, ChatCompletionUsage, InputContentBlock,
-        MessageResponse, OutputContentBlock, Usage,
+        InputContentBlock, MessageResponse, OutputContentBlock, Usage,
     };
     use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode};
     use serde_json::json;
@@ -6713,52 +6368,6 @@ mod tests {
             &events[1],
             AssistantEvent::ToolUse { id, name, input }
                 if id == "toolu_1"
-                    && name == "read_file"
-                    && input == "{\"path\":\"README.md\"}"
-        ));
-    }
-
-    #[test]
-    fn proxy_chat_completion_responses_preserve_native_tool_calls() {
-        let response = ChatCompletionResponse {
-            id: "chatcmpl_123".to_string(),
-            object: "chat.completion".to_string(),
-            created: 0,
-            choices: vec![ChatCompletionChoice {
-                index: 0,
-                message: ChatCompletionAssistantMessage {
-                    role: "assistant".to_string(),
-                    content: Some("I will inspect this.\n\n".to_string()),
-                    tool_calls: Some(vec![ChatCompletionToolCall {
-                        id: "call_1".to_string(),
-                        kind: "function".to_string(),
-                        function: ChatCompletionFunctionCall {
-                            name: "read_file".to_string(),
-                            arguments: "{\"path\":\"README.md\"}".to_string(),
-                        },
-                    }]),
-                },
-                finish_reason: Some("tool_calls".to_string()),
-            }],
-            usage: Some(ChatCompletionUsage {
-                prompt_tokens: 10,
-                completion_tokens: 5,
-                total_tokens: 15,
-            }),
-            service_tier: None,
-        };
-
-        let events =
-            proxy_chat_completion_response_to_events(response, &mut Vec::new(), &tool_specs())
-                .expect("proxy chat completion should convert");
-        assert!(matches!(
-            &events[0],
-            AssistantEvent::TextDelta(text) if text == "I will inspect this.\n\n"
-        ));
-        assert!(matches!(
-            &events[1],
-            AssistantEvent::ToolUse { id, name, input }
-                if id == "call_1"
                     && name == "read_file"
                     && input == "{\"path\":\"README.md\"}"
         ));
