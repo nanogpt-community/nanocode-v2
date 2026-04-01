@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::config::{
-    McpOAuthConfig, McpServerConfig, McpStdioStderrMode, ScopedMcpServerConfig,
-};
+use crate::config::{McpOAuthConfig, McpServerConfig, McpStdioStderrMode, ScopedMcpServerConfig};
 use crate::mcp::{mcp_server_signature, mcp_tool_prefix, normalize_name_for_mcp};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,8 +127,7 @@ mod tests {
 
     use crate::config::{
         ConfigSource, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig,
-        McpStdioServerConfig, McpStdioStderrMode, McpWebSocketServerConfig,
-        ScopedMcpServerConfig,
+        McpStdioServerConfig, McpStdioStderrMode, McpWebSocketServerConfig, ScopedMcpServerConfig,
     };
 
     use super::{McpClientAuth, McpClientBootstrap, McpClientTransport};

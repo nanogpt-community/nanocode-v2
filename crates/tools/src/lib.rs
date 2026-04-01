@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use reqwest::blocking::Client;
 use runtime::{
     edit_file, execute_bash, glob_search, grep_search, read_file, write_file, BashCommandInput,
-    GrepSearchInput,
+    GrepSearchInput, PermissionMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -45,6 +45,7 @@ pub struct ToolSpec {
     pub name: &'static str,
     pub description: &'static str,
     pub input_schema: Value,
+    pub required_permission: PermissionMode,
 }
 
 #[must_use]
@@ -66,6 +67,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["command"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
             name: "read_file",
@@ -80,6 +82,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["path"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "write_file",
@@ -93,6 +96,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["path", "content"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
             name: "edit_file",
@@ -108,6 +112,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["path", "old_string", "new_string"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
             name: "glob_search",
@@ -121,6 +126,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["pattern"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "grep_search",
@@ -146,6 +152,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["pattern"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "WebFetch",
@@ -160,6 +167,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["url", "prompt"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "WebSearch",
@@ -180,6 +188,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["query"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "TodoWrite",
@@ -207,6 +216,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["todos"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
             name: "Skill",
@@ -220,6 +230,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["skill"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "Agent",
@@ -236,6 +247,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["description", "prompt"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
             name: "ToolSearch",
@@ -249,6 +261,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["query"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "NotebookEdit",
@@ -265,6 +278,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["notebook_path"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
             name: "Sleep",
@@ -277,6 +291,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["duration_ms"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "SendUserMessage",
@@ -297,6 +312,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["message", "status"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "Config",
@@ -312,6 +328,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["setting"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
             name: "StructuredOutput",
@@ -320,6 +337,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "additionalProperties": true
             }),
+            required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
             name: "REPL",
@@ -334,6 +352,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["code", "language"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
             name: "PowerShell",
@@ -349,6 +368,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["command"],
                 "additionalProperties": false
             }),
+            required_permission: PermissionMode::DangerFullAccess,
         },
     ]
 }

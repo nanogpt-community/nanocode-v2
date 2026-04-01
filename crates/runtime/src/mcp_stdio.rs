@@ -563,13 +563,15 @@ impl McpServerManager {
             }
 
             let server = self.server_mut(server_name)?;
-            let process = server.process.as_mut().ok_or_else(|| {
-                McpServerManagerError::InvalidResponse {
-                    server_name: server_name.to_string(),
-                    method: "notifications/initialized",
-                    details: "server process missing after initialize".to_string(),
-                }
-            })?;
+            let process =
+                server
+                    .process
+                    .as_mut()
+                    .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                        server_name: server_name.to_string(),
+                        method: "notifications/initialized",
+                        details: "server process missing after initialize".to_string(),
+                    })?;
             process.send_initialized_notification().await?;
             server.initialized = true;
         }
@@ -877,8 +879,7 @@ mod tests {
 
     use crate::config::{
         ConfigSource, McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig,
-        McpStdioServerConfig, McpStdioStderrMode, McpWebSocketServerConfig,
-        ScopedMcpServerConfig,
+        McpStdioServerConfig, McpStdioStderrMode, McpWebSocketServerConfig, ScopedMcpServerConfig,
     };
     use crate::mcp::mcp_tool_name;
     use crate::mcp_client::McpClientBootstrap;

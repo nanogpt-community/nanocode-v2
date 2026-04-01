@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use runtime::{ContentBlock, ConversationMessage, MessageRole};
+use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode};
 use serde_json::{Map, Number, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8,6 +8,7 @@ pub struct RuntimeToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    pub required_permission: PermissionMode,
 }
 
 impl From<tools::ToolSpec> for RuntimeToolSpec {
@@ -16,6 +17,7 @@ impl From<tools::ToolSpec> for RuntimeToolSpec {
             name: value.name.to_string(),
             description: value.description.to_string(),
             input_schema: value.input_schema,
+            required_permission: value.required_permission,
         }
     }
 }

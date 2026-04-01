@@ -3,12 +3,12 @@ mod models;
 mod proxy;
 mod render;
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::collections::BTreeSet;
 
 use api::{
     resolve_api_key as resolve_nanogpt_api_key, ApiError, ChatCompletionAssistantMessage,
@@ -40,7 +40,8 @@ use runtime::{
     ConversationMessage, ConversationRuntime, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
     McpClientAuth, McpClientBootstrap, McpClientTransport, McpInitializeClientInfo,
     McpInitializeParams, McpListToolsParams, McpListToolsResult, McpToolCallParams,
-    McpToolCallResult, McpTransport, MessageRole, PermissionMode, PermissionPolicy, RuntimeError,
+    McpToolCallResult, McpTransport, MessageRole, PermissionMode, PermissionPolicy,
+    PermissionPromptDecision, PermissionPrompter, PermissionRequest, RuntimeError,
     ScopedMcpServerConfig, Session, TokenUsage, ToolError, ToolExecutor,
 };
 use tools::{execute_tool, mvp_tool_specs};
@@ -80,11 +81,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             prompt,
             model,
             allowed_tools,
-        } => LiveCli::new(model, false, allowed_tools)?.run_turn(&prompt)?,
+            permission_mode,
+        } => LiveCli::new(model, false, allowed_tools, permission_mode)?.run_turn(&prompt)?,
         CliAction::Repl {
             model,
             allowed_tools,
-        } => run_repl(model, allowed_tools)?,
+            permission_mode,
+        } => run_repl(model, allowed_tools, permission_mode)?,
         CliAction::Login { api_key } => login(api_key)?,
         CliAction::Help => print_help(),
         CliAction::Version => print_version(),
@@ -120,6 +123,7 @@ enum CliAction {
         prompt: String,
         model: String,
         allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
     },
     Login {
         api_key: Option<String>,
@@ -127,6 +131,7 @@ enum CliAction {
     Repl {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
     },
     Help,
     Version,
@@ -167,6 +172,7 @@ struct McpCatalog {
 
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut model = default_model_or(DEFAULT_MODEL);
+    let mut permission_mode = default_permission_mode();
     let mut allowed_tool_values = Vec::new();
     let mut rest = Vec::new();
     let mut index = 0;
@@ -182,6 +188,17 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             flag if flag.starts_with("--model=") => {
                 model = flag[8..].to_string();
+                index += 1;
+            }
+            "--permission-mode" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --permission-mode".to_string())?;
+                permission_mode = parse_permission_mode_arg(value)?;
+                index += 2;
+            }
+            flag if flag.starts_with("--permission-mode=") => {
+                permission_mode = parse_permission_mode_arg(&flag[18..])?;
                 index += 1;
             }
             "--allowedTools" | "--allowed-tools" => {
@@ -212,6 +229,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         return Ok(CliAction::Repl {
             model,
             allowed_tools,
+            permission_mode,
         });
     }
     if matches!(rest.first().map(String::as_str), Some("--help" | "-h")) {
@@ -242,6 +260,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 prompt,
                 model,
                 allowed_tools,
+                permission_mode,
             })
         }
         other => Err(format!("unknown subcommand: {other}")),
@@ -681,6 +700,58 @@ fn parse_mcp_command(input: &str) -> Option<Result<McpCommand, String>> {
     })
 }
 
+fn parse_permissions_command(input: &str) -> Option<Result<Option<PermissionMode>, String>> {
+    let mut parts = input.split_whitespace();
+    let command = parts.next()?;
+    if command != "/permissions" {
+        return None;
+    }
+
+    let remainder = parts.collect::<Vec<_>>().join(" ");
+    if remainder.trim().is_empty() {
+        return Some(Ok(None));
+    }
+    Some(parse_permission_mode_arg(remainder.trim()).map(Some))
+}
+
+fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "read-only" | "readonly" | "read_only" => Some("read-only"),
+        "workspace-write" | "workspacewrite" | "workspace_write" => Some("workspace-write"),
+        "danger-full-access" | "dangerfullaccess" | "danger_full_access" => {
+            Some("danger-full-access")
+        }
+        _ => None,
+    }
+}
+
+fn permission_mode_from_label(mode: &str) -> PermissionMode {
+    match mode {
+        "read-only" => PermissionMode::ReadOnly,
+        "workspace-write" => PermissionMode::WorkspaceWrite,
+        "danger-full-access" => PermissionMode::DangerFullAccess,
+        other => panic!("unsupported permission mode label: {other}"),
+    }
+}
+
+fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
+    normalize_permission_mode(value)
+        .ok_or_else(|| {
+            format!(
+                "unsupported permission mode '{value}'. Use read-only, workspace-write, or danger-full-access."
+            )
+        })
+        .map(permission_mode_from_label)
+}
+
+fn default_permission_mode() -> PermissionMode {
+    env::var("NANOCODE_PERMISSION_MODE")
+        .ok()
+        .as_deref()
+        .and_then(normalize_permission_mode)
+        .map_or(PermissionMode::WorkspaceWrite, permission_mode_from_label)
+}
+
 fn is_clear_provider_arg(value: &str) -> bool {
     matches!(value, "default" | "none" | "clear")
 }
@@ -760,7 +831,8 @@ fn filter_runtime_tool_specs(
     specs: Vec<RuntimeToolSpec>,
     allowed_tools: Option<&AllowedToolSet>,
 ) -> Vec<RuntimeToolSpec> {
-    specs.into_iter()
+    specs
+        .into_iter()
         .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(&spec.name)))
         .collect()
 }
@@ -925,10 +997,8 @@ fn managed_nanogpt_mcp_binary_path(root: &Path) -> PathBuf {
 }
 
 fn install_managed_nanogpt_mcp(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let npm_cache = std::env::temp_dir().join(format!(
-        "nanocode-npm-cache-install-{}",
-        std::process::id()
-    ));
+    let npm_cache =
+        std::env::temp_dir().join(format!("nanocode-npm-cache-install-{}", std::process::id()));
     fs::create_dir_all(&npm_cache)?;
 
     let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
@@ -1304,9 +1374,7 @@ async fn http_jsonrpc_notification(
     params: Option<JsonValue>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    let mut request = client
-        .post(url)
-        .header("content-type", "application/json");
+    let mut request = client.post(url).header("content-type", "application/json");
     for (key, value) in headers {
         request = request.header(
             HeaderName::from_bytes(key.as_bytes())?,
@@ -1402,6 +1470,7 @@ impl McpCatalog {
                     tool.server_name, tool.upstream_name, tool.description
                 ),
                 input_schema: tool.input_schema.clone(),
+                required_permission: PermissionMode::DangerFullAccess,
             })
             .collect()
     }
@@ -1414,8 +1483,9 @@ impl McpCatalog {
 fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cli = LiveCli::new(model, true, allowed_tools)?;
+    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
     let editor = input::LineEditor::new("› ");
     println!("NanoCode interactive mode");
     println!("Type /help for commands. Shift+Enter or Ctrl+J inserts a newline.");
@@ -1459,6 +1529,10 @@ fn run_repl(
             handle_mcp_runtime_command(&mut cli, command?)?;
             continue;
         }
+        if let Some(mode) = parse_permissions_command(trimmed) {
+            cli.set_permissions(mode?)?;
+            continue;
+        }
         match trimmed {
             "/exit" | "/quit" => break,
             "/help" => {
@@ -1470,6 +1544,7 @@ fn run_repl(
                 println!("  /provider Choose a provider override for the current model only");
                 println!("  /proxy   Toggle XML tool-call proxy mode (or /proxy on|off|status)");
                 println!("  /mcp     Show MCP status, tools, or reload config (/mcp [status|tools|reload])");
+                println!("  /permissions Show or switch permission mode");
                 println!("  /status  Show session status");
                 println!("  /compact Compact session history");
                 println!("  /exit    Quit the REPL");
@@ -1486,6 +1561,7 @@ fn run_repl(
 struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
     system_prompt: Vec<String>,
     proxy_tool_calls: bool,
     mcp_catalog: McpCatalog,
@@ -1497,6 +1573,7 @@ impl LiveCli {
         model: String,
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let proxy_tool_calls = proxy_tool_calls_enabled();
@@ -1509,10 +1586,12 @@ impl LiveCli {
             proxy_tool_calls,
             mcp_catalog.clone(),
             allowed_tools.clone(),
+            permission_mode,
         )?;
         Ok(Self {
             model,
             allowed_tools,
+            permission_mode,
             system_prompt,
             proxy_tool_calls,
             mcp_catalog,
@@ -1528,7 +1607,8 @@ impl LiveCli {
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
-        let result = self.runtime.run_turn(input, None);
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
         match result {
             Ok(_) => {
                 spinner.finish(
@@ -1555,8 +1635,9 @@ impl LiveCli {
         let provider =
             provider_for_model(&self.model).unwrap_or_else(|| "<platform default>".to_string());
         println!(
-            "status: model={} provider_for_current_model={} proxy_tool_calls={} messages={} turns={} input_tokens={} output_tokens={}",
+            "status: model={} permission_mode={} provider_for_current_model={} proxy_tool_calls={} messages={} turns={} input_tokens={} output_tokens={}",
             self.model,
+            self.permission_mode.as_str(),
             provider,
             if self.proxy_tool_calls {
                 "enabled"
@@ -1591,6 +1672,7 @@ impl LiveCli {
             self.proxy_tool_calls,
             self.mcp_catalog.clone(),
             self.allowed_tools.clone(),
+            self.permission_mode,
         )?;
         println!("Compacted {removed} messages.");
         Ok(())
@@ -1607,6 +1689,7 @@ impl LiveCli {
             self.proxy_tool_calls,
             self.mcp_catalog.clone(),
             self.allowed_tools.clone(),
+            self.permission_mode,
         )?;
         self.model = model.clone();
         let provider =
@@ -1633,6 +1716,7 @@ impl LiveCli {
             self.proxy_tool_calls,
             self.mcp_catalog.clone(),
             self.allowed_tools.clone(),
+            self.permission_mode,
         )?;
         if provider_label == "<platform default>" {
             println!(
@@ -1659,6 +1743,7 @@ impl LiveCli {
             enabled,
             self.mcp_catalog.clone(),
             self.allowed_tools.clone(),
+            self.permission_mode,
         )?;
         self.proxy_tool_calls = enabled;
         println!(
@@ -1684,6 +1769,7 @@ impl LiveCli {
             self.proxy_tool_calls,
             catalog.clone(),
             self.allowed_tools.clone(),
+            self.permission_mode,
         )?;
         self.mcp_catalog = catalog;
         println!("Reloaded MCP config.");
@@ -1697,6 +1783,35 @@ impl LiveCli {
 
     fn print_mcp_tools(&self) {
         print_mcp_tools(&self.mcp_catalog);
+    }
+
+    fn set_permissions(
+        &mut self,
+        mode: Option<PermissionMode>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(mode) = mode else {
+            println!("Permission mode: {}", self.permission_mode.as_str());
+            return Ok(());
+        };
+        if mode == self.permission_mode {
+            println!("Permission mode: {}", self.permission_mode.as_str());
+            return Ok(());
+        }
+
+        let session = self.runtime.session().clone();
+        self.permission_mode = mode;
+        self.runtime = build_runtime(
+            session,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            self.proxy_tool_calls,
+            self.mcp_catalog.clone(),
+            self.allowed_tools.clone(),
+            self.permission_mode,
+        )?;
+        println!("Permission mode: {}", self.permission_mode.as_str());
+        Ok(())
     }
 }
 
@@ -1739,6 +1854,49 @@ fn handle_mcp_runtime_command(
     }
 }
 
+struct CliPermissionPrompter {
+    current_mode: PermissionMode,
+}
+
+impl CliPermissionPrompter {
+    fn new(current_mode: PermissionMode) -> Self {
+        Self { current_mode }
+    }
+}
+
+impl PermissionPrompter for CliPermissionPrompter {
+    fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
+        println!();
+        println!("Permission approval required");
+        println!("  Tool             {}", request.tool_name);
+        println!("  Current mode     {}", self.current_mode.as_str());
+        println!("  Required mode    {}", request.required_mode.as_str());
+        println!("  Input            {}", request.input);
+        print!("Approve this tool call? [y/N]: ");
+        let _ = io::stdout().flush();
+
+        let mut response = String::new();
+        match io::stdin().read_line(&mut response) {
+            Ok(_) => {
+                let normalized = response.trim().to_ascii_lowercase();
+                if matches!(normalized.as_str(), "y" | "yes") {
+                    PermissionPromptDecision::Allow
+                } else {
+                    PermissionPromptDecision::Deny {
+                        reason: format!(
+                            "tool '{}' denied by user approval prompt",
+                            request.tool_name
+                        ),
+                    }
+                }
+            }
+            Err(error) => PermissionPromptDecision::Deny {
+                reason: format!("permission approval failed: {error}"),
+            },
+        }
+    }
+}
+
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     Ok(load_system_prompt(
         env::current_dir()?,
@@ -1756,10 +1914,14 @@ fn build_runtime(
     proxy_tool_calls: bool,
     mcp_catalog: McpCatalog,
     allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
 ) -> Result<ConversationRuntime<NanoCodeRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     let tool_specs = if enable_tools {
-        filter_runtime_tool_specs(available_runtime_tool_specs(&mcp_catalog), allowed_tools.as_ref())
+        filter_runtime_tool_specs(
+            available_runtime_tool_specs(&mcp_catalog),
+            allowed_tools.as_ref(),
+        )
     } else {
         Vec::new()
     };
@@ -1767,6 +1929,8 @@ fn build_runtime(
     if enable_tools && proxy_tool_calls {
         runtime_prompt.push(build_proxy_system_prompt(&tool_specs));
     }
+    let permission_policy =
+        permission_policy(permission_mode, &available_runtime_tool_specs(&mcp_catalog));
     Ok(ConversationRuntime::new(
         session,
         NanoCodeRuntimeClient::new(
@@ -1777,7 +1941,7 @@ fn build_runtime(
             tool_specs.clone(),
         )?,
         CliToolExecutor::new(mcp_catalog, tool_specs, allowed_tools),
-        permission_policy_from_env(),
+        permission_policy,
         runtime_prompt,
     ))
 }
@@ -2685,16 +2849,12 @@ fn extract_first_json_object(input: &str) -> Option<serde_json::Value> {
     None
 }
 
-fn permission_policy_from_env() -> PermissionPolicy {
-    let mode =
-        env::var("NANOCODE_PERMISSION_MODE").unwrap_or_else(|_| "workspace-write".to_string());
-    match mode.as_str() {
-        "read-only" => PermissionPolicy::new(PermissionMode::Deny)
-            .with_tool_mode("read_file", PermissionMode::Allow)
-            .with_tool_mode("glob_search", PermissionMode::Allow)
-            .with_tool_mode("grep_search", PermissionMode::Allow),
-        _ => PermissionPolicy::new(PermissionMode::Allow),
-    }
+fn permission_policy(mode: PermissionMode, tool_specs: &[RuntimeToolSpec]) -> PermissionPolicy {
+    tool_specs
+        .iter()
+        .fold(PermissionPolicy::new(mode), |policy, spec| {
+            policy.with_tool_requirement(spec.name.clone(), spec.required_permission)
+        })
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
@@ -2877,7 +3037,7 @@ fn print_help() {
     println!("nanocode");
     println!();
     println!("Usage:");
-    println!("  nanocode [--model MODEL] [--allowedTools TOOL[,TOOL...]]");
+    println!("  nanocode [--model MODEL] [--permission-mode MODE] [--allowedTools TOOL[,TOOL...]]");
     println!("                                               Start interactive REPL");
     println!("  nanocode login [--api-key KEY]              Save a NanoGPT API key");
     println!("  nanocode model [MODEL_ID]                   Choose or persist a default model");
@@ -2889,14 +3049,17 @@ fn print_help() {
         "  nanocode mcp [status|tools|reload]          Inspect configured MCP servers and tools"
     );
     println!(
-        "  nanocode [--model MODEL] [--allowedTools TOOL[,TOOL...]] prompt TEXT"
+        "  nanocode [--model MODEL] [--permission-mode MODE] [--allowedTools TOOL[,TOOL...]] prompt TEXT"
     );
-    println!("                                               Send one prompt and stream the response");
+    println!(
+        "                                               Send one prompt and stream the response"
+    );
     println!("  nanocode dump-manifests");
     println!("  nanocode bootstrap-plan");
     println!("  nanocode system-prompt [--cwd PATH] [--date YYYY-MM-DD]");
     println!("  nanocode --resume SESSION.json [/compact]");
     println!("  nanocode --version");
+    println!("  --permission-mode MODE                     read-only, workspace-write, or danger-full-access");
 }
 
 fn print_version() {
@@ -2919,7 +3082,7 @@ mod tests {
         ChatCompletionResponse, ChatCompletionToolCall, ChatCompletionUsage, MessageResponse,
         OutputContentBlock, Usage,
     };
-    use runtime::{ContentBlock, ConversationMessage, MessageRole};
+    use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode};
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
@@ -2961,6 +3124,7 @@ mod tests {
                 CliAction::Repl {
                     model: DEFAULT_MODEL.to_string(),
                     allowed_tools: None,
+                    permission_mode: PermissionMode::WorkspaceWrite,
                 }
             );
         });
@@ -2980,6 +3144,7 @@ mod tests {
                     prompt: "hello world".to_string(),
                     model: DEFAULT_MODEL.to_string(),
                     allowed_tools: None,
+                    permission_mode: PermissionMode::WorkspaceWrite,
                 }
             );
         });
@@ -3003,6 +3168,22 @@ mod tests {
                             .map(str::to_string)
                             .collect()
                     ),
+                    permission_mode: PermissionMode::WorkspaceWrite,
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn parses_permission_mode_flag() {
+        with_isolated_config_home(|| {
+            let args = vec!["--permission-mode=read-only".to_string()];
+            assert_eq!(
+                parse_args(&args).expect("args should parse"),
+                CliAction::Repl {
+                    model: DEFAULT_MODEL.to_string(),
+                    allowed_tools: None,
+                    permission_mode: PermissionMode::ReadOnly,
                 }
             );
         });
@@ -3137,8 +3318,10 @@ mod tests {
             .into_iter()
             .map(str::to_string)
             .collect();
-        let filtered =
-            filter_runtime_tool_specs(available_runtime_tool_specs(&McpCatalog::default()), Some(&allowed));
+        let filtered = filter_runtime_tool_specs(
+            available_runtime_tool_specs(&McpCatalog::default()),
+            Some(&allowed),
+        );
         let names = filtered
             .into_iter()
             .map(|spec| spec.name)

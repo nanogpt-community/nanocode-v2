@@ -207,8 +207,7 @@ mod tests {
 
     use crate::config::{
         ConfigSource, McpRemoteServerConfig, McpServerConfig, McpStdioServerConfig,
-        McpStdioStderrMode,
-        McpWebSocketServerConfig, ScopedMcpServerConfig,
+        McpStdioStderrMode, McpWebSocketServerConfig, ScopedMcpServerConfig,
     };
 
     use super::{
