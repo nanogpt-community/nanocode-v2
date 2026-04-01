@@ -1832,6 +1832,10 @@ fn format_sandbox_status(status: &runtime::SandboxStatus) -> String {
     line
 }
 
+fn format_auto_compaction_notice(removed: usize) -> String {
+    format!("[auto-compacted: removed {removed} messages]")
+}
+
 fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let path = cwd.join(".nanocode").join("sessions");
@@ -2545,6 +2549,12 @@ impl LiveCli {
                 )?;
                 self.persist_session()?;
                 self.print_budget_notice(summary.usage);
+                if let Some(event) = summary.auto_compaction {
+                    println!(
+                        "{}",
+                        format_auto_compaction_notice(event.removed_message_count)
+                    );
+                }
                 println!();
                 Ok(())
             }
@@ -2572,6 +2582,10 @@ impl LiveCli {
                 "message": assistant_text_from_messages(&summary.assistant_messages),
                 "model": self.model,
                 "iterations": summary.iterations,
+                "auto_compaction": summary.auto_compaction.map(|event| serde_json::json!({
+                    "removed_messages": event.removed_message_count,
+                    "notice": format_auto_compaction_notice(event.removed_message_count),
+                })),
                 "tool_uses": collect_tool_uses(&summary),
                 "tool_results": collect_tool_results(&summary),
                 "usage": {

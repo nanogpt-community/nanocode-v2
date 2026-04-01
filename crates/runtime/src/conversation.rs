@@ -10,6 +10,9 @@ use crate::permissions::{PermissionOutcome, PermissionPolicy, PermissionPrompter
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
 
+const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
+const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "NANOCODE_AUTO_COMPACT_INPUT_TOKENS";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
     pub system_prompt: Vec<String>,
@@ -88,6 +91,12 @@ pub struct TurnSummary {
     pub tool_results: Vec<ConversationMessage>,
     pub iterations: usize,
     pub usage: TokenUsage,
+    pub auto_compaction: Option<AutoCompactionEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoCompactionEvent {
+    pub removed_message_count: usize,
 }
 
 pub struct ConversationRuntime<C, T> {
@@ -99,6 +108,7 @@ pub struct ConversationRuntime<C, T> {
     max_iterations: usize,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
+    auto_compaction_input_tokens_threshold: u32,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -143,12 +153,19 @@ where
             max_iterations: usize::MAX,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(&feature_config),
+            auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
         }
     }
 
     #[must_use]
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
+        self
+    }
+
+    #[must_use]
+    pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
+        self.auto_compaction_input_tokens_threshold = threshold;
         self
     }
 
@@ -256,11 +273,14 @@ where
             }
         }
 
+        let auto_compaction = self.maybe_auto_compact();
+
         Ok(TurnSummary {
             assistant_messages,
             tool_results,
             iterations,
             usage: self.usage_tracker.cumulative_usage(),
+            auto_compaction,
         })
     }
 
@@ -288,6 +308,48 @@ where
     pub fn into_session(self) -> Session {
         self.session
     }
+
+    fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
+        if self.usage_tracker.cumulative_usage().input_tokens
+            < self.auto_compaction_input_tokens_threshold
+        {
+            return None;
+        }
+
+        let result = compact_session(
+            &self.session,
+            CompactionConfig {
+                max_estimated_tokens: 0,
+                ..CompactionConfig::default()
+            },
+        );
+
+        if result.removed_message_count == 0 {
+            return None;
+        }
+
+        self.session = result.compacted_session;
+        Some(AutoCompactionEvent {
+            removed_message_count: result.removed_message_count,
+        })
+    }
+}
+
+#[must_use]
+pub fn auto_compaction_threshold_from_env() -> u32 {
+    parse_auto_compaction_threshold(
+        std::env::var(AUTO_COMPACTION_THRESHOLD_ENV_VAR)
+            .ok()
+            .as_deref(),
+    )
+}
+
+#[must_use]
+fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
+    value
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|threshold| *threshold > 0)
+        .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
 }
 
 fn build_assistant_message(
@@ -427,8 +489,9 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiClient, ApiRequest, AssistantEvent, ConversationRuntime, RuntimeError,
-        StaticToolExecutor,
+        parse_auto_compaction_threshold, ApiClient, ApiRequest, AssistantEvent,
+        AutoCompactionEvent, ConversationRuntime, RuntimeError, StaticToolExecutor,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -540,6 +603,7 @@ mod tests {
         assert_eq!(summary.tool_results.len(), 1);
         assert_eq!(runtime.session().messages.len(), 4);
         assert_eq!(summary.usage.output_tokens, 10);
+        assert_eq!(summary.auto_compaction, None);
         assert!(matches!(
             runtime.session().messages[1].blocks[1],
             ContentBlock::ToolUse { .. }
@@ -845,5 +909,117 @@ mod tests {
     #[cfg(not(windows))]
     fn shell_snippet(script: &str) -> String {
         script.to_string()
+    }
+
+    #[test]
+    fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens: 120_000,
+                        output_tokens: 4,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let session = Session {
+            version: 1,
+            messages: vec![
+                crate::session::ConversationMessage::user_text("one"),
+                crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "two".to_string(),
+                }]),
+                crate::session::ConversationMessage::user_text("three"),
+                crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "four".to_string(),
+                }]),
+            ],
+            metadata: None,
+        };
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000);
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+
+        assert_eq!(
+            summary.auto_compaction,
+            Some(AutoCompactionEvent {
+                removed_message_count: 2,
+            })
+        );
+        assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+    }
+
+    #[test]
+    fn skips_auto_compaction_below_threshold() {
+        struct SimpleApi;
+        impl ApiClient for SimpleApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::Usage(TokenUsage {
+                        input_tokens: 99_999,
+                        output_tokens: 4,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    }),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            SimpleApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000);
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+        assert_eq!(summary.auto_compaction, None);
+        assert_eq!(runtime.session().messages.len(), 2);
+    }
+
+    #[test]
+    fn auto_compaction_threshold_defaults_and_parses_values() {
+        assert_eq!(
+            parse_auto_compaction_threshold(None),
+            DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
+        );
+        assert_eq!(parse_auto_compaction_threshold(Some("4321")), 4321);
+        assert_eq!(
+            parse_auto_compaction_threshold(Some("not-a-number")),
+            DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
+        );
+        assert_eq!(
+            parse_auto_compaction_threshold(Some("0")),
+            DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD
+        );
     }
 }
