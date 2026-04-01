@@ -18,12 +18,49 @@ impl PermissionMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionOverride {
+    Allow,
+    Deny,
+    Ask,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PermissionContext {
+    override_decision: Option<PermissionOverride>,
+    override_reason: Option<String>,
+}
+
+impl PermissionContext {
+    #[must_use]
+    pub fn new(
+        override_decision: Option<PermissionOverride>,
+        override_reason: Option<String>,
+    ) -> Self {
+        Self {
+            override_decision,
+            override_reason,
+        }
+    }
+
+    #[must_use]
+    pub fn override_decision(&self) -> Option<PermissionOverride> {
+        self.override_decision
+    }
+
+    #[must_use]
+    pub fn override_reason(&self) -> Option<&str> {
+        self.override_reason.as_deref()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionRequest {
     pub tool_name: String,
     pub input: String,
     pub current_mode: PermissionMode,
     pub required_mode: PermissionMode,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,37 +123,66 @@ impl PermissionPolicy {
         &self,
         tool_name: &str,
         input: &str,
-        mut prompter: Option<&mut dyn PermissionPrompter>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> PermissionOutcome {
+        self.authorize_with_context(tool_name, input, &PermissionContext::default(), prompter)
+    }
+
+    #[must_use]
+    pub fn authorize_with_context(
+        &self,
+        tool_name: &str,
+        input: &str,
+        context: &PermissionContext,
+        prompter: Option<&mut dyn PermissionPrompter>,
     ) -> PermissionOutcome {
         let current_mode = self.active_mode();
         let required_mode = self.required_mode_for(tool_name);
+        match context.override_decision() {
+            Some(PermissionOverride::Allow) => return PermissionOutcome::Allow,
+            Some(PermissionOverride::Deny) => {
+                return PermissionOutcome::Deny {
+                    reason: context.override_reason().map_or_else(
+                        || format!("tool '{tool_name}' denied by hook"),
+                        ToOwned::to_owned,
+                    ),
+                };
+            }
+            Some(PermissionOverride::Ask) => {
+                return Self::prompt_or_deny(
+                    tool_name,
+                    input,
+                    current_mode,
+                    required_mode,
+                    Some(context.override_reason().map_or_else(
+                        || format!("tool '{tool_name}' requires approval due to hook guidance"),
+                        ToOwned::to_owned,
+                    )),
+                    prompter,
+                );
+            }
+            None => {}
+        }
+
         if current_mode >= required_mode {
             return PermissionOutcome::Allow;
         }
 
-        let request = PermissionRequest {
-            tool_name: tool_name.to_string(),
-            input: input.to_string(),
-            current_mode,
-            required_mode,
-        };
-
         if current_mode == PermissionMode::WorkspaceWrite
             && required_mode == PermissionMode::DangerFullAccess
         {
-            return match prompter.as_mut() {
-                Some(prompter) => match prompter.decide(&request) {
-                    PermissionPromptDecision::Allow => PermissionOutcome::Allow,
-                    PermissionPromptDecision::Deny { reason } => PermissionOutcome::Deny { reason },
-                },
-                None => PermissionOutcome::Deny {
-                    reason: format!(
-                        "tool '{tool_name}' requires approval to escalate from {} to {}",
-                        current_mode.as_str(),
-                        required_mode.as_str()
-                    ),
-                },
-            };
+            return Self::prompt_or_deny(
+                tool_name,
+                input,
+                current_mode,
+                required_mode,
+                Some(format!(
+                    "tool '{tool_name}' requires approval to escalate from {} to {}",
+                    current_mode.as_str(),
+                    required_mode.as_str()
+                )),
+                prompter,
+            );
         }
 
         PermissionOutcome::Deny {
@@ -127,13 +193,45 @@ impl PermissionPolicy {
             ),
         }
     }
+
+    fn prompt_or_deny(
+        tool_name: &str,
+        input: &str,
+        current_mode: PermissionMode,
+        required_mode: PermissionMode,
+        reason: Option<String>,
+        mut prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> PermissionOutcome {
+        let request = PermissionRequest {
+            tool_name: tool_name.to_string(),
+            input: input.to_string(),
+            current_mode,
+            required_mode,
+            reason: reason.clone(),
+        };
+
+        match prompter.as_mut() {
+            Some(prompter) => match prompter.decide(&request) {
+                PermissionPromptDecision::Allow => PermissionOutcome::Allow,
+                PermissionPromptDecision::Deny { reason } => PermissionOutcome::Deny { reason },
+            },
+            None => PermissionOutcome::Deny {
+                reason: reason.unwrap_or_else(|| {
+                    format!(
+                        "tool '{tool_name}' requires approval to run while mode is {}",
+                        current_mode.as_str()
+                    )
+                }),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        PermissionMode, PermissionOutcome, PermissionPolicy, PermissionPromptDecision,
-        PermissionPrompter, PermissionRequest,
+        PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride,
+        PermissionPolicy, PermissionPromptDecision, PermissionPrompter, PermissionRequest,
     };
 
     struct RecordingPrompter {
@@ -222,6 +320,40 @@ mod tests {
         assert!(matches!(
             policy.authorize("bash", "echo hi", Some(&mut prompter)),
             PermissionOutcome::Deny { reason } if reason == "not now"
+        ));
+    }
+
+    #[test]
+    fn hook_allow_override_skips_normal_escalation() {
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite);
+
+        assert_eq!(
+            policy.authorize_with_context(
+                "write_file",
+                "{}",
+                &PermissionContext::new(Some(PermissionOverride::Allow), None),
+                None,
+            ),
+            PermissionOutcome::Allow
+        );
+    }
+
+    #[test]
+    fn hook_deny_override_returns_hook_reason() {
+        let policy = PermissionPolicy::new(PermissionMode::DangerFullAccess);
+
+        assert!(matches!(
+            policy.authorize_with_context(
+                "bash",
+                "{}",
+                &PermissionContext::new(
+                    Some(PermissionOverride::Deny),
+                    Some("blocked by policy hook".to_string()),
+                ),
+                None,
+            ),
+            PermissionOutcome::Deny { reason } if reason == "blocked by policy hook"
         ));
     }
 }

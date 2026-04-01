@@ -7,12 +7,13 @@ use api::{
     InputContentBlock, InputMessage, MessageRequest, NanoGptClient, OutputContentBlock, ToolChoice,
     ToolDefinition,
 };
+use plugins::{PluginManager, PluginManagerConfig, PluginTool};
 use reqwest::blocking::Client;
 use runtime::{
     edit_file, execute_bash, glob_search, grep_search, load_system_prompt, read_file, write_file,
-    ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ContentBlock, ConversationMessage,
-    ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode, PermissionPolicy,
-    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ConfigLoader, ContentBlock,
+    ConversationMessage, ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode,
+    PermissionPolicy, RuntimeConfig, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -52,6 +53,284 @@ pub struct ToolSpec {
     pub description: &'static str,
     pub input_schema: Value,
     pub required_permission: PermissionMode,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegisteredTool {
+    pub definition: ToolDefinition,
+    pub required_permission: PermissionMode,
+    handler: RegisteredToolHandler,
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+enum RegisteredToolHandler {
+    Builtin,
+    Plugin(PluginTool),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GlobalToolRegistry {
+    entries: Vec<RegisteredTool>,
+}
+
+impl GlobalToolRegistry {
+    #[must_use]
+    pub fn builtin() -> Self {
+        Self {
+            entries: mvp_tool_specs()
+                .into_iter()
+                .map(|spec| RegisteredTool {
+                    definition: ToolDefinition {
+                        name: spec.name.to_string(),
+                        description: Some(spec.description.to_string()),
+                        input_schema: spec.input_schema,
+                    },
+                    required_permission: spec.required_permission,
+                    handler: RegisteredToolHandler::Builtin,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn with_plugin_tools(plugin_tools: Vec<PluginTool>) -> Result<Self, String> {
+        let mut registry = Self::builtin();
+        let mut seen = registry
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    normalize_registry_tool_name(&entry.definition.name),
+                    entry.definition.name.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        for tool in plugin_tools {
+            let normalized = normalize_registry_tool_name(&tool.definition().name);
+            if let Some(existing) = seen.get(&normalized) {
+                return Err(format!(
+                    "plugin tool `{}` from `{}` conflicts with already-registered tool `{existing}`",
+                    tool.definition().name,
+                    tool.plugin_id()
+                ));
+            }
+            seen.insert(normalized, tool.definition().name.clone());
+            registry.entries.push(RegisteredTool {
+                definition: ToolDefinition {
+                    name: tool.definition().name.clone(),
+                    description: tool.definition().description.clone(),
+                    input_schema: tool.definition().input_schema.clone(),
+                },
+                required_permission: permission_mode_from_plugin_tool(tool.required_permission())?,
+                handler: RegisteredToolHandler::Plugin(tool),
+            });
+        }
+
+        Ok(registry)
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &[RegisteredTool] {
+        &self.entries
+    }
+
+    #[must_use]
+    pub fn definitions(&self, allowed_tools: Option<&BTreeSet<String>>) -> Vec<ToolDefinition> {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                allowed_tools.is_none_or(|allowed| allowed.contains(entry.definition.name.as_str()))
+            })
+            .map(|entry| entry.definition.clone())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn permission_specs(
+        &self,
+        allowed_tools: Option<&BTreeSet<String>>,
+    ) -> Vec<(String, PermissionMode)> {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                allowed_tools.is_none_or(|allowed| allowed.contains(entry.definition.name.as_str()))
+            })
+            .map(|entry| (entry.definition.name.clone(), entry.required_permission))
+            .collect()
+    }
+
+    pub fn normalize_allowed_tools(
+        &self,
+        values: &[String],
+    ) -> Result<Option<BTreeSet<String>>, String> {
+        if values.is_empty() {
+            return Ok(None);
+        }
+
+        let canonical_names = self
+            .entries
+            .iter()
+            .map(|entry| entry.definition.name.clone())
+            .collect::<Vec<_>>();
+        let mut name_map = canonical_names
+            .iter()
+            .map(|name| (normalize_registry_tool_name(name), name.clone()))
+            .collect::<BTreeMap<_, _>>();
+
+        for (alias, canonical) in [
+            ("read", "read_file"),
+            ("write", "write_file"),
+            ("edit", "edit_file"),
+            ("glob", "glob_search"),
+            ("grep", "grep_search"),
+        ] {
+            if canonical_names.iter().any(|name| name == canonical) {
+                name_map.insert(alias.to_string(), canonical.to_string());
+            }
+        }
+
+        let mut allowed = BTreeSet::new();
+        for value in values {
+            for token in value
+                .split(|ch: char| ch == ',' || ch.is_whitespace())
+                .filter(|token| !token.is_empty())
+            {
+                let normalized = normalize_registry_tool_name(token);
+                let canonical = name_map.get(&normalized).ok_or_else(|| {
+                    format!(
+                        "unsupported tool in --allowedTools: {token} (expected one of: {})",
+                        canonical_names.join(", ")
+                    )
+                })?;
+                allowed.insert(canonical.clone());
+            }
+        }
+
+        Ok(Some(allowed))
+    }
+
+    pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| {
+                normalize_registry_tool_name(entry.definition.name.as_str())
+                    == normalize_registry_tool_name(name)
+            })
+            .ok_or_else(|| format!("unsupported tool: {name}"))?;
+        match &entry.handler {
+            RegisteredToolHandler::Builtin => execute_tool(&entry.definition.name, input),
+            RegisteredToolHandler::Plugin(tool) => {
+                tool.execute(input).map_err(|error| error.to_string())
+            }
+        }
+    }
+}
+
+impl Default for GlobalToolRegistry {
+    fn default() -> Self {
+        Self::builtin()
+    }
+}
+
+fn normalize_registry_tool_name(value: &str) -> String {
+    let trimmed = value.trim();
+    let chars = trimmed.chars().collect::<Vec<_>>();
+    let mut normalized = String::new();
+
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if matches!(ch, '-' | ' ' | '\t' | '\n') {
+            if !normalized.ends_with('_') {
+                normalized.push('_');
+            }
+            continue;
+        }
+
+        if ch == '_' {
+            if !normalized.ends_with('_') {
+                normalized.push('_');
+            }
+            continue;
+        }
+
+        if ch.is_uppercase() {
+            let prev = chars.get(index.wrapping_sub(1)).copied();
+            let next = chars.get(index + 1).copied();
+            let needs_separator = index > 0
+                && !normalized.ends_with('_')
+                && (prev.is_some_and(|prev| prev.is_lowercase() || prev.is_ascii_digit())
+                    || (prev.is_some_and(char::is_uppercase)
+                        && next.is_some_and(char::is_lowercase)));
+            if needs_separator {
+                normalized.push('_');
+            }
+            normalized.extend(ch.to_lowercase());
+            continue;
+        }
+
+        normalized.push(ch.to_ascii_lowercase());
+    }
+
+    normalized.trim_matches('_').to_string()
+}
+
+fn permission_mode_from_plugin_tool(value: &str) -> Result<PermissionMode, String> {
+    match value {
+        "read-only" => Ok(PermissionMode::ReadOnly),
+        "workspace-write" => Ok(PermissionMode::WorkspaceWrite),
+        "danger-full-access" => Ok(PermissionMode::DangerFullAccess),
+        other => Err(format!(
+            "unsupported plugin tool permission `{other}` (expected read-only, workspace-write, or danger-full-access)"
+        )),
+    }
+}
+
+pub fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load().map_err(|error| error.to_string())?;
+    let plugin_manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+    let plugin_tools = plugin_manager
+        .aggregated_tools()
+        .map_err(|error| error.to_string())?;
+    GlobalToolRegistry::with_plugin_tools(plugin_tools)
+}
+
+pub fn build_plugin_manager(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &RuntimeConfig,
+) -> PluginManager {
+    let plugin_settings = runtime_config.plugins();
+    let mut plugin_config = PluginManagerConfig::new(loader.config_home().to_path_buf());
+    plugin_config.enabled_plugins = plugin_settings.enabled_plugins().clone();
+    plugin_config.external_dirs = plugin_settings
+        .external_directories()
+        .iter()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path))
+        .collect();
+    plugin_config.install_root = plugin_settings
+        .install_root()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    plugin_config.registry_path = plugin_settings
+        .registry_path()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    plugin_config.bundled_root = plugin_settings
+        .bundled_root()
+        .map(|path| resolve_plugin_path(cwd, loader.config_home(), path));
+    PluginManager::new(plugin_config)
+}
+
+fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else if value.starts_with('.') {
+        cwd.join(path)
+    } else {
+        config_home.join(path)
+    }
 }
 
 #[must_use]
@@ -1473,11 +1752,17 @@ fn run_child_agent_conversation(
     prompt: &str,
     model: Option<String>,
 ) -> Result<ChildConversationResult, String> {
+    let tool_registry = current_tool_registry()?;
     let mut runtime = ConversationRuntime::new(
         Session::new(),
-        build_agent_api_client(model.unwrap_or_else(default_agent_model))?,
-        AgentToolExecutor,
-        agent_permission_policy(),
+        build_agent_api_client(
+            model.unwrap_or_else(default_agent_model),
+            tool_registry.clone(),
+        )?,
+        AgentToolExecutor {
+            tool_registry: tool_registry.clone(),
+        },
+        agent_permission_policy(&tool_registry),
         build_agent_system_prompt()?,
     )
     .with_max_iterations(16);
@@ -1594,20 +1879,26 @@ fn build_agent_system_prompt() -> Result<Vec<String>, String> {
         .map_err(|error| error.to_string())
 }
 
-fn agent_permission_policy() -> PermissionPolicy {
-    mvp_tool_specs().into_iter().fold(
+fn agent_permission_policy(tool_registry: &GlobalToolRegistry) -> PermissionPolicy {
+    tool_registry.permission_specs(None).into_iter().fold(
         PermissionPolicy::new(PermissionMode::DangerFullAccess),
-        |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
+        |policy, (name, required_permission)| {
+            policy.with_tool_requirement(name, required_permission)
+        },
     )
 }
 
-struct AgentToolExecutor;
+struct AgentToolExecutor {
+    tool_registry: GlobalToolRegistry,
+}
 
 impl ToolExecutor for AgentToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool(tool_name, &value).map_err(ToolError::new)
+        self.tool_registry
+            .execute(tool_name, &value)
+            .map_err(ToolError::new)
     }
 }
 
@@ -1629,14 +1920,16 @@ struct NanoCodeAgentApiClient {
     runtime: tokio::runtime::Runtime,
     client: NanoGptClient,
     model: String,
+    tool_registry: GlobalToolRegistry,
 }
 
 impl NanoCodeAgentApiClient {
-    fn new(model: String) -> Result<Self, String> {
+    fn new(model: String, tool_registry: GlobalToolRegistry) -> Result<Self, String> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
             client: NanoGptClient::from_env().map_err(|error| error.to_string())?,
             model,
+            tool_registry,
         })
     }
 }
@@ -1648,7 +1941,7 @@ impl ApiClient for NanoCodeAgentApiClient {
             max_tokens: 4096,
             messages: convert_agent_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: Some(agent_tool_definitions()),
+            tools: Some(self.tool_registry.definitions(None)),
             tool_choice: Some(ToolChoice::Auto),
             thinking: None,
             stream: false,
@@ -1665,7 +1958,10 @@ impl ApiClient for NanoCodeAgentApiClient {
     }
 }
 
-fn build_agent_api_client(model: String) -> Result<AgentApiClient, String> {
+fn build_agent_api_client(
+    model: String,
+    tool_registry: GlobalToolRegistry,
+) -> Result<AgentApiClient, String> {
     if let Some(script) = std::env::var("NANOCODE_AGENT_TEST_SCRIPT")
         .ok()
         .or_else(|| std::env::var("CLAWD_AGENT_TEST_SCRIPT").ok())
@@ -1675,7 +1971,10 @@ fn build_agent_api_client(model: String) -> Result<AgentApiClient, String> {
             &script,
         )?));
     }
-    Ok(AgentApiClient::NanoGpt(NanoCodeAgentApiClient::new(model)?))
+    Ok(AgentApiClient::NanoGpt(NanoCodeAgentApiClient::new(
+        model,
+        tool_registry,
+    )?))
 }
 
 #[derive(Debug)]
@@ -1733,17 +2032,6 @@ impl ScriptedAgentEvent {
             },
         }
     }
-}
-
-fn agent_tool_definitions() -> Vec<ToolDefinition> {
-    mvp_tool_specs()
-        .into_iter()
-        .map(|spec| ToolDefinition {
-            name: spec.name.to_string(),
-            description: Some(spec.description.to_string()),
-            input_schema: spec.input_schema,
-        })
-        .collect()
 }
 
 fn convert_agent_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
@@ -1810,6 +2098,7 @@ fn agent_response_to_events(response: api::MessageResponse) -> Vec<AssistantEven
                     events.push(AssistantEvent::ThinkingSignature(signature));
                 }
             }
+            OutputContentBlock::RedactedThinking { .. } => {}
             OutputContentBlock::ToolUse { id, name, input } => {
                 events.push(AssistantEvent::ToolUse {
                     id,
@@ -3301,7 +3590,10 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = temp_path("agent-store");
+        let config_home = temp_path("agent-config");
+        std::fs::create_dir_all(&config_home).expect("config home should exist");
         std::env::set_var("NANOCODE_AGENT_STORE", &dir);
+        std::env::set_var("NANOCODE_CONFIG_HOME", &config_home);
         std::env::set_var(
             "NANOCODE_AGENT_TEST_SCRIPT",
             serde_json::to_string(&vec![
@@ -3389,9 +3681,11 @@ mod tests {
         .expect("Agent should normalize explicit names");
         std::env::remove_var("NANOCODE_AGENT_TEST_SCRIPT");
         std::env::remove_var("NANOCODE_AGENT_STORE");
+        std::env::remove_var("NANOCODE_CONFIG_HOME");
         let named_output: serde_json::Value = serde_json::from_str(&named).expect("valid json");
         assert_eq!(named_output["name"], "ship-audit");
         let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(config_home);
     }
 
     #[test]

@@ -33,6 +33,7 @@ impl CommandRegistry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlashCommandSpec {
     pub name: &'static str,
+    pub aliases: &'static [&'static str],
     pub summary: &'static str,
     pub argument_hint: Option<&'static str>,
     pub resume_supported: bool,
@@ -41,110 +42,137 @@ pub struct SlashCommandSpec {
 const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "help",
+        aliases: &[],
         summary: "Show available slash commands",
         argument_hint: None,
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "status",
+        aliases: &[],
         summary: "Show current session status",
         argument_hint: None,
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "compact",
+        aliases: &[],
         summary: "Compact local session history",
         argument_hint: None,
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "thinking",
+        aliases: &[],
         summary: "Show or toggle extended thinking",
         argument_hint: Some("[on|off]"),
         resume_supported: false,
     },
     SlashCommandSpec {
         name: "model",
+        aliases: &[],
         summary: "Show or switch the active model",
         argument_hint: Some("[model]"),
         resume_supported: false,
     },
     SlashCommandSpec {
         name: "mcp",
+        aliases: &[],
         summary: "Inspect configured MCP servers or list exposed MCP tools",
         argument_hint: Some("[status|tools|reload]"),
         resume_supported: false,
     },
     SlashCommandSpec {
         name: "permissions",
+        aliases: &[],
         summary: "Show or switch the active permission mode",
         argument_hint: Some("[read-only|workspace-write|danger-full-access]"),
         resume_supported: false,
     },
     SlashCommandSpec {
         name: "clear",
+        aliases: &[],
         summary: "Start a fresh local session",
         argument_hint: Some("[--confirm]"),
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "cost",
+        aliases: &[],
         summary: "Show cumulative token usage for this session",
         argument_hint: None,
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "resume",
+        aliases: &[],
         summary: "Load a saved session into the REPL",
         argument_hint: Some("<session-path>"),
         resume_supported: false,
     },
     SlashCommandSpec {
         name: "config",
+        aliases: &[],
         summary: "Inspect NanoCode config files or merged sections",
-        argument_hint: Some("[env|hooks|model]"),
+        argument_hint: Some("[env|hooks|model|plugins]"),
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "memory",
+        aliases: &[],
         summary: "Inspect loaded NanoCode instruction memory files",
         argument_hint: None,
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "init",
+        aliases: &[],
         summary: "Create a starter NANOCODE.md for this repo",
         argument_hint: None,
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "diff",
+        aliases: &[],
         summary: "Show git diff for current workspace changes",
         argument_hint: None,
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "version",
+        aliases: &[],
         summary: "Show CLI version and build information",
         argument_hint: None,
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "export",
+        aliases: &[],
         summary: "Export the current conversation to a file",
         argument_hint: Some("[file]"),
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "session",
+        aliases: &[],
         summary: "List or switch managed local sessions",
         argument_hint: Some("[list|switch <session-id>]"),
         resume_supported: false,
     },
     SlashCommandSpec {
         name: "sessions",
+        aliases: &[],
         summary: "List recent managed local sessions",
         argument_hint: None,
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "plugins",
+        aliases: &["plugin", "marketplace"],
+        summary: "Manage NanoCode plugins",
+        argument_hint: Some(
+            "[list|install <path>|enable <id>|disable <id>|uninstall <id>|update <id>]",
+        ),
         resume_supported: false,
     },
 ];
@@ -188,6 +216,10 @@ pub enum SlashCommand {
         target: Option<String>,
     },
     Sessions,
+    Plugins {
+        action: Option<String>,
+        target: Option<String>,
+    },
     Unknown(String),
 }
 
@@ -243,6 +275,13 @@ impl SlashCommand {
                 target: parts.next().map(ToOwned::to_owned),
             },
             "sessions" => Self::Sessions,
+            "plugin" | "plugins" | "marketplace" => Self::Plugins {
+                action: parts.next().map(ToOwned::to_owned),
+                target: {
+                    let remainder = parts.collect::<Vec<_>>().join(" ");
+                    (!remainder.is_empty()).then_some(remainder)
+                },
+            },
             other => Self::Unknown(other.to_string()),
         })
     }
@@ -272,12 +311,20 @@ pub fn render_slash_command_help() -> String {
             Some(argument_hint) => format!("/{} {}", spec.name, argument_hint),
             None => format!("/{}", spec.name),
         };
+        let aliases = if spec.aliases.is_empty() {
+            String::new()
+        } else {
+            format!(" (aliases: {})", spec.aliases.join(", "))
+        };
         let resume = if spec.resume_supported {
             " [resume]"
         } else {
             ""
         };
-        lines.push(format!("  {name:<20} {}{}", spec.summary, resume));
+        lines.push(format!(
+            "  {name:<20} {}{}{}",
+            spec.summary, aliases, resume
+        ));
     }
     lines.join("\n")
 }
@@ -330,6 +377,7 @@ pub fn handle_slash_command(
         | SlashCommand::Export { .. }
         | SlashCommand::Session { .. }
         | SlashCommand::Sessions
+        | SlashCommand::Plugins { .. }
         | SlashCommand::Unknown(_) => None,
     }
 }
@@ -404,6 +452,20 @@ mod tests {
                 target: Some("abc123".to_string())
             })
         );
+        assert_eq!(
+            SlashCommand::parse("/plugins enable demo@external"),
+            Some(SlashCommand::Plugins {
+                action: Some("enable".to_string()),
+                target: Some("demo@external".to_string())
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/marketplace list"),
+            Some(SlashCommand::Plugins {
+                action: Some("list".to_string()),
+                target: None
+            })
+        );
     }
 
     #[test]
@@ -420,7 +482,7 @@ mod tests {
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
-        assert!(help.contains("/config [env|hooks|model]"));
+        assert!(help.contains("/config [env|hooks|model|plugins]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
@@ -428,7 +490,10 @@ mod tests {
         assert!(help.contains("/export [file]"));
         assert!(help.contains("/session [list|switch <session-id>]"));
         assert!(help.contains("/sessions"));
-        assert_eq!(slash_command_specs().len(), 18);
+        assert!(help.contains(
+            "/plugins [list|install <path>|enable <id>|disable <id>|uninstall <id>|update <id>]"
+        ));
+        assert_eq!(slash_command_specs().len(), 19);
         assert_eq!(resume_supported_slash_commands().len(), 11);
     }
 
@@ -524,6 +589,9 @@ mod tests {
         );
         assert!(
             handle_slash_command("/session list", &session, CompactionConfig::default()).is_none()
+        );
+        assert!(
+            handle_slash_command("/plugins list", &session, CompactionConfig::default()).is_none()
         );
     }
 }

@@ -18,6 +18,7 @@ use api::{
 };
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use plugins::{PluginError, PluginManager, PluginSummary};
 use reqwest::blocking::Client as BlockingClient;
 use reqwest::header::{HeaderName, HeaderValue};
 use serde::Deserialize;
@@ -49,7 +50,7 @@ use runtime::{
     RuntimeError, ScopedMcpServerConfig, Session, SessionMetadata, TokenUsage, ToolError,
     ToolExecutor, UsageTracker,
 };
-use tools::{execute_tool, mvp_tool_specs};
+use tools::{build_plugin_manager, current_tool_registry, GlobalToolRegistry};
 
 const DEFAULT_MODEL: &str = "zai-org/glm-5.1";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
@@ -88,6 +89,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Provider { provider } => handle_provider_action(provider)?,
         CliAction::Proxy { mode } => handle_proxy_action(mode)?,
         CliAction::Mcp { action } => handle_mcp_action(action)?,
+        CliAction::Plugins { action, target } => {
+            println!(
+                "{}",
+                handle_plugins_command(action.as_deref(), target.as_deref())?
+            )
+        }
         CliAction::Init => run_init()?,
         CliAction::Doctor => run_doctor()?,
         CliAction::SelfUpdate => run_self_update()?,
@@ -152,6 +159,10 @@ enum CliAction {
     },
     Mcp {
         action: McpCommand,
+    },
+    Plugins {
+        action: Option<String>,
+        target: Option<String>,
     },
     Init,
     Doctor,
@@ -382,6 +393,13 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "provider" | "providers" => parse_provider_args(&rest[1..]),
         "proxy" => parse_proxy_args(&rest[1..]),
         "mcp" => parse_mcp_args(&rest[1..]),
+        "plugins" | "plugin" | "marketplace" => Ok(CliAction::Plugins {
+            action: rest.get(1).cloned(),
+            target: {
+                let remainder = rest.iter().skip(2).cloned().collect::<Vec<_>>().join(" ");
+                (!remainder.is_empty()).then_some(remainder)
+            },
+        }),
         "init" => Ok(CliAction::Init),
         "doctor" => Ok(CliAction::Doctor),
         "self-update" => Ok(CliAction::SelfUpdate),
@@ -424,41 +442,7 @@ fn resolve_model_alias(model: &str) -> &str {
 }
 
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
-    if values.is_empty() {
-        return Ok(None);
-    }
-
-    let canonical_names = base_runtime_tool_specs()
-        .into_iter()
-        .map(|spec| spec.name)
-        .collect::<Vec<_>>();
-    let mut allowed = AllowedToolSet::new();
-
-    for value in values {
-        for token in value
-            .split(|ch: char| ch == ',' || ch.is_whitespace())
-            .filter(|token| !token.is_empty())
-        {
-            let normalized = token.trim().replace('-', "_").to_ascii_lowercase();
-            let canonical = match normalized.as_str() {
-                "read" => "read_file",
-                "write" => "write_file",
-                "edit" => "edit_file",
-                "glob" => "glob_search",
-                "grep" => "grep_search",
-                other => other,
-            };
-            if !canonical_names.iter().any(|name| name == canonical) {
-                return Err(format!(
-                    "unsupported tool in --allowedTools: {token} (expected one of: {})",
-                    canonical_names.join(", ")
-                ));
-            }
-            allowed.insert(canonical.to_string());
-        }
-    }
-
-    Ok(Some(allowed))
+    current_tool_registry()?.normalize_allowed_tools(values)
 }
 
 fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
@@ -1016,15 +1000,28 @@ fn read_secret_raw(out: &mut impl Write) -> io::Result<String> {
     }
 }
 
-fn base_runtime_tool_specs() -> Vec<RuntimeToolSpec> {
-    mvp_tool_specs()
-        .into_iter()
-        .map(RuntimeToolSpec::from)
+fn base_runtime_tool_specs(tool_registry: &GlobalToolRegistry) -> Vec<RuntimeToolSpec> {
+    tool_registry
+        .entries()
+        .iter()
+        .map(|entry| RuntimeToolSpec {
+            name: entry.definition.name.clone(),
+            description: entry
+                .definition
+                .description
+                .clone()
+                .unwrap_or_else(|| entry.definition.name.clone()),
+            input_schema: entry.definition.input_schema.clone(),
+            required_permission: entry.required_permission,
+        })
         .collect()
 }
 
-fn available_runtime_tool_specs(mcp_catalog: &McpCatalog) -> Vec<RuntimeToolSpec> {
-    let mut specs = base_runtime_tool_specs();
+fn available_runtime_tool_specs(
+    tool_registry: &GlobalToolRegistry,
+    mcp_catalog: &McpCatalog,
+) -> Vec<RuntimeToolSpec> {
+    let mut specs = base_runtime_tool_specs(tool_registry);
     specs.extend(mcp_catalog.tool_specs());
     specs
 }
@@ -2085,9 +2082,10 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
             "env" => runtime_config.get("env"),
             "hooks" => runtime_config.get("hooks"),
             "model" => runtime_config.get("model"),
+            "plugins" => runtime_config.get("plugins"),
             other => {
                 lines.push(format!(
-                    "  Unsupported config section '{other}'. Use env, hooks, or model."
+                    "  Unsupported config section '{other}'. Use env, hooks, model, or plugins."
                 ));
                 return Ok(lines.join("\n"));
             }
@@ -2105,6 +2103,163 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
     lines.push("Merged JSON".to_string());
     lines.push(format!("  {}", runtime_config.as_json().render()));
     Ok(lines.join("\n"))
+}
+
+fn current_plugin_manager() -> Result<PluginManager, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load()?;
+    Ok(build_plugin_manager(&cwd, &loader, &runtime_config))
+}
+
+fn render_plugins_report(plugins: &[PluginSummary]) -> String {
+    let mut lines = vec!["Plugins".to_string()];
+    if plugins.is_empty() {
+        lines.push("  No plugins discovered.".to_string());
+        return lines.join("\n");
+    }
+
+    for plugin in plugins {
+        lines.push(format!(
+            "  {} [{}] {} {}",
+            plugin.metadata.id,
+            plugin.metadata.kind,
+            plugin.metadata.version,
+            if plugin.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ));
+        lines.push(format!("    {}", plugin.metadata.description));
+        if let Some(root) = &plugin.metadata.root {
+            lines.push(format!("    root={}", root.display()));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn resolve_plugin_summary(
+    manager: &PluginManager,
+    target: &str,
+) -> Result<PluginSummary, PluginError> {
+    let plugins = manager.list_installed_plugins()?;
+    plugins
+        .into_iter()
+        .find(|plugin| plugin.metadata.id == target || plugin.metadata.name == target)
+        .ok_or_else(|| PluginError::NotFound(format!("plugin `{target}` was not found")))
+}
+
+fn handle_plugins_command(
+    action: Option<&str>,
+    target: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut manager = current_plugin_manager()?;
+    match action {
+        None | Some("list") => Ok(render_plugins_report(&manager.list_installed_plugins()?)),
+        Some("install") => {
+            let Some(target) = target else {
+                return Ok(
+                    "Plugins\n  Missing target for install. Usage: /plugins install <path>"
+                        .to_string(),
+                );
+            };
+            let install = manager.install(target)?;
+            let plugin = resolve_plugin_summary(&manager, &install.plugin_id).ok();
+            Ok(format!(
+                "Plugins\n  Result           installed {}\n  Name             {}\n  Version          {}\n  Status           {}",
+                install.plugin_id,
+                plugin
+                    .as_ref()
+                    .map(|plugin| plugin.metadata.name.as_str())
+                    .unwrap_or(install.plugin_id.as_str()),
+                install.version,
+                if plugin.as_ref().is_some_and(|plugin| plugin.enabled) {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ))
+        }
+        Some("enable") => {
+            let Some(target) = target else {
+                return Ok(
+                    "Plugins\n  Missing target for enable. Usage: /plugins enable <id>"
+                        .to_string(),
+                );
+            };
+            let plugin = resolve_plugin_summary(&manager, target)?;
+            manager.enable(&plugin.metadata.id)?;
+            Ok(format!(
+                "Plugins\n  Result           enabled {}\n  Name             {}\n  Version          {}\n  Status           enabled",
+                plugin.metadata.id, plugin.metadata.name, plugin.metadata.version
+            ))
+        }
+        Some("disable") => {
+            let Some(target) = target else {
+                return Ok(
+                    "Plugins\n  Missing target for disable. Usage: /plugins disable <id>"
+                        .to_string(),
+                );
+            };
+            let plugin = resolve_plugin_summary(&manager, target)?;
+            manager.disable(&plugin.metadata.id)?;
+            Ok(format!(
+                "Plugins\n  Result           disabled {}\n  Name             {}\n  Version          {}\n  Status           disabled",
+                plugin.metadata.id, plugin.metadata.name, plugin.metadata.version
+            ))
+        }
+        Some("uninstall") => {
+            let Some(target) = target else {
+                return Ok(
+                    "Plugins\n  Missing target for uninstall. Usage: /plugins uninstall <id>"
+                        .to_string(),
+                );
+            };
+            let plugin = resolve_plugin_summary(&manager, target)?;
+            manager.uninstall(&plugin.metadata.id)?;
+            Ok(format!(
+                "Plugins\n  Result           uninstalled {}",
+                plugin.metadata.id
+            ))
+        }
+        Some("update") => {
+            let Some(target) = target else {
+                return Ok(
+                    "Plugins\n  Missing target for update. Usage: /plugins update <id>"
+                        .to_string(),
+                );
+            };
+            let plugin = resolve_plugin_summary(&manager, target)?;
+            let update = manager.update(&plugin.metadata.id)?;
+            Ok(format!(
+                "Plugins\n  Result           updated {}\n  Name             {}\n  Old version      {}\n  New version      {}\n  Status           {}",
+                update.plugin_id,
+                plugin.metadata.name,
+                update.old_version,
+                update.new_version,
+                if resolve_plugin_summary(&manager, &update.plugin_id)
+                    .ok()
+                    .is_some_and(|summary| summary.enabled)
+                {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ))
+        }
+        Some(other) => Ok(format!(
+            "Plugins\n  Unsupported action `{other}`. Use list, install, enable, disable, uninstall, or update."
+        )),
+    }
+}
+
+fn plugins_command_is_mutating(action: Option<&str>) -> bool {
+    matches!(
+        action.unwrap_or("list"),
+        "install" | "enable" | "disable" | "uninstall" | "update"
+    )
 }
 
 fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
@@ -2359,6 +2514,11 @@ fn run_repl(
     let completions = slash_command_specs()
         .iter()
         .map(|spec| format!("/{}", spec.name))
+        .chain(
+            slash_command_specs()
+                .iter()
+                .flat_map(|spec| spec.aliases.iter().map(|alias| format!("/{alias}"))),
+        )
         .chain(["/login", "/auth", "/provider", "/proxy", "/exit", "/quit"].map(str::to_string))
         .collect();
     let mut editor = input::LineEditor::new("> ", completions);
@@ -2447,6 +2607,9 @@ fn run_repl(
                         cli.handle_session_command(action.as_deref(), target.as_deref())?
                     }
                     SlashCommand::Sessions => println!("{}", render_session_list(&cli.session.id)?),
+                    SlashCommand::Plugins { action, target } => {
+                        cli.handle_plugins_command(action.as_deref(), target.as_deref())?
+                    }
                     SlashCommand::Unknown(name) => eprintln!("unknown slash command: /{name}"),
                     SlashCommand::Model { .. } | SlashCommand::Mcp { .. } => {
                         unreachable!("handled before shared slash command dispatch")
@@ -2833,6 +2996,31 @@ impl LiveCli {
         Ok(())
     }
 
+    fn handle_plugins_command(
+        &mut self,
+        action: Option<&str>,
+        target: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", handle_plugins_command(action, target)?);
+        if plugins_command_is_mutating(action) {
+            let session = self.runtime.session().clone();
+            self.runtime = build_runtime(
+                session,
+                self.model.clone(),
+                self.system_prompt.clone(),
+                true,
+                self.proxy_tool_calls,
+                self.mcp_catalog.clone(),
+                self.allowed_tools.clone(),
+                self.permission_mode,
+                self.thinking_enabled,
+                self.render_model_output,
+            )?;
+            self.persist_session()?;
+        }
+        Ok(())
+    }
+
     fn print_cost(&self) {
         println!(
             "{}",
@@ -3107,10 +3295,32 @@ fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
 fn build_runtime_feature_config(
 ) -> Result<runtime::RuntimeFeatureConfig, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    Ok(ConfigLoader::default_for(cwd)
-        .load()?
-        .feature_config()
-        .clone())
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load()?;
+    let mut feature_config = runtime_config.feature_config().clone();
+    let plugin_manager = build_plugin_manager(&cwd, &loader, &runtime_config);
+    let plugin_hooks = plugin_manager.aggregated_hooks()?;
+    let plugin_pre_hooks = plugin_hooks.pre_tool_use.clone();
+    let plugin_post_hooks = plugin_hooks.post_tool_use.clone();
+    let merged_hooks = runtime::RuntimeHookConfig::new(
+        feature_config
+            .hooks()
+            .pre_tool_use()
+            .iter()
+            .cloned()
+            .chain(plugin_pre_hooks)
+            .collect(),
+        feature_config
+            .hooks()
+            .post_tool_use()
+            .iter()
+            .cloned()
+            .chain(plugin_post_hooks)
+            .collect(),
+        feature_config.hooks().post_tool_use_failure().to_vec(),
+    );
+    feature_config = feature_config.with_hooks(merged_hooks);
+    Ok(feature_config)
 }
 
 fn build_runtime(
@@ -3126,9 +3336,11 @@ fn build_runtime(
     render_model_output: bool,
 ) -> Result<ConversationRuntime<NanoCodeRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
+    let tool_registry = current_tool_registry()
+        .map_err(|error| io::Error::other(format!("failed to load tool registry: {error}")))?;
     let tool_specs = if enable_tools {
         filter_runtime_tool_specs(
-            available_runtime_tool_specs(&mcp_catalog),
+            available_runtime_tool_specs(&tool_registry, &mcp_catalog),
             allowed_tools.as_ref(),
         )
     } else {
@@ -3138,8 +3350,10 @@ fn build_runtime(
     if enable_tools && proxy_tool_calls {
         runtime_prompt.push(build_proxy_system_prompt(&tool_specs));
     }
-    let permission_policy =
-        permission_policy(permission_mode, &available_runtime_tool_specs(&mcp_catalog));
+    let permission_policy = permission_policy(
+        permission_mode,
+        &available_runtime_tool_specs(&tool_registry, &mcp_catalog),
+    );
     Ok(ConversationRuntime::new_with_features(
         session,
         NanoCodeRuntimeClient::new(
@@ -3151,7 +3365,13 @@ fn build_runtime(
             thinking_enabled,
             render_model_output,
         )?,
-        CliToolExecutor::new(mcp_catalog, tool_specs, allowed_tools, render_model_output),
+        CliToolExecutor::new(
+            tool_registry,
+            mcp_catalog,
+            tool_specs,
+            allowed_tools,
+            render_model_output,
+        ),
         permission_policy,
         runtime_prompt,
         build_runtime_feature_config()?,
@@ -3645,6 +3865,7 @@ fn push_output_block(
                 events.push(AssistantEvent::ThinkingSignature(signature));
             }
         }
+        OutputContentBlock::RedactedThinking { .. } => {}
         OutputContentBlock::ToolUse { id, name, input } => {
             let initial_input = if streaming_tool_input
                 && input.is_object()
@@ -3780,6 +4001,7 @@ fn proxy_response_to_events(
                     events.push(AssistantEvent::ThinkingSignature(signature));
                 }
             }
+            OutputContentBlock::RedactedThinking { .. } => {}
             OutputContentBlock::ToolUse { id, name, input } => {
                 events.push(AssistantEvent::ToolUse {
                     id,
@@ -3980,6 +4202,7 @@ fn contains_proxy_markup(text: &str) -> bool {
 
 struct CliToolExecutor {
     renderer: TerminalRenderer,
+    tool_registry: GlobalToolRegistry,
     mcp_catalog: McpCatalog,
     tool_specs: Vec<RuntimeToolSpec>,
     allowed_tools: Option<AllowedToolSet>,
@@ -3988,6 +4211,7 @@ struct CliToolExecutor {
 
 impl CliToolExecutor {
     fn new(
+        tool_registry: GlobalToolRegistry,
         mcp_catalog: McpCatalog,
         tool_specs: Vec<RuntimeToolSpec>,
         allowed_tools: Option<AllowedToolSet>,
@@ -3995,6 +4219,7 @@ impl CliToolExecutor {
     ) -> Self {
         Self {
             renderer: TerminalRenderer::new(),
+            tool_registry,
             mcp_catalog,
             tool_specs,
             allowed_tools,
@@ -4018,7 +4243,9 @@ impl ToolExecutor for CliToolExecutor {
         let output = if let Some(tool) = self.mcp_catalog.find_tool(tool_name) {
             call_mcp_tool(tool, &value).map_err(|error| ToolError::new(error.to_string()))
         } else {
-            execute_tool(tool_name, &value).map_err(ToolError::new)
+            self.tool_registry
+                .execute(tool_name, &value)
+                .map_err(ToolError::new)
         }?;
         if self.emit_output {
             let markdown = render_tool_result_markdown(tool_name, &output);
@@ -4925,6 +5152,7 @@ fn run_resume_command(
         | SlashCommand::Thinking { .. }
         | SlashCommand::Session { .. }
         | SlashCommand::Sessions
+        | SlashCommand::Plugins { .. }
         | SlashCommand::Unknown(_) => Err("unsupported resumed slash command".into()),
     }
 }
@@ -4946,6 +5174,7 @@ fn print_help() {
     println!(
         "  nanocode mcp [status|tools|reload]          Inspect configured MCP servers and tools"
     );
+    println!("  nanocode plugins [list|install|enable|disable|uninstall|update] [TARGET]");
     println!("  nanocode init                               Create starter NanoCode project files");
     println!("  nanocode doctor                             Run local environment diagnostics");
     println!("  nanocode self-update                        Update from GitHub releases");
@@ -5830,6 +6059,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tools::current_tool_registry;
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -5856,7 +6086,10 @@ mod tests {
     }
 
     fn tool_specs() -> Vec<RuntimeToolSpec> {
-        available_runtime_tool_specs(&McpCatalog::default())
+        available_runtime_tool_specs(
+            &current_tool_registry().expect("tool registry should load"),
+            &McpCatalog::default(),
+        )
     }
 
     #[test]
@@ -6215,7 +6448,10 @@ mod tests {
             .map(str::to_string)
             .collect();
         let filtered = filter_runtime_tool_specs(
-            available_runtime_tool_specs(&McpCatalog::default()),
+            available_runtime_tool_specs(
+                &current_tool_registry().expect("tool registry should load"),
+                &McpCatalog::default(),
+            ),
             Some(&allowed),
         );
         let names = filtered
@@ -6693,5 +6929,45 @@ mod tests {
             AssistantEvent::ToolUse { name, input, .. }
                 if name == "read_file" && input == "{}"
         ));
+    }
+
+    #[test]
+    fn response_to_events_ignores_redacted_thinking_blocks() {
+        let events = response_to_events(
+            MessageResponse {
+                id: "msg_2".to_string(),
+                kind: "message".to_string(),
+                role: "assistant".to_string(),
+                content: vec![
+                    OutputContentBlock::RedactedThinking {
+                        data: json!({"reason":"hidden"}),
+                    },
+                    OutputContentBlock::Text {
+                        text: "Final answer".to_string(),
+                    },
+                ],
+                model: "zai-org/glm-5.1".to_string(),
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+                usage: Usage {
+                    input_tokens: 1,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    output_tokens: 1,
+                },
+                request_id: None,
+            },
+            &mut Vec::new(),
+        )
+        .expect("response conversion should succeed");
+
+        assert!(matches!(
+            &events[0],
+            AssistantEvent::TextDelta(text) if text == "Final answer"
+        ));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AssistantEvent::ThinkingDelta(_) | AssistantEvent::ThinkingSignature(_)
+        )));
     }
 }

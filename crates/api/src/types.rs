@@ -277,6 +277,9 @@ pub enum OutputContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
+    RedactedThinking {
+        data: Value,
+    },
     ToolUse {
         id: String,
         name: String,

@@ -36,8 +36,18 @@ pub struct RuntimeConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RuntimePluginConfig {
+    enabled_plugins: BTreeMap<String, bool>,
+    external_directories: Vec<String>,
+    install_root: Option<String>,
+    registry_path: Option<String>,
+    bundled_root: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RuntimeFeatureConfig {
     hooks: RuntimeHookConfig,
+    plugins: RuntimePluginConfig,
     mcp: McpConfigCollection,
     oauth: Option<OAuthConfig>,
     model: Option<String>,
@@ -49,6 +59,7 @@ pub struct RuntimeFeatureConfig {
 pub struct RuntimeHookConfig {
     pre_tool_use: Vec<String>,
     post_tool_use: Vec<String>,
+    post_tool_use_failure: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -182,11 +193,13 @@ impl ConfigLoader {
     #[must_use]
     pub fn default_for(cwd: impl Into<PathBuf>) -> Self {
         let cwd = cwd.into();
-        let config_home = std::env::var_os("NANOCODE_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".nanocode")))
-            .unwrap_or_else(|| PathBuf::from(".nanocode"));
+        let config_home = default_config_home();
         Self { cwd, config_home }
+    }
+
+    #[must_use]
+    pub fn config_home(&self) -> &Path {
+        &self.config_home
     }
 
     #[must_use]
@@ -224,6 +237,7 @@ impl ConfigLoader {
         let merged_value = JsonValue::Object(merged.clone());
         let feature_config = RuntimeFeatureConfig {
             hooks: parse_optional_hooks_config(&merged_value)?,
+            plugins: parse_optional_plugin_config(&merged_value)?,
             mcp: McpConfigCollection {
                 servers: mcp_servers,
             },
@@ -287,6 +301,11 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn plugins(&self) -> &RuntimePluginConfig {
+        &self.feature_config.plugins
+    }
+
+    #[must_use]
     pub fn oauth(&self) -> Option<&OAuthConfig> {
         self.feature_config.oauth.as_ref()
     }
@@ -320,6 +339,17 @@ impl RuntimeFeatureConfig {
     }
 
     #[must_use]
+    pub fn with_plugins(mut self, plugins: RuntimePluginConfig) -> Self {
+        self.plugins = plugins;
+        self
+    }
+
+    #[must_use]
+    pub fn plugins(&self) -> &RuntimePluginConfig {
+        &self.plugins
+    }
+
+    #[must_use]
     pub fn mcp(&self) -> &McpConfigCollection {
         &self.mcp
     }
@@ -347,10 +377,15 @@ impl RuntimeFeatureConfig {
 
 impl RuntimeHookConfig {
     #[must_use]
-    pub fn new(pre_tool_use: Vec<String>, post_tool_use: Vec<String>) -> Self {
+    pub fn new(
+        pre_tool_use: Vec<String>,
+        post_tool_use: Vec<String>,
+        post_tool_use_failure: Vec<String>,
+    ) -> Self {
         Self {
             pre_tool_use,
             post_tool_use,
+            post_tool_use_failure,
         }
     }
 
@@ -363,6 +398,46 @@ impl RuntimeHookConfig {
     pub fn post_tool_use(&self) -> &[String] {
         &self.post_tool_use
     }
+
+    #[must_use]
+    pub fn post_tool_use_failure(&self) -> &[String] {
+        &self.post_tool_use_failure
+    }
+}
+
+impl RuntimePluginConfig {
+    #[must_use]
+    pub fn enabled_plugins(&self) -> &BTreeMap<String, bool> {
+        &self.enabled_plugins
+    }
+
+    #[must_use]
+    pub fn external_directories(&self) -> &[String] {
+        &self.external_directories
+    }
+
+    #[must_use]
+    pub fn install_root(&self) -> Option<&str> {
+        self.install_root.as_deref()
+    }
+
+    #[must_use]
+    pub fn registry_path(&self) -> Option<&str> {
+        self.registry_path.as_deref()
+    }
+
+    #[must_use]
+    pub fn bundled_root(&self) -> Option<&str> {
+        self.bundled_root.as_deref()
+    }
+}
+
+#[must_use]
+pub fn default_config_home() -> PathBuf {
+    std::env::var_os("NANOCODE_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".nanocode")))
+        .unwrap_or_else(|| PathBuf::from(".nanocode"))
 }
 
 impl McpConfigCollection {
@@ -498,7 +573,42 @@ fn parse_optional_hooks_config(root: &JsonValue) -> Result<RuntimeHookConfig, Co
             .unwrap_or_default(),
         post_tool_use: optional_string_array(hooks, "PostToolUse", "merged settings.hooks")?
             .unwrap_or_default(),
+        post_tool_use_failure: optional_string_array(
+            hooks,
+            "PostToolUseFailure",
+            "merged settings.hooks",
+        )?
+        .unwrap_or_default(),
     })
+}
+
+fn parse_optional_plugin_config(root: &JsonValue) -> Result<RuntimePluginConfig, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(RuntimePluginConfig::default());
+    };
+
+    let mut config = RuntimePluginConfig::default();
+    if let Some(enabled_plugins) = object.get("enabledPlugins") {
+        config.enabled_plugins = parse_bool_map(enabled_plugins, "merged settings.enabledPlugins")?;
+    }
+
+    let Some(plugins_value) = object.get("plugins") else {
+        return Ok(config);
+    };
+    let plugins = expect_object(plugins_value, "merged settings.plugins")?;
+    if let Some(enabled_value) = plugins.get("enabled") {
+        config.enabled_plugins = parse_bool_map(enabled_value, "merged settings.plugins.enabled")?;
+    }
+    config.external_directories =
+        optional_string_array(plugins, "externalDirectories", "merged settings.plugins")?
+            .unwrap_or_default();
+    config.install_root =
+        optional_string(plugins, "installRoot", "merged settings.plugins")?.map(str::to_string);
+    config.registry_path =
+        optional_string(plugins, "registryPath", "merged settings.plugins")?.map(str::to_string);
+    config.bundled_root =
+        optional_string(plugins, "bundledRoot", "merged settings.plugins")?.map(str::to_string);
+    Ok(config)
 }
 
 fn parse_optional_permission_mode(
@@ -780,6 +890,24 @@ fn optional_string_map(
     }
 }
 
+fn parse_bool_map(value: &JsonValue, context: &str) -> Result<BTreeMap<String, bool>, ConfigError> {
+    let Some(map) = value.as_object() else {
+        return Err(ConfigError::Parse(format!(
+            "{context}: expected JSON object of booleans"
+        )));
+    };
+    map.iter()
+        .map(|(key, value)| {
+            value
+                .as_bool()
+                .map(|bool_value| (key.clone(), bool_value))
+                .ok_or_else(|| {
+                    ConfigError::Parse(format!("{context}: entry {key} must be a boolean value"))
+                })
+        })
+        .collect()
+}
+
 fn deep_merge_objects(
     target: &mut BTreeMap<String, JsonValue>,
     source: &BTreeMap<String, JsonValue>,
@@ -1023,6 +1151,55 @@ mod tests {
         assert_eq!(oauth.client_id, "runtime-client");
         assert_eq!(oauth.callback_port, Some(54_545));
         assert_eq!(oauth.scopes, vec!["org:read", "user:write"]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_plugin_config() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".nanocode");
+        fs::create_dir_all(cwd.join(".nanocode")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "enabledPlugins": {
+                "sample@external": true
+              },
+              "plugins": {
+                "externalDirectories": ["./plugins"],
+                "installRoot": "plugin-cache/installed",
+                "registryPath": "plugin-cache/installed.json",
+                "bundledRoot": "./bundled-plugins"
+              }
+            }"#,
+        )
+        .expect("write plugin settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+
+        assert_eq!(
+            loaded.plugins().enabled_plugins().get("sample@external"),
+            Some(&true)
+        );
+        assert_eq!(
+            loaded.plugins().external_directories(),
+            &["./plugins".to_string()]
+        );
+        assert_eq!(
+            loaded.plugins().install_root(),
+            Some("plugin-cache/installed")
+        );
+        assert_eq!(
+            loaded.plugins().registry_path(),
+            Some("plugin-cache/installed.json")
+        );
+        assert_eq!(loaded.plugins().bundled_root(), Some("./bundled-plugins"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

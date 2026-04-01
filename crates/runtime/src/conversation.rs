@@ -5,8 +5,10 @@ use crate::compact::{
     compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
 };
 use crate::config::RuntimeFeatureConfig;
-use crate::hooks::{HookRunResult, HookRunner};
-use crate::permissions::{PermissionOutcome, PermissionPolicy, PermissionPrompter};
+use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
+use crate::permissions::{
+    PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
+};
 use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
 
@@ -109,6 +111,8 @@ pub struct ConversationRuntime<C, T> {
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
+    hook_abort_signal: HookAbortSignal,
+    hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -154,6 +158,8 @@ where
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(&feature_config),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
+            hook_abort_signal: HookAbortSignal::default(),
+            hook_progress_reporter: None,
         }
     }
 
@@ -169,6 +175,92 @@ where
         self
     }
 
+    #[must_use]
+    pub fn with_hook_abort_signal(mut self, hook_abort_signal: HookAbortSignal) -> Self {
+        self.hook_abort_signal = hook_abort_signal;
+        self
+    }
+
+    #[must_use]
+    pub fn with_hook_progress_reporter(
+        mut self,
+        hook_progress_reporter: Box<dyn HookProgressReporter>,
+    ) -> Self {
+        self.hook_progress_reporter = Some(hook_progress_reporter);
+        self
+    }
+
+    fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
+        if let Some(reporter) = self.hook_progress_reporter.as_mut() {
+            self.hook_runner.run_pre_tool_use_with_context(
+                tool_name,
+                input,
+                Some(&self.hook_abort_signal),
+                Some(reporter.as_mut()),
+            )
+        } else {
+            self.hook_runner.run_pre_tool_use_with_context(
+                tool_name,
+                input,
+                Some(&self.hook_abort_signal),
+                None,
+            )
+        }
+    }
+
+    fn run_post_tool_use_hook(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        output: &str,
+        is_error: bool,
+    ) -> HookRunResult {
+        if let Some(reporter) = self.hook_progress_reporter.as_mut() {
+            self.hook_runner.run_post_tool_use_with_context(
+                tool_name,
+                input,
+                output,
+                is_error,
+                Some(&self.hook_abort_signal),
+                Some(reporter.as_mut()),
+            )
+        } else {
+            self.hook_runner.run_post_tool_use_with_context(
+                tool_name,
+                input,
+                output,
+                is_error,
+                Some(&self.hook_abort_signal),
+                None,
+            )
+        }
+    }
+
+    fn run_post_tool_use_failure_hook(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        output: &str,
+    ) -> HookRunResult {
+        if let Some(reporter) = self.hook_progress_reporter.as_mut() {
+            self.hook_runner.run_post_tool_use_failure_with_context(
+                tool_name,
+                input,
+                output,
+                Some(&self.hook_abort_signal),
+                Some(reporter.as_mut()),
+            )
+        } else {
+            self.hook_runner.run_post_tool_use_failure_with_context(
+                tool_name,
+                input,
+                output,
+                Some(&self.hook_abort_signal),
+                None,
+            )
+        }
+    }
+
     pub fn run_turn(
         &mut self,
         user_input: impl Into<String>,
@@ -181,6 +273,7 @@ where
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
         let mut iterations = 0;
+        let mut max_turn_input_tokens = 0;
 
         loop {
             iterations += 1;
@@ -197,6 +290,7 @@ where
             let events = self.api_client.stream(request)?;
             let (assistant_message, usage) = build_assistant_message(events)?;
             if let Some(usage) = usage {
+                max_turn_input_tokens = max_turn_input_tokens.max(usage.input_tokens);
                 self.usage_tracker.record(usage);
             }
             let pending_tool_uses = assistant_message
@@ -218,54 +312,105 @@ where
             }
 
             for (tool_use_id, tool_name, input) in pending_tool_uses {
+                let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
+                let effective_input = pre_hook_result
+                    .updated_input()
+                    .map_or_else(|| input.clone(), ToOwned::to_owned);
+                let permission_context = PermissionContext::new(
+                    pre_hook_result.permission_override(),
+                    pre_hook_result.permission_reason().map(ToOwned::to_owned),
+                );
+
                 let permission_outcome = if let Some(prompt) = prompter.as_mut() {
-                    self.permission_policy
-                        .authorize(&tool_name, &input, Some(*prompt))
+                    if pre_hook_result.is_cancelled() {
+                        PermissionOutcome::Deny {
+                            reason: format_hook_message(
+                                &pre_hook_result,
+                                &format!("PreToolUse hook cancelled tool `{tool_name}`"),
+                            ),
+                        }
+                    } else if pre_hook_result.is_denied() {
+                        PermissionOutcome::Deny {
+                            reason: format_hook_message(
+                                &pre_hook_result,
+                                &format!("PreToolUse hook denied tool `{tool_name}`"),
+                            ),
+                        }
+                    } else {
+                        self.permission_policy.authorize_with_context(
+                            &tool_name,
+                            &effective_input,
+                            &permission_context,
+                            Some(*prompt),
+                        )
+                    }
                 } else {
-                    self.permission_policy.authorize(&tool_name, &input, None)
+                    if pre_hook_result.is_cancelled() {
+                        PermissionOutcome::Deny {
+                            reason: format_hook_message(
+                                &pre_hook_result,
+                                &format!("PreToolUse hook cancelled tool `{tool_name}`"),
+                            ),
+                        }
+                    } else if pre_hook_result.is_denied() {
+                        PermissionOutcome::Deny {
+                            reason: format_hook_message(
+                                &pre_hook_result,
+                                &format!("PreToolUse hook denied tool `{tool_name}`"),
+                            ),
+                        }
+                    } else {
+                        self.permission_policy.authorize_with_context(
+                            &tool_name,
+                            &effective_input,
+                            &permission_context,
+                            None,
+                        )
+                    }
                 };
 
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
-                        let pre_hook_result = self.hook_runner.run_pre_tool_use(&tool_name, &input);
-                        if pre_hook_result.is_denied() {
-                            let deny_message = format!("PreToolUse hook denied tool `{tool_name}`");
-                            ConversationMessage::tool_result(
-                                tool_use_id,
-                                tool_name,
-                                format_hook_message(&pre_hook_result, &deny_message),
-                                true,
+                        let (mut output, mut is_error) =
+                            match self.tool_executor.execute(&tool_name, &effective_input) {
+                                Ok(output) => (output, false),
+                                Err(error) => (error.to_string(), true),
+                            };
+                        output = merge_hook_feedback(pre_hook_result.messages(), output, false);
+
+                        let hook_output = output.clone();
+                        let post_hook_result = if is_error {
+                            self.run_post_tool_use_failure_hook(
+                                &tool_name,
+                                &effective_input,
+                                &hook_output,
                             )
                         } else {
-                            let (mut output, mut is_error) =
-                                match self.tool_executor.execute(&tool_name, &input) {
-                                    Ok(output) => (output, false),
-                                    Err(error) => (error.to_string(), true),
-                                };
-                            output = merge_hook_feedback(pre_hook_result.messages(), output, false);
-
-                            let post_hook_result = self
-                                .hook_runner
-                                .run_post_tool_use(&tool_name, &input, &output, is_error);
-                            if post_hook_result.is_denied() {
-                                is_error = true;
-                            }
-                            output = merge_hook_feedback(
-                                post_hook_result.messages(),
-                                output,
-                                post_hook_result.is_denied(),
-                            );
-
-                            ConversationMessage::tool_result(
-                                tool_use_id,
-                                tool_name,
-                                output,
-                                is_error,
+                            self.run_post_tool_use_hook(
+                                &tool_name,
+                                &effective_input,
+                                &hook_output,
+                                false,
                             )
+                        };
+                        if post_hook_result.is_denied() || post_hook_result.is_cancelled() {
+                            is_error = true;
                         }
+                        output = merge_hook_feedback(
+                            post_hook_result.messages(),
+                            output,
+                            post_hook_result.is_denied() || post_hook_result.is_cancelled(),
+                        );
+
+                        ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
                     }
                     PermissionOutcome::Deny { reason } => {
-                        ConversationMessage::tool_result(tool_use_id, tool_name, reason, true)
+                        ConversationMessage::tool_result(
+                            tool_use_id,
+                            tool_name,
+                            merge_hook_feedback(pre_hook_result.messages(), reason, true),
+                            true,
+                        )
                     }
                 };
                 self.session.messages.push(result_message.clone());
@@ -273,7 +418,7 @@ where
             }
         }
 
-        let auto_compaction = self.maybe_auto_compact();
+        let auto_compaction = self.maybe_auto_compact(max_turn_input_tokens);
 
         Ok(TurnSummary {
             assistant_messages,
@@ -309,17 +454,16 @@ where
         self.session
     }
 
-    fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
-        if self.usage_tracker.cumulative_usage().input_tokens
-            < self.auto_compaction_input_tokens_threshold
-        {
+    fn maybe_auto_compact(&mut self, turn_input_tokens: u32) -> Option<AutoCompactionEvent> {
+        if turn_input_tokens < self.auto_compaction_input_tokens_threshold {
             return None;
         }
 
         let result = compact_session(
             &self.session,
             CompactionConfig {
-                max_estimated_tokens: 0,
+                max_estimated_tokens: usize::try_from(self.auto_compaction_input_tokens_threshold)
+                    .unwrap_or(usize::MAX),
                 ..CompactionConfig::default()
             },
         );
@@ -709,6 +853,7 @@ mod tests {
             RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
                 vec![shell_snippet("printf 'blocked by hook'; exit 2")],
                 Vec::new(),
+                Vec::new(),
             )),
         );
 
@@ -775,6 +920,7 @@ mod tests {
             RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
                 vec![shell_snippet("printf 'pre hook ran'")],
                 vec![shell_snippet("printf 'post hook ran'")],
+                Vec::new(),
             )),
         );
 
@@ -805,6 +951,69 @@ mod tests {
             output.contains("post hook ran"),
             "tool output missing post hook feedback: {output:?}"
         );
+    }
+
+    #[test]
+    fn runs_post_tool_use_failure_hook_for_tool_errors() {
+        struct TwoCallApiClient {
+            calls: usize,
+        }
+
+        impl ApiClient for TwoCallApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "tool-1".to_string(),
+                            name: "explode".to_string(),
+                            input: r#"{"path":"boom"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        assert!(request
+                            .messages
+                            .iter()
+                            .any(|message| message.role == MessageRole::Tool));
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => Err(RuntimeError::new("unexpected extra API call")),
+                }
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new_with_features(
+            Session::new(),
+            TwoCallApiClient { calls: 0 },
+            StaticToolExecutor::new().register("explode", |_input| {
+                Err(super::ToolError::new("kaboom"))
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+            RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
+                Vec::new(),
+                Vec::new(),
+                vec![shell_snippet("printf 'failure hook ran'")],
+            )),
+        );
+
+        let summary = runtime
+            .run_turn("use explode", None)
+            .expect("tool loop succeeds");
+
+        let ContentBlock::ToolResult {
+            is_error, output, ..
+        } = &summary.tool_results[0].blocks[0]
+        else {
+            panic!("expected tool result block");
+        };
+        assert!(*is_error, "tool error should stay an error: {output:?}");
+        assert!(output.contains("kaboom"));
+        assert!(output.contains("failure hook ran"));
     }
 
     #[test]
@@ -912,7 +1121,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
+    fn auto_compacts_when_turn_input_threshold_is_crossed() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
             fn stream(
@@ -954,7 +1163,7 @@ mod tests {
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .with_auto_compaction_input_tokens_threshold(100_000);
+        .with_auto_compaction_input_tokens_threshold(1);
 
         let summary = runtime
             .run_turn("trigger", None)
