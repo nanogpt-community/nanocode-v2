@@ -3090,6 +3090,15 @@ fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     )?)
 }
 
+fn build_runtime_feature_config(
+) -> Result<runtime::RuntimeFeatureConfig, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    Ok(ConfigLoader::default_for(cwd)
+        .load()?
+        .feature_config()
+        .clone())
+}
+
 fn build_runtime(
     session: Session,
     model: String,
@@ -3117,7 +3126,7 @@ fn build_runtime(
     }
     let permission_policy =
         permission_policy(permission_mode, &available_runtime_tool_specs(&mcp_catalog));
-    Ok(ConversationRuntime::new(
+    Ok(ConversationRuntime::new_with_features(
         session,
         NanoCodeRuntimeClient::new(
             model.clone(),
@@ -3131,6 +3140,7 @@ fn build_runtime(
         CliToolExecutor::new(mcp_catalog, tool_specs, allowed_tools, render_model_output),
         permission_policy,
         runtime_prompt,
+        build_runtime_feature_config()?,
     ))
 }
 
