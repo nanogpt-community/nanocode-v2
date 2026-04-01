@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "api"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "reqwest",
  "serde",
@@ -108,14 +108,14 @@ dependencies = [
 
 [[package]]
 name = "commands"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "runtime",
 ]
 
 [[package]]
 name = "compat-harness"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "commands",
  "runtime",
@@ -719,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "nanocode"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "api",
  "commands",
@@ -1110,7 +1110,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "glob",
  "regex",
@@ -1547,7 +1547,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "api",
  "reqwest",
