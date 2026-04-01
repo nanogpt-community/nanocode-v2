@@ -19,6 +19,15 @@ const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_RETRIES: u32 = 2;
 
+fn nanogpt_client_debug_enabled() -> bool {
+    std::env::var("NANOGPT_CLIENT_DEBUG").ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on" | "debug"
+        )
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct NanoGptClient {
     http: reqwest::Client,
@@ -104,9 +113,11 @@ impl NanoGptClient {
             "{}/v1/chat/completions",
             self.base_url.trim_end_matches('/')
         );
-        let resolved_base_url = self.base_url.trim_end_matches('/');
-        eprintln!("[nanogpt-client] resolved_base_url={resolved_base_url}");
-        eprintln!("[nanogpt-client] request_url={request_url}");
+        if nanogpt_client_debug_enabled() {
+            let resolved_base_url = self.base_url.trim_end_matches('/');
+            eprintln!("[nanogpt-client] resolved_base_url={resolved_base_url}");
+            eprintln!("[nanogpt-client] request_url={request_url}");
+        }
         let request_builder = self
             .http
             .post(&request_url)
@@ -158,9 +169,11 @@ impl NanoGptClient {
         canonical_id: &str,
     ) -> Result<ProviderSelectionResponse, ApiError> {
         let request_url = providers_url(&self.base_url, canonical_id)?;
-        let resolved_base_url = self.base_url.trim_end_matches('/');
-        eprintln!("[nanogpt-client] resolved_base_url={resolved_base_url}");
-        eprintln!("[nanogpt-client] request_url={request_url}");
+        if nanogpt_client_debug_enabled() {
+            let resolved_base_url = self.base_url.trim_end_matches('/');
+            eprintln!("[nanogpt-client] resolved_base_url={resolved_base_url}");
+            eprintln!("[nanogpt-client] request_url={request_url}");
+        }
 
         let request_builder = self.http.get(request_url);
         let request_builder = self.apply_auth_headers(request_builder, false);
@@ -214,9 +227,11 @@ impl NanoGptClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let resolved_base_url = self.base_url.trim_end_matches('/');
-        eprintln!("[nanogpt-client] resolved_base_url={resolved_base_url}");
-        eprintln!("[nanogpt-client] request_url={request_url}");
+        if nanogpt_client_debug_enabled() {
+            let resolved_base_url = self.base_url.trim_end_matches('/');
+            eprintln!("[nanogpt-client] resolved_base_url={resolved_base_url}");
+            eprintln!("[nanogpt-client] request_url={request_url}");
+        }
         let request_builder = self
             .http
             .post(&request_url)
@@ -236,9 +251,11 @@ impl NanoGptClient {
         query: &[(&str, &str)],
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
-        let resolved_base_url = self.base_url.trim_end_matches('/');
-        eprintln!("[nanogpt-client] resolved_base_url={resolved_base_url}");
-        eprintln!("[nanogpt-client] request_url={request_url}");
+        if nanogpt_client_debug_enabled() {
+            let resolved_base_url = self.base_url.trim_end_matches('/');
+            eprintln!("[nanogpt-client] resolved_base_url={resolved_base_url}");
+            eprintln!("[nanogpt-client] request_url={request_url}");
+        }
 
         let request_builder = self.http.get(&request_url).query(query);
         let request_builder = self.apply_auth_headers(request_builder, false);
@@ -252,13 +269,18 @@ impl NanoGptClient {
         request_builder: reqwest::RequestBuilder,
         include_provider: bool,
     ) -> reqwest::RequestBuilder {
+        let debug = nanogpt_client_debug_enabled();
         let request_builder = if self.api_key.is_empty() {
-            eprintln!("[nanogpt-client] headers authorization=<absent> x-api-key=<absent>");
+            if debug {
+                eprintln!("[nanogpt-client] headers authorization=<absent> x-api-key=<absent>");
+            }
             request_builder
         } else {
-            eprintln!(
-                "[nanogpt-client] headers x-api-key=[REDACTED] authorization=Bearer [REDACTED]"
-            );
+            if debug {
+                eprintln!(
+                    "[nanogpt-client] headers x-api-key=[REDACTED] authorization=Bearer [REDACTED]"
+                );
+            }
             request_builder
                 .bearer_auth(&self.api_key)
                 .header("x-api-key", &self.api_key)
@@ -266,10 +288,14 @@ impl NanoGptClient {
 
         if include_provider {
             if let Some(provider) = &self.provider {
-                eprintln!("[nanogpt-client] x-provider={provider}");
+                if debug {
+                    eprintln!("[nanogpt-client] x-provider={provider}");
+                }
                 let request_builder = request_builder.header("x-provider", provider);
                 if self.force_paygo {
-                    eprintln!("[nanogpt-client] x-billing-mode=paygo");
+                    if debug {
+                        eprintln!("[nanogpt-client] x-billing-mode=paygo");
+                    }
                     return request_builder.header("x-billing-mode", "paygo");
                 }
                 return request_builder;

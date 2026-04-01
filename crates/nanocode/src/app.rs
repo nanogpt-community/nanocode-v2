@@ -2505,10 +2505,14 @@ fn append_proxy_text_events(
     events: &mut Vec<AssistantEvent>,
     tool_specs: &[RuntimeToolSpec],
 ) -> Result<(), RuntimeError> {
-    for segment in parse_proxy_response(text, tool_specs).map_err(RuntimeError::new)? {
+    let segments = parse_proxy_response(text, tool_specs).map_err(RuntimeError::new)?;
+    let has_tool_use = segments
+        .iter()
+        .any(|segment| matches!(segment, ProxySegment::ToolUse { .. }));
+    for segment in segments {
         match segment {
             ProxySegment::Text(text) => {
-                if !text.is_empty() {
+                if !text.is_empty() && should_render_proxy_text_segment(&text, has_tool_use) {
                     write!(out, "{text}")
                         .and_then(|_| out.flush())
                         .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -2521,6 +2525,64 @@ fn append_proxy_text_events(
         }
     }
     Ok(())
+}
+
+fn should_render_proxy_text_segment(text: &str, has_tool_use: bool) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if contains_proxy_markup(trimmed) {
+        return false;
+    }
+
+    if has_tool_use {
+        let normalized = trimmed.to_ascii_lowercase();
+        let boilerplate = [
+            "now let me",
+            "let me",
+            "i'll",
+            "i will",
+            "creating",
+            "writing",
+            "saving",
+        ];
+        if boilerplate.iter().any(|prefix| normalized.starts_with(prefix)) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn contains_proxy_markup(text: &str) -> bool {
+    let normalized = text.to_ascii_lowercase();
+    let markers = [
+        "<tool_call",
+        "</tool_call",
+        "<tool_result",
+        "</tool_result",
+        "<arg",
+        "</arg",
+        "</parameter",
+        "<read_file",
+        "<write_file",
+        "<edit_file",
+        "<bash",
+        "<glob_search",
+        "<grep_search",
+        "<webfetch",
+        "<websearch",
+        "<todowrite",
+        "<skill",
+        "<agent",
+        "<toolsearch",
+        "<notebookedit",
+        "<sleep",
+        "<powershell",
+    ];
+    markers.iter().any(|marker| normalized.contains(marker))
 }
 
 struct CliToolExecutor {
@@ -2602,32 +2664,16 @@ fn render_read_file_preview(value: &serde_json::Value) -> Option<String> {
     let start_line = file.get("startLine").and_then(serde_json::Value::as_u64);
     let num_lines = file.get("numLines").and_then(serde_json::Value::as_u64);
     let total_lines = file.get("totalLines").and_then(serde_json::Value::as_u64);
-    let content = file
-        .get("content")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let preview = truncate_tool_text(content, MAX_TOOL_PREVIEW_LINES, MAX_TOOL_PREVIEW_CHARS);
     let end_line = match (start_line, num_lines) {
         (Some(start), Some(count)) if count > 0 => Some(start + count - 1),
         _ => start_line,
     };
     Some(format!(
-        "### Tool `read_file`\n\n{} lines {}-{} of {}.\nPath: `{}`\n{}\n```text\n{}\n```\n",
-        if preview == content {
-            "Showing"
-        } else {
-            "Previewing"
-        },
+        "### Tool `read_file`\n\nRead lines {}-{} of {}.\nPath: `{}`\n_File contents hidden in the TUI; full content kept in conversation context._\n",
         start_line.unwrap_or(1),
         end_line.unwrap_or(start_line.unwrap_or(1)),
         total_lines.unwrap_or(num_lines.unwrap_or(0)),
-        path,
-        if preview == content {
-            ""
-        } else {
-            "_Output truncated in TUI; full file content kept in conversation context._\n"
-        },
-        preview
+        path
     ))
 }
 
@@ -3069,12 +3115,12 @@ fn print_version() {
 #[cfg(test)]
 mod tests {
     use super::{
-        available_runtime_tool_specs, extract_first_json_object, filter_runtime_tool_specs,
-        parse_args, parse_auth_command, parse_mcp_command, parse_model_command,
-        parse_provider_command, parse_proxy_command, parse_tool_input_value,
-        proxy_chat_completion_response_to_events, proxy_response_to_events,
-        render_tool_result_markdown, should_retry_proxy_tool_prompt, AssistantEvent, CliAction,
-        McpCatalog, McpCommand, RuntimeToolSpec, DEFAULT_MODEL,
+        append_proxy_text_events, available_runtime_tool_specs, extract_first_json_object,
+        filter_runtime_tool_specs, parse_args, parse_auth_command, parse_mcp_command,
+        parse_model_command, parse_provider_command, parse_proxy_command,
+        parse_tool_input_value, proxy_chat_completion_response_to_events,
+        proxy_response_to_events, render_tool_result_markdown, should_retry_proxy_tool_prompt,
+        AssistantEvent, CliAction, McpCatalog, McpCommand, RuntimeToolSpec, DEFAULT_MODEL,
     };
     use crate::proxy::ProxyCommand;
     use api::{
@@ -3574,8 +3620,26 @@ mod tests {
 
         assert!(markdown.contains("### Tool `read_file`"));
         assert!(markdown.contains("Path: `/tmp/demo.rs`"));
-        assert!(markdown.contains("full file content kept in conversation context"));
+        assert!(markdown.contains("File contents hidden in the TUI"));
+        assert!(!markdown.contains("line 1"));
         assert!(!markdown.contains("line 80"));
+    }
+
+    #[test]
+    fn proxy_write_file_xml_is_not_rendered_to_tui() {
+        let text = "Now let me create the file: <tool_call name=\"write_file\"><arg name=\"path\">test.md</arg><arg name=\"content\">hello world</arg></tool_call>";
+        let mut rendered = Vec::new();
+        let mut events = Vec::new();
+
+        append_proxy_text_events(text, &mut rendered, &mut events, &tool_specs())
+            .expect("proxy text should parse");
+
+        let rendered_text = String::from_utf8(rendered).expect("rendered bytes should be utf8");
+        assert!(rendered_text.trim().is_empty());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AssistantEvent::ToolUse { name, .. } if name == "write_file"
+        )));
     }
 
     #[test]
