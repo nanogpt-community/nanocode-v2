@@ -1,6 +1,11 @@
 name: Release NanoCode
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.toml
   workflow_dispatch:
 
 permissions:
@@ -15,17 +20,22 @@ jobs:
     name: Resolve release metadata
     runs-on: ubuntu-latest
     outputs:
+      should_release: ${{ steps.version.outputs.should_release }}
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
-      - name: Read workspace version
+      - name: Read workspace version and detect version bump
         id: version
         shell: bash
         run: |
-          version="$(awk '
+          read_version() {
+            local file="$1"
+            awk '
             /^\[workspace\.package\]$/ { in_section=1; next }
             /^\[/ && $0 != "[workspace.package]" { in_section=0 }
             in_section && $1 == "version" {
@@ -33,19 +43,40 @@ jobs:
               print $3
               exit
             }
-          ' Cargo.toml)"
+          ' "$file"
+          }
+
+          version="$(read_version Cargo.toml)"
 
           if [[ -z "$version" ]]; then
             echo "Failed to read version from Cargo.toml" >&2
             exit 1
           fi
 
+          should_release="true"
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            previous_version="$(git show "${{ github.event.before }}:Cargo.toml" 2>/dev/null | awk '
+              /^\[workspace\.package\]$/ { in_section=1; next }
+              /^\[/ && $0 != "[workspace.package]" { in_section=0 }
+              in_section && $1 == "version" {
+                gsub(/"/, "", $3)
+                print $3
+                exit
+              }
+            ')"
+            if [[ -n "$previous_version" && "$previous_version" == "$version" ]]; then
+              should_release="false"
+            fi
+          fi
+
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.label }}
     needs: metadata
+    if: needs.metadata.outputs.should_release == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -101,6 +132,7 @@ jobs:
   release:
     name: Create GitHub release
     needs: [metadata, build]
+    if: needs.metadata.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Download build artifacts
