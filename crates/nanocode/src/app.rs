@@ -35,7 +35,7 @@ use crate::proxy::{
     build_proxy_system_prompt, convert_messages_for_proxy, parse_proxy_response, parse_proxy_value,
     ProxyCommand, ProxyMessage, ProxySegment, RuntimeToolSpec,
 };
-use crate::render::{Spinner, TerminalRenderer};
+use crate::render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use commands::{render_slash_command_help, slash_command_specs, SlashCommand};
 use compat_harness::{extract_manifest, UpstreamPaths};
 use runtime::{
@@ -3193,6 +3193,8 @@ impl ApiClient for NanoCodeRuntimeClient {
             } else {
                 Box::new(io::sink())
             };
+            let renderer = TerminalRenderer::new();
+            let mut markdown_stream = MarkdownStreamState::default();
             let mut events = Vec::new();
             let mut pending_tool: Option<(String, String, String)> = None;
             let mut saw_stop = false;
@@ -3244,9 +3246,11 @@ impl ApiClient for NanoCodeRuntimeClient {
                     ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                         ContentBlockDelta::TextDelta { text } => {
                             if !text.is_empty() {
-                                write!(output, "{text}")
-                                    .and_then(|_| output.flush())
-                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                if let Some(rendered) = markdown_stream.push(&renderer, &text) {
+                                    write!(output, "{rendered}")
+                                        .and_then(|_| output.flush())
+                                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                }
                                 events.push(AssistantEvent::TextDelta(text));
                             }
                         }
@@ -3267,6 +3271,11 @@ impl ApiClient for NanoCodeRuntimeClient {
                         }
                     },
                     ApiStreamEvent::ContentBlockStop(_) => {
+                        if let Some(rendered) = markdown_stream.flush(&renderer) {
+                            write!(output, "{rendered}")
+                                .and_then(|_| output.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
                         if let Some((id, name, input)) = pending_tool.take() {
                             render_streamed_tool_call_start(output.as_mut(), &name, &input)?;
                             events.push(AssistantEvent::ToolUse { id, name, input });
@@ -3282,6 +3291,11 @@ impl ApiClient for NanoCodeRuntimeClient {
                     }
                     ApiStreamEvent::MessageStop(_) => {
                         saw_stop = true;
+                        if let Some(rendered) = markdown_stream.flush(&renderer) {
+                            write!(output, "{rendered}")
+                                .and_then(|_| output.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
                         events.push(AssistantEvent::MessageStop);
                     }
                 }
@@ -3569,7 +3583,8 @@ fn push_output_block(
     match block {
         OutputContentBlock::Text { text } => {
             if !text.is_empty() {
-                write!(out, "{text}")
+                let rendered = TerminalRenderer::new().markdown_to_ansi(&text);
+                write!(out, "{rendered}")
                     .and_then(|_| out.flush())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 events.push(AssistantEvent::TextDelta(text));

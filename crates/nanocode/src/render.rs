@@ -1,13 +1,10 @@
-use std::fmt::Write as FmtWrite;
-use std::io::{self, Write};
-use std::thread;
-use std::time::Duration;
-
 use crossterm::cursor::MoveToColumn;
 use crossterm::execute;
 use crossterm::style::{Color, Print, ResetColor, SetForegroundColor, Stylize};
 use crossterm::terminal::{Clear, ClearType};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use std::fmt::Write as FmtWrite;
+use std::io::{self, Write};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
@@ -230,6 +227,11 @@ impl TerminalRenderer {
         }
 
         output.trim_end().to_string()
+    }
+
+    #[must_use]
+    pub fn markdown_to_ansi(&self, markdown: &str) -> String {
+        self.render_markdown(markdown)
     }
 
     fn render_event(
@@ -514,9 +516,10 @@ impl TerminalRenderer {
         for line in LinesWithEndings::from(code) {
             match syntax_highlighter.highlight_line(line, &self.syntax_set) {
                 Ok(ranges) => {
-                    colored_output.push_str(&as_24_bit_terminal_escaped(&ranges[..], false));
+                    let escaped = as_24_bit_terminal_escaped(&ranges[..], false);
+                    colored_output.push_str(&apply_code_block_background(&escaped));
                 }
-                Err(_) => colored_output.push_str(line),
+                Err(_) => colored_output.push_str(&apply_code_block_background(line)),
             }
         }
 
@@ -524,14 +527,81 @@ impl TerminalRenderer {
     }
 
     pub fn stream_markdown(&self, markdown: &str, out: &mut impl Write) -> io::Result<()> {
-        let rendered_markdown = self.render_markdown(markdown);
-        for chunk in rendered_markdown.split_inclusive(char::is_whitespace) {
-            write!(out, "{chunk}")?;
-            out.flush()?;
-            thread::sleep(Duration::from_millis(8));
+        let rendered_markdown = self.markdown_to_ansi(markdown);
+        write!(out, "{rendered_markdown}")?;
+        if !rendered_markdown.ends_with('\n') {
+            writeln!(out)?;
         }
-        writeln!(out)
+        out.flush()
     }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MarkdownStreamState {
+    pending: String,
+}
+
+impl MarkdownStreamState {
+    #[must_use]
+    pub fn push(&mut self, renderer: &TerminalRenderer, delta: &str) -> Option<String> {
+        self.pending.push_str(delta);
+        let split = find_stream_safe_boundary(&self.pending)?;
+        let ready = self.pending[..split].to_string();
+        self.pending.drain(..split);
+        Some(renderer.markdown_to_ansi(&ready))
+    }
+
+    #[must_use]
+    pub fn flush(&mut self, renderer: &TerminalRenderer) -> Option<String> {
+        if self.pending.trim().is_empty() {
+            self.pending.clear();
+            None
+        } else {
+            let pending = std::mem::take(&mut self.pending);
+            Some(renderer.markdown_to_ansi(&pending))
+        }
+    }
+}
+
+fn apply_code_block_background(line: &str) -> String {
+    let trimmed = line.trim_end_matches('\n');
+    let trailing_newline = if trimmed.len() == line.len() {
+        ""
+    } else {
+        "\n"
+    };
+    let with_background = trimmed.replace("\u{1b}[0m", "\u{1b}[0;48;5;236m");
+    format!("\u{1b}[48;5;236m{with_background}\u{1b}[0m{trailing_newline}")
+}
+
+fn find_stream_safe_boundary(markdown: &str) -> Option<usize> {
+    let mut in_fence = false;
+    let mut last_boundary = None;
+
+    for (offset, line) in markdown.split_inclusive('\n').scan(0usize, |cursor, line| {
+        let start = *cursor;
+        *cursor += line.len();
+        Some((start, line))
+    }) {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            if !in_fence {
+                last_boundary = Some(offset + line.len());
+            }
+            continue;
+        }
+
+        if in_fence {
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            last_boundary = Some(offset + line.len());
+        }
+    }
+
+    last_boundary
 }
 
 fn visible_width(input: &str) -> usize {
@@ -562,7 +632,7 @@ fn strip_ansi(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_ansi, Spinner, TerminalRenderer};
+    use super::{strip_ansi, MarkdownStreamState, Spinner, TerminalRenderer};
 
     #[test]
     fn renders_markdown_with_styling_and_lists() {
@@ -580,12 +650,13 @@ mod tests {
     fn highlights_fenced_code_blocks() {
         let terminal_renderer = TerminalRenderer::new();
         let markdown_output =
-            terminal_renderer.render_markdown("```rust\nfn hi() { println!(\"hi\"); }\n```");
+            terminal_renderer.markdown_to_ansi("```rust\nfn hi() { println!(\"hi\"); }\n```");
         let plain_text = strip_ansi(&markdown_output);
 
         assert!(plain_text.contains("╭─ rust"));
         assert!(plain_text.contains("fn hi"));
         assert!(markdown_output.contains('\u{1b}'));
+        assert!(markdown_output.contains("[48;5;236m"));
     }
 
     #[test]
@@ -630,5 +701,25 @@ mod tests {
 
         let output = String::from_utf8_lossy(&out);
         assert!(output.contains("Working"));
+    }
+
+    #[test]
+    fn streaming_state_waits_for_complete_blocks() {
+        let renderer = TerminalRenderer::new();
+        let mut state = MarkdownStreamState::default();
+
+        assert_eq!(state.push(&renderer, "# Heading"), None);
+        let flushed = state
+            .push(&renderer, "\n\nParagraph\n\n")
+            .expect("completed block");
+        let plain_text = strip_ansi(&flushed);
+        assert!(plain_text.contains("Heading"));
+        assert!(plain_text.contains("Paragraph"));
+
+        assert_eq!(state.push(&renderer, "```rust\nfn main() {}\n"), None);
+        let code = state
+            .push(&renderer, "```\n")
+            .expect("closed code fence flushes");
+        assert!(strip_ansi(&code).contains("fn main()"));
     }
 }
