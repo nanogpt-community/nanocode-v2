@@ -311,6 +311,25 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 output_format = CliOutputFormat::parse(&flag[16..])?;
                 index += 1;
             }
+            "-p" => {
+                let prompt = args[index + 1..].join(" ");
+                if prompt.trim().is_empty() {
+                    return Err("-p requires a prompt string".to_string());
+                }
+                return Ok(CliAction::Prompt {
+                    prompt,
+                    model: resolve_model_alias(&model).to_string(),
+                    allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
+                    permission_mode,
+                    max_cost_usd,
+                    thinking,
+                    output_format,
+                });
+            }
+            "--print" => {
+                output_format = CliOutputFormat::Text;
+                index += 1;
+            }
             "--allowedTools" | "--allowed-tools" => {
                 let value = args
                     .get(index + 1)
@@ -5874,6 +5893,53 @@ mod tests {
                     max_cost_usd: None,
                     thinking: false,
                     output_format: CliOutputFormat::Json,
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn parses_dash_p_prompt_shorthand() {
+        with_isolated_config_home(|| {
+            let args = vec![
+                "-p".to_string(),
+                "summarize".to_string(),
+                "this".to_string(),
+            ];
+            assert_eq!(
+                parse_args(&args).expect("args should parse"),
+                CliAction::Prompt {
+                    prompt: "summarize this".to_string(),
+                    model: DEFAULT_MODEL.to_string(),
+                    allowed_tools: None,
+                    permission_mode: PermissionMode::WorkspaceWrite,
+                    max_cost_usd: None,
+                    thinking: false,
+                    output_format: CliOutputFormat::Text,
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn parses_print_flag_as_text_output() {
+        with_isolated_config_home(|| {
+            let args = vec![
+                "--output-format=json".to_string(),
+                "--print".to_string(),
+                "summarize".to_string(),
+                "this".to_string(),
+            ];
+            assert_eq!(
+                parse_args(&args).expect("args should parse"),
+                CliAction::Prompt {
+                    prompt: "summarize this".to_string(),
+                    model: DEFAULT_MODEL.to_string(),
+                    allowed_tools: None,
+                    permission_mode: PermissionMode::WorkspaceWrite,
+                    max_cost_usd: None,
+                    thinking: false,
+                    output_format: CliOutputFormat::Text,
                 }
             );
         });
