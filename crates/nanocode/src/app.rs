@@ -105,7 +105,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
         } => LiveCli::new(
             model,
-            false,
+            true,
             allowed_tools,
             permission_mode,
             max_cost_usd,
@@ -2552,6 +2552,9 @@ impl LiveCli {
             serde_json::json!({
                 "message": assistant_text_from_messages(&summary.assistant_messages),
                 "model": self.model,
+                "iterations": summary.iterations,
+                "tool_uses": collect_tool_uses(&summary),
+                "tool_results": collect_tool_results(&summary),
                 "usage": {
                     "input_tokens": summary.usage.input_tokens,
                     "output_tokens": summary.usage.output_tokens,
@@ -3106,7 +3109,7 @@ fn build_runtime(
             thinking_enabled,
             render_model_output,
         )?,
-        CliToolExecutor::new(mcp_catalog, tool_specs, allowed_tools),
+        CliToolExecutor::new(mcp_catalog, tool_specs, allowed_tools, render_model_output),
         permission_policy,
         runtime_prompt,
     ))
@@ -3225,6 +3228,7 @@ impl ApiClient for NanoCodeRuntimeClient {
                                 output.as_mut(),
                                 &mut events,
                                 &mut pending_tool,
+                                true,
                             )?;
                         }
                     }
@@ -3234,6 +3238,7 @@ impl ApiClient for NanoCodeRuntimeClient {
                             output.as_mut(),
                             &mut events,
                             &mut pending_tool,
+                            true,
                         )?;
                     }
                     ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
@@ -3559,6 +3564,7 @@ fn push_output_block(
     out: &mut (impl Write + ?Sized),
     events: &mut Vec<AssistantEvent>,
     pending_tool: &mut Option<(String, String, String)>,
+    streaming_tool_input: bool,
 ) -> Result<(), RuntimeError> {
     match block {
         OutputContentBlock::Text { text } => {
@@ -3582,12 +3588,14 @@ fn push_output_block(
             }
         }
         OutputContentBlock::ToolUse { id, name, input } => {
-            let initial_input =
-                if input.is_object() && input.as_object().is_some_and(|object| object.is_empty()) {
-                    String::new()
-                } else {
-                    input.to_string()
-                };
+            let initial_input = if streaming_tool_input
+                && input.is_object()
+                && input.as_object().is_some_and(|object| object.is_empty())
+            {
+                String::new()
+            } else {
+                input.to_string()
+            };
             *pending_tool = Some((id, name, initial_input));
         }
     }
@@ -3675,7 +3683,7 @@ fn response_to_events(
     let mut pending_tool = None;
 
     for block in response.content {
-        push_output_block(block, out, &mut events, &mut pending_tool)?;
+        push_output_block(block, out, &mut events, &mut pending_tool, false)?;
         if let Some((id, name, input)) = pending_tool.take() {
             events.push(AssistantEvent::ToolUse { id, name, input });
         }
@@ -3917,6 +3925,7 @@ struct CliToolExecutor {
     mcp_catalog: McpCatalog,
     tool_specs: Vec<RuntimeToolSpec>,
     allowed_tools: Option<AllowedToolSet>,
+    emit_output: bool,
 }
 
 impl CliToolExecutor {
@@ -3924,12 +3933,14 @@ impl CliToolExecutor {
         mcp_catalog: McpCatalog,
         tool_specs: Vec<RuntimeToolSpec>,
         allowed_tools: Option<AllowedToolSet>,
+        emit_output: bool,
     ) -> Self {
         Self {
             renderer: TerminalRenderer::new(),
             mcp_catalog,
             tool_specs,
             allowed_tools,
+            emit_output,
         }
     }
 }
@@ -3951,10 +3962,12 @@ impl ToolExecutor for CliToolExecutor {
         } else {
             execute_tool(tool_name, &value).map_err(ToolError::new)
         }?;
-        let markdown = render_tool_result_markdown(tool_name, &output);
-        self.renderer
-            .stream_markdown(&markdown, &mut io::stdout())
-            .map_err(|error| ToolError::new(error.to_string()))?;
+        if self.emit_output {
+            let markdown = render_tool_result_markdown(tool_name, &output);
+            self.renderer
+                .stream_markdown(&markdown, &mut io::stdout())
+                .map_err(|error| ToolError::new(error.to_string()))?;
+        }
         Ok(output)
     }
 }
@@ -4649,6 +4662,44 @@ fn usage_cost_estimate(model: &str, usage: TokenUsage) -> runtime::UsageCostEsti
 
 fn usage_cost_total(model: &str, usage: TokenUsage) -> f64 {
     usage_cost_estimate(model, usage).total_cost_usd()
+}
+
+fn collect_tool_uses(summary: &runtime::TurnSummary) -> Vec<JsonValue> {
+    summary
+        .assistant_messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, name, input } => Some(serde_json::json!({
+                "id": id,
+                "name": name,
+                "input": input,
+            })),
+            _ => None,
+        })
+        .collect()
+}
+
+fn collect_tool_results(summary: &runtime::TurnSummary) -> Vec<JsonValue> {
+    summary
+        .tool_results
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                tool_name,
+                output,
+                is_error,
+            } => Some(serde_json::json!({
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "output": output,
+                "is_error": is_error,
+            })),
+            _ => None,
+        })
+        .collect()
 }
 
 fn format_budget_line(cost_usd: f64, max_cost_usd: Option<f64>) -> String {
@@ -5706,7 +5757,7 @@ mod tests {
         parse_mcp_command, parse_model_command, parse_provider_command, parse_proxy_command,
         parse_tool_input_value, prompt_to_content_blocks, proxy_chat_completion_response_to_events,
         proxy_response_to_events, push_output_block, render_streamed_tool_call_start,
-        render_tool_result_markdown, render_update_report, resolve_model_alias,
+        render_tool_result_markdown, render_update_report, resolve_model_alias, response_to_events,
         should_retry_proxy_tool_prompt, AssistantEvent, CliAction, CliOutputFormat, GitHubRelease,
         GitHubReleaseAsset, McpCatalog, McpCommand, RuntimeToolSpec, DEFAULT_MODEL,
     };
@@ -6478,6 +6529,7 @@ mod tests {
             &mut rendered,
             &mut events,
             &mut pending_tool,
+            true,
         )
         .expect("tool block should be accepted");
 
@@ -6503,5 +6555,38 @@ mod tests {
         let text = String::from_utf8(rendered).expect("rendered bytes should be utf8");
         assert!(text.contains("→ read_file README.md"));
         assert!(!text.contains("{}"));
+    }
+
+    #[test]
+    fn non_stream_response_preserves_empty_object_tool_input() {
+        let response = MessageResponse {
+            id: "msg_123".to_string(),
+            kind: "message".to_string(),
+            role: "assistant".to_string(),
+            content: vec![OutputContentBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "read_file".to_string(),
+                input: json!({}),
+            }],
+            model: "zai-org/glm-5.1".to_string(),
+            stop_reason: Some("tool_use".to_string()),
+            stop_sequence: None,
+            usage: Usage {
+                input_tokens: 1,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: 1,
+            },
+            request_id: None,
+        };
+
+        let events = response_to_events(response, &mut Vec::new())
+            .expect("response conversion should succeed");
+
+        assert!(matches!(
+            &events[0],
+            AssistantEvent::ToolUse { name, input, .. }
+                if name == "read_file" && input == "{}"
+        ));
     }
 }
