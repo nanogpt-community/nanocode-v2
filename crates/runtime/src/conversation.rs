@@ -118,7 +118,7 @@ where
             tool_executor,
             permission_policy,
             system_prompt,
-            max_iterations: 16,
+            max_iterations: usize::MAX,
             usage_tracker,
         }
     }

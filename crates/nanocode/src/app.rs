@@ -1943,6 +1943,14 @@ fn truncate_for_summary(text: &str, max_chars: usize) -> String {
     }
 }
 
+fn summarize_tool_payload(payload: &str) -> String {
+    let compact = match serde_json::from_str::<JsonValue>(payload) {
+        Ok(value) => value.to_string(),
+        Err(_) => payload.trim().to_string(),
+    };
+    truncate_for_summary(&compact, 96)
+}
+
 fn current_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3255,6 +3263,7 @@ impl ApiClient for NanoCodeRuntimeClient {
                     },
                     ApiStreamEvent::ContentBlockStop(_) => {
                         if let Some((id, name, input)) = pending_tool.take() {
+                            render_streamed_tool_call_start(output.as_mut(), &name, &input)?;
                             events.push(AssistantEvent::ToolUse { id, name, input });
                         }
                     }
@@ -3573,10 +3582,80 @@ fn push_output_block(
             }
         }
         OutputContentBlock::ToolUse { id, name, input } => {
-            *pending_tool = Some((id, name, input.to_string()));
+            let initial_input =
+                if input.is_object() && input.as_object().is_some_and(|object| object.is_empty()) {
+                    String::new()
+                } else {
+                    input.to_string()
+                };
+            *pending_tool = Some((id, name, initial_input));
         }
     }
     Ok(())
+}
+
+fn render_streamed_tool_call_start(
+    out: &mut (impl Write + ?Sized),
+    name: &str,
+    input: &str,
+) -> Result<(), RuntimeError> {
+    writeln!(out, "\n{}", format_tool_call_start(name, input))
+        .and_then(|_| out.flush())
+        .map_err(|error| RuntimeError::new(error.to_string()))
+}
+
+fn format_tool_call_start(name: &str, input: &str) -> String {
+    let parsed =
+        serde_json::from_str::<JsonValue>(input).unwrap_or(JsonValue::String(input.to_string()));
+    let detail = match name {
+        "bash" | "Bash" => parsed
+            .get("command")
+            .and_then(JsonValue::as_str)
+            .map(|command| truncate_for_summary(command, 120))
+            .unwrap_or_default(),
+        "read_file" | "Read" => parsed
+            .get("file_path")
+            .or_else(|| parsed.get("path"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or("?")
+            .to_string(),
+        "write_file" | "Write" => {
+            let path = parsed
+                .get("file_path")
+                .or_else(|| parsed.get("path"))
+                .and_then(JsonValue::as_str)
+                .unwrap_or("?");
+            let lines = parsed
+                .get("content")
+                .and_then(JsonValue::as_str)
+                .map(|content| content.lines().count())
+                .unwrap_or(0);
+            format!("{path} ({lines} lines)")
+        }
+        "edit_file" | "Edit" => parsed
+            .get("file_path")
+            .or_else(|| parsed.get("path"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or("?")
+            .to_string(),
+        "glob_search" | "Glob" | "grep_search" | "Grep" => parsed
+            .get("pattern")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("?")
+            .to_string(),
+        "web_search" | "WebSearch" => parsed
+            .get("query")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("?")
+            .to_string(),
+        _ => summarize_tool_payload(input),
+    };
+
+    if detail.is_empty() {
+        format!("→ {name}")
+    } else {
+        format!("→ {name} {detail}")
+    }
 }
 
 fn render_thinking_block_summary(
@@ -5626,10 +5705,10 @@ mod tests {
         filter_runtime_tool_specs, parse_args, parse_auth_command, parse_checksum_for_asset,
         parse_mcp_command, parse_model_command, parse_provider_command, parse_proxy_command,
         parse_tool_input_value, prompt_to_content_blocks, proxy_chat_completion_response_to_events,
-        proxy_response_to_events, render_tool_result_markdown, render_update_report,
-        resolve_model_alias, should_retry_proxy_tool_prompt, AssistantEvent, CliAction,
-        CliOutputFormat, GitHubRelease, GitHubReleaseAsset, McpCatalog, McpCommand,
-        RuntimeToolSpec, DEFAULT_MODEL,
+        proxy_response_to_events, push_output_block, render_streamed_tool_call_start,
+        render_tool_result_markdown, render_update_report, resolve_model_alias,
+        should_retry_proxy_tool_prompt, AssistantEvent, CliAction, CliOutputFormat, GitHubRelease,
+        GitHubReleaseAsset, McpCatalog, McpCommand, RuntimeToolSpec, DEFAULT_MODEL,
     };
     use crate::proxy::ProxyCommand;
     use api::{
@@ -6382,5 +6461,47 @@ mod tests {
         assert!(markdown.contains("### Tool `bash`"));
         assert!(markdown.contains("stdout truncated in TUI"));
         assert!(!markdown.contains("output 100"));
+    }
+
+    #[test]
+    fn streaming_tool_use_defers_empty_object_until_json_deltas_arrive() {
+        let mut rendered = Vec::new();
+        let mut events = Vec::new();
+        let mut pending_tool = None;
+
+        push_output_block(
+            OutputContentBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "read_file".to_string(),
+                input: json!({}),
+            },
+            &mut rendered,
+            &mut events,
+            &mut pending_tool,
+        )
+        .expect("tool block should be accepted");
+
+        assert!(rendered.is_empty());
+        assert!(events.is_empty());
+        assert_eq!(
+            pending_tool,
+            Some((
+                "toolu_1".to_string(),
+                "read_file".to_string(),
+                String::new()
+            ))
+        );
+    }
+
+    #[test]
+    fn streamed_tool_call_start_renders_after_accumulation() {
+        let mut rendered = Vec::new();
+
+        render_streamed_tool_call_start(&mut rendered, "read_file", r#"{"path":"README.md"}"#)
+            .expect("rendered tool call should succeed");
+
+        let text = String::from_utf8(rendered).expect("rendered bytes should be utf8");
+        assert!(text.contains("→ read_file README.md"));
+        assert!(!text.contains("{}"));
     }
 }
