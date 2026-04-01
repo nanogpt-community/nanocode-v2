@@ -8,6 +8,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::collections::BTreeSet;
 
 use api::{
     resolve_api_key as resolve_nanogpt_api_key, ApiError, ChatCompletionAssistantMessage,
@@ -52,6 +53,8 @@ const MAX_TOOL_PREVIEW_LINES: usize = 48;
 const MCP_DISCOVERY_TIMEOUT_SECS: u64 = 30;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+type AllowedToolSet = BTreeSet<String>;
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
@@ -73,8 +76,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             session_path,
             command,
         } => resume_session(&session_path, command),
-        CliAction::Prompt { prompt, model } => LiveCli::new(model, false)?.run_turn(&prompt)?,
-        CliAction::Repl { model } => run_repl(model)?,
+        CliAction::Prompt {
+            prompt,
+            model,
+            allowed_tools,
+        } => LiveCli::new(model, false, allowed_tools)?.run_turn(&prompt)?,
+        CliAction::Repl {
+            model,
+            allowed_tools,
+        } => run_repl(model, allowed_tools)?,
         CliAction::Login { api_key } => login(api_key)?,
         CliAction::Help => print_help(),
         CliAction::Version => print_version(),
@@ -109,12 +119,14 @@ enum CliAction {
     Prompt {
         prompt: String,
         model: String,
+        allowed_tools: Option<AllowedToolSet>,
     },
     Login {
         api_key: Option<String>,
     },
     Repl {
         model: String,
+        allowed_tools: Option<AllowedToolSet>,
     },
     Help,
     Version,
@@ -155,6 +167,7 @@ struct McpCatalog {
 
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut model = default_model_or(DEFAULT_MODEL);
+    let mut allowed_tool_values = Vec::new();
     let mut rest = Vec::new();
     let mut index = 0;
 
@@ -171,6 +184,21 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 model = flag[8..].to_string();
                 index += 1;
             }
+            "--allowedTools" | "--allowed-tools" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --allowedTools".to_string())?;
+                allowed_tool_values.push(value.clone());
+                index += 2;
+            }
+            flag if flag.starts_with("--allowedTools=") => {
+                allowed_tool_values.push(flag[15..].to_string());
+                index += 1;
+            }
+            flag if flag.starts_with("--allowed-tools=") => {
+                allowed_tool_values.push(flag[16..].to_string());
+                index += 1;
+            }
             other => {
                 rest.push(other.to_string());
                 index += 1;
@@ -178,8 +206,13 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         }
     }
 
+    let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
+
     if rest.is_empty() {
-        return Ok(CliAction::Repl { model });
+        return Ok(CliAction::Repl {
+            model,
+            allowed_tools,
+        });
     }
     if matches!(rest.first().map(String::as_str), Some("--help" | "-h")) {
         return Ok(CliAction::Help);
@@ -205,10 +238,52 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             if prompt.trim().is_empty() {
                 return Err("prompt subcommand requires a prompt string".to_string());
             }
-            Ok(CliAction::Prompt { prompt, model })
+            Ok(CliAction::Prompt {
+                prompt,
+                model,
+                allowed_tools,
+            })
         }
         other => Err(format!("unknown subcommand: {other}")),
     }
+}
+
+fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+
+    let canonical_names = base_runtime_tool_specs()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>();
+    let mut allowed = AllowedToolSet::new();
+
+    for value in values {
+        for token in value
+            .split(|ch: char| ch == ',' || ch.is_whitespace())
+            .filter(|token| !token.is_empty())
+        {
+            let normalized = token.trim().replace('-', "_").to_ascii_lowercase();
+            let canonical = match normalized.as_str() {
+                "read" => "read_file",
+                "write" => "write_file",
+                "edit" => "edit_file",
+                "glob" => "glob_search",
+                "grep" => "grep_search",
+                other => other,
+            };
+            if !canonical_names.iter().any(|name| name == canonical) {
+                return Err(format!(
+                    "unsupported tool in --allowedTools: {token} (expected one of: {})",
+                    canonical_names.join(", ")
+                ));
+            }
+            allowed.insert(canonical.to_string());
+        }
+    }
+
+    Ok(Some(allowed))
 }
 
 fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
@@ -679,6 +754,15 @@ fn available_runtime_tool_specs(mcp_catalog: &McpCatalog) -> Vec<RuntimeToolSpec
     let mut specs = base_runtime_tool_specs();
     specs.extend(mcp_catalog.tool_specs());
     specs
+}
+
+fn filter_runtime_tool_specs(
+    specs: Vec<RuntimeToolSpec>,
+    allowed_tools: Option<&AllowedToolSet>,
+) -> Vec<RuntimeToolSpec> {
+    specs.into_iter()
+        .filter(|spec| allowed_tools.is_none_or(|allowed| allowed.contains(&spec.name)))
+        .collect()
 }
 
 fn load_mcp_catalog(cwd: &Path) -> Result<McpCatalog, Box<dyn std::error::Error>> {
@@ -1327,8 +1411,11 @@ impl McpCatalog {
     }
 }
 
-fn run_repl(model: String) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cli = LiveCli::new(model, true)?;
+fn run_repl(
+    model: String,
+    allowed_tools: Option<AllowedToolSet>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cli = LiveCli::new(model, true, allowed_tools)?;
     let editor = input::LineEditor::new("› ");
     println!("NanoCode interactive mode");
     println!("Type /help for commands. Shift+Enter or Ctrl+J inserts a newline.");
@@ -1398,6 +1485,7 @@ fn run_repl(model: String) -> Result<(), Box<dyn std::error::Error>> {
 
 struct LiveCli {
     model: String,
+    allowed_tools: Option<AllowedToolSet>,
     system_prompt: Vec<String>,
     proxy_tool_calls: bool,
     mcp_catalog: McpCatalog,
@@ -1405,7 +1493,11 @@ struct LiveCli {
 }
 
 impl LiveCli {
-    fn new(model: String, enable_tools: bool) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(
+        model: String,
+        enable_tools: bool,
+        allowed_tools: Option<AllowedToolSet>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let proxy_tool_calls = proxy_tool_calls_enabled();
         let mcp_catalog = load_mcp_catalog(&env::current_dir()?)?;
@@ -1416,9 +1508,11 @@ impl LiveCli {
             enable_tools,
             proxy_tool_calls,
             mcp_catalog.clone(),
+            allowed_tools.clone(),
         )?;
         Ok(Self {
             model,
+            allowed_tools,
             system_prompt,
             proxy_tool_calls,
             mcp_catalog,
@@ -1496,6 +1590,7 @@ impl LiveCli {
             true,
             self.proxy_tool_calls,
             self.mcp_catalog.clone(),
+            self.allowed_tools.clone(),
         )?;
         println!("Compacted {removed} messages.");
         Ok(())
@@ -1511,6 +1606,7 @@ impl LiveCli {
             true,
             self.proxy_tool_calls,
             self.mcp_catalog.clone(),
+            self.allowed_tools.clone(),
         )?;
         self.model = model.clone();
         let provider =
@@ -1536,6 +1632,7 @@ impl LiveCli {
             true,
             self.proxy_tool_calls,
             self.mcp_catalog.clone(),
+            self.allowed_tools.clone(),
         )?;
         if provider_label == "<platform default>" {
             println!(
@@ -1561,6 +1658,7 @@ impl LiveCli {
             true,
             enabled,
             self.mcp_catalog.clone(),
+            self.allowed_tools.clone(),
         )?;
         self.proxy_tool_calls = enabled;
         println!(
@@ -1585,6 +1683,7 @@ impl LiveCli {
             true,
             self.proxy_tool_calls,
             catalog.clone(),
+            self.allowed_tools.clone(),
         )?;
         self.mcp_catalog = catalog;
         println!("Reloaded MCP config.");
@@ -1656,10 +1755,11 @@ fn build_runtime(
     enable_tools: bool,
     proxy_tool_calls: bool,
     mcp_catalog: McpCatalog,
+    allowed_tools: Option<AllowedToolSet>,
 ) -> Result<ConversationRuntime<NanoCodeRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     let tool_specs = if enable_tools {
-        available_runtime_tool_specs(&mcp_catalog)
+        filter_runtime_tool_specs(available_runtime_tool_specs(&mcp_catalog), allowed_tools.as_ref())
     } else {
         Vec::new()
     };
@@ -1676,7 +1776,7 @@ fn build_runtime(
             proxy_tool_calls,
             tool_specs.clone(),
         )?,
-        CliToolExecutor::new(mcp_catalog, tool_specs),
+        CliToolExecutor::new(mcp_catalog, tool_specs, allowed_tools),
         permission_policy_from_env(),
         runtime_prompt,
     ))
@@ -2263,20 +2363,35 @@ struct CliToolExecutor {
     renderer: TerminalRenderer,
     mcp_catalog: McpCatalog,
     tool_specs: Vec<RuntimeToolSpec>,
+    allowed_tools: Option<AllowedToolSet>,
 }
 
 impl CliToolExecutor {
-    fn new(mcp_catalog: McpCatalog, tool_specs: Vec<RuntimeToolSpec>) -> Self {
+    fn new(
+        mcp_catalog: McpCatalog,
+        tool_specs: Vec<RuntimeToolSpec>,
+        allowed_tools: Option<AllowedToolSet>,
+    ) -> Self {
         Self {
             renderer: TerminalRenderer::new(),
             mcp_catalog,
             tool_specs,
+            allowed_tools,
         }
     }
 }
 
 impl ToolExecutor for CliToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        if self
+            .allowed_tools
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(tool_name))
+        {
+            return Err(ToolError::new(format!(
+                "tool `{tool_name}` is not enabled by the current --allowedTools setting"
+            )));
+        }
         let value = parse_tool_input_value(tool_name, input, &self.tool_specs)?;
         let output = if let Some(tool) = self.mcp_catalog.find_tool(tool_name) {
             call_mcp_tool(tool, &value).map_err(|error| ToolError::new(error.to_string()))
@@ -2762,7 +2877,8 @@ fn print_help() {
     println!("nanocode");
     println!();
     println!("Usage:");
-    println!("  nanocode [--model MODEL]                     Start interactive REPL");
+    println!("  nanocode [--model MODEL] [--allowedTools TOOL[,TOOL...]]");
+    println!("                                               Start interactive REPL");
     println!("  nanocode login [--api-key KEY]              Save a NanoGPT API key");
     println!("  nanocode model [MODEL_ID]                   Choose or persist a default model");
     println!(
@@ -2773,8 +2889,9 @@ fn print_help() {
         "  nanocode mcp [status|tools|reload]          Inspect configured MCP servers and tools"
     );
     println!(
-        "  nanocode [--model MODEL] prompt TEXT        Send one prompt and stream the response"
+        "  nanocode [--model MODEL] [--allowedTools TOOL[,TOOL...]] prompt TEXT"
     );
+    println!("                                               Send one prompt and stream the response");
     println!("  nanocode dump-manifests");
     println!("  nanocode bootstrap-plan");
     println!("  nanocode system-prompt [--cwd PATH] [--date YYYY-MM-DD]");
@@ -2789,9 +2906,10 @@ fn print_version() {
 #[cfg(test)]
 mod tests {
     use super::{
-        available_runtime_tool_specs, extract_first_json_object, parse_args, parse_auth_command,
-        parse_mcp_command, parse_model_command, parse_provider_command, parse_proxy_command,
-        parse_tool_input_value, proxy_chat_completion_response_to_events, proxy_response_to_events,
+        available_runtime_tool_specs, extract_first_json_object, filter_runtime_tool_specs,
+        parse_args, parse_auth_command, parse_mcp_command, parse_model_command,
+        parse_provider_command, parse_proxy_command, parse_tool_input_value,
+        proxy_chat_completion_response_to_events, proxy_response_to_events,
         render_tool_result_markdown, should_retry_proxy_tool_prompt, AssistantEvent, CliAction,
         McpCatalog, McpCommand, RuntimeToolSpec, DEFAULT_MODEL,
     };
@@ -2842,6 +2960,7 @@ mod tests {
                 parse_args(&[]).expect("args should parse"),
                 CliAction::Repl {
                     model: DEFAULT_MODEL.to_string(),
+                    allowed_tools: None,
                 }
             );
         });
@@ -2860,8 +2979,41 @@ mod tests {
                 CliAction::Prompt {
                     prompt: "hello world".to_string(),
                     model: DEFAULT_MODEL.to_string(),
+                    allowed_tools: None,
                 }
             );
+        });
+    }
+
+    #[test]
+    fn parses_allowed_tools_flags_with_aliases_and_lists() {
+        with_isolated_config_home(|| {
+            let args = vec![
+                "--allowedTools".to_string(),
+                "read,glob".to_string(),
+                "--allowed-tools=write_file".to_string(),
+            ];
+            assert_eq!(
+                parse_args(&args).expect("args should parse"),
+                CliAction::Repl {
+                    model: DEFAULT_MODEL.to_string(),
+                    allowed_tools: Some(
+                        ["glob_search", "read_file", "write_file"]
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect()
+                    ),
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn rejects_unknown_allowed_tools() {
+        with_isolated_config_home(|| {
+            let error = parse_args(&["--allowedTools".to_string(), "teleport".to_string()])
+                .expect_err("tool should be rejected");
+            assert!(error.contains("unsupported tool in --allowedTools: teleport"));
         });
     }
 
@@ -2977,6 +3129,21 @@ mod tests {
                 CliAction::Version
             );
         });
+    }
+
+    #[test]
+    fn filtered_tool_specs_respect_allowlist() {
+        let allowed = ["read_file", "grep_search"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let filtered =
+            filter_runtime_tool_specs(available_runtime_tool_specs(&McpCatalog::default()), Some(&allowed));
+        let names = filtered
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["read_file", "grep_search"]);
     }
 
     #[test]

@@ -37,9 +37,33 @@ The CLI reads:
 - `NANOCODE_PERMISSION_MODE` for local permission defaults
 - `NANOCODE_CONFIG_HOME`, `.nanocode/settings*.json`, and `NANOCODE.md` files for runtime configuration and instructions
 
+## Quick start
+
+### Show help
+
+```bash
+cd rust
+cargo run -p nanocode -- --help
+```
+
+### Print version
+
+```bash
+cd rust
+cargo run -p nanocode -- --version
+```
+
+### Restrict enabled tools
+
+```bash
+cd rust
+cargo run -p nanocode -- --allowedTools read,glob prompt "Summarize Cargo.toml"
+```
+
 ## Notes
 
 - The fallback default model is `zai-org/glm-5.1`.
 - Provider overrides are stored per model.
+- `--allowedTools` restricts both advertised tools and executable tools for prompt mode and REPL sessions.
 - `compat-harness` exists to compare the Rust port against the upstream TypeScript codebase and is intentionally excluded from the requested release test run.
 - The CLI currently focuses on a practical integrated workflow: prompt execution, REPL operation, session inspection/resume, config discovery, NanoGPT routing, and tool/runtime plumbing.

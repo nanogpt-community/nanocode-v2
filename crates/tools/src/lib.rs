@@ -2349,8 +2349,10 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
@@ -2361,6 +2363,14 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
     }
 
     #[test]
@@ -2433,6 +2443,40 @@ mod tests {
     }
 
     #[test]
+    fn web_fetch_supports_plain_text_and_rejects_invalid_url() {
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.starts_with("GET /plain "));
+            HttpResponse::text(200, "OK", "plain text response")
+        }));
+
+        let result = execute_tool(
+            "WebFetch",
+            &json!({
+                "url": format!("http://{}/plain", server.addr()),
+                "prompt": "Show me the content"
+            }),
+        )
+        .expect("WebFetch should succeed for text content");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(output["url"], format!("http://{}/plain", server.addr()));
+        assert!(output["result"]
+            .as_str()
+            .expect("result")
+            .contains("plain text response"));
+
+        let error = execute_tool(
+            "WebFetch",
+            &json!({
+                "url": "not a url",
+                "prompt": "Summarize"
+            }),
+        )
+        .expect_err("invalid URL should fail");
+        assert!(error.contains("relative URL without a base") || error.contains("invalid"));
+    }
+
+    #[test]
     fn web_search_extracts_and_filters_results() {
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
             assert!(request_line.contains("GET /search?q=rust+web+search "));
@@ -2477,14 +2521,62 @@ mod tests {
     }
 
     #[test]
+    fn web_search_handles_generic_links_and_invalid_base_url() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.contains("GET /fallback?q=generic+links "));
+            HttpResponse::html(
+                200,
+                "OK",
+                r#"
+                <html><body>
+                  <a href="https://example.com/one">Example One</a>
+                  <a href="https://example.com/one">Duplicate Example One</a>
+                  <a href="https://docs.rs/tokio">Tokio Docs</a>
+                </body></html>
+                "#,
+            )
+        }));
+
+        std::env::set_var(
+            "CLAWD_WEB_SEARCH_BASE_URL",
+            format!("http://{}/fallback", server.addr()),
+        );
+        let result = execute_tool(
+            "WebSearch",
+            &json!({
+                "query": "generic links"
+            }),
+        )
+        .expect("WebSearch fallback parsing should succeed");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        let results = output["results"].as_array().expect("results array");
+        let search_result = results
+            .iter()
+            .find(|item| item.get("content").is_some())
+            .expect("search result block present");
+        let content = search_result["content"].as_array().expect("content array");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["url"], "https://example.com/one");
+        assert_eq!(content[1]["url"], "https://docs.rs/tokio");
+
+        std::env::set_var("CLAWD_WEB_SEARCH_BASE_URL", "://bad-base-url");
+        let error = execute_tool("WebSearch", &json!({ "query": "generic links" }))
+            .expect_err("invalid base URL should fail");
+        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+        assert!(error.contains("relative URL without a base") || error.contains("empty host"));
+    }
+
+    #[test]
     fn todo_write_persists_and_returns_previous_state() {
-        let path = std::env::temp_dir().join(format!(
-            "clawd-tools-todos-{}.json",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = temp_path("todos.json");
         std::env::set_var("CLAWD_TODO_STORE", &path);
 
         let first = execute_tool(
@@ -2524,6 +2616,59 @@ mod tests {
             3
         );
         assert!(second_output["verificationNudgeNeeded"].is_null());
+    }
+
+    #[test]
+    fn todo_write_rejects_invalid_payloads_and_sets_verification_nudge() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = temp_path("todos-errors.json");
+        std::env::set_var("CLAWD_TODO_STORE", &path);
+
+        let empty = execute_tool("TodoWrite", &json!({ "todos": [] }))
+            .expect_err("empty todos should fail");
+        assert!(empty.contains("todos must not be empty"));
+
+        let too_many_active = execute_tool(
+            "TodoWrite",
+            &json!({
+                "todos": [
+                    {"content": "One", "activeForm": "Doing one", "status": "in_progress"},
+                    {"content": "Two", "activeForm": "Doing two", "status": "in_progress"}
+                ]
+            }),
+        )
+        .expect_err("multiple in-progress todos should fail");
+        assert!(too_many_active.contains("zero or one todo items may be in_progress"));
+
+        let blank_content = execute_tool(
+            "TodoWrite",
+            &json!({
+                "todos": [
+                    {"content": "   ", "activeForm": "Doing it", "status": "pending"}
+                ]
+            }),
+        )
+        .expect_err("blank content should fail");
+        assert!(blank_content.contains("todo content must not be empty"));
+
+        let nudge = execute_tool(
+            "TodoWrite",
+            &json!({
+                "todos": [
+                    {"content": "Write tests", "activeForm": "Writing tests", "status": "completed"},
+                    {"content": "Fix errors", "activeForm": "Fixing errors", "status": "completed"},
+                    {"content": "Ship branch", "activeForm": "Shipping branch", "status": "completed"}
+                ]
+            }),
+        )
+        .expect("completed todos should succeed");
+        std::env::remove_var("CLAWD_TODO_STORE");
+        let _ = fs::remove_file(path);
+
+        let output: serde_json::Value = serde_json::from_str(&nudge).expect("valid json");
+        assert_eq!(output["verificationNudgeNeeded"], true);
     }
 
     #[test]
@@ -2619,13 +2764,10 @@ mod tests {
 
     #[test]
     fn agent_persists_handoff_metadata() {
-        let dir = std::env::temp_dir().join(format!(
-            "clawd-agent-store-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = temp_path("agent-store");
         std::env::set_var("CLAWD_AGENT_STORE", &dir);
 
         let result = execute_tool(
@@ -2682,14 +2824,31 @@ mod tests {
     }
 
     #[test]
+    fn agent_rejects_blank_required_fields() {
+        let missing_description = execute_tool(
+            "Agent",
+            &json!({
+                "description": "  ",
+                "prompt": "Inspect"
+            }),
+        )
+        .expect_err("blank description should fail");
+        assert!(missing_description.contains("description must not be empty"));
+
+        let missing_prompt = execute_tool(
+            "Agent",
+            &json!({
+                "description": "Inspect branch",
+                "prompt": " "
+            }),
+        )
+        .expect_err("blank prompt should fail");
+        assert!(missing_prompt.contains("prompt must not be empty"));
+    }
+
+    #[test]
     fn notebook_edit_replaces_inserts_and_deletes_cells() {
-        let path = std::env::temp_dir().join(format!(
-            "clawd-notebook-{}.ipynb",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let path = temp_path("notebook.ipynb");
         std::fs::write(
             &path,
             r#"{
@@ -2765,6 +2924,270 @@ mod tests {
         assert_eq!(cells[1]["cell_type"], "code");
         assert_eq!(cells[1]["source"][0], "print(3)\n");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn notebook_edit_rejects_invalid_inputs() {
+        let text_path = temp_path("notebook.txt");
+        fs::write(&text_path, "not a notebook").expect("write text file");
+        let wrong_extension = execute_tool(
+            "NotebookEdit",
+            &json!({
+                "notebook_path": text_path.display().to_string(),
+                "new_source": "print(1)\n"
+            }),
+        )
+        .expect_err("non-ipynb file should fail");
+        assert!(wrong_extension.contains("Jupyter notebook"));
+        let _ = fs::remove_file(&text_path);
+
+        let empty_notebook = temp_path("empty.ipynb");
+        fs::write(
+            &empty_notebook,
+            r#"{"cells":[],"metadata":{"kernelspec":{"language":"python"}},"nbformat":4,"nbformat_minor":5}"#,
+        )
+        .expect("write empty notebook");
+
+        let missing_source = execute_tool(
+            "NotebookEdit",
+            &json!({
+                "notebook_path": empty_notebook.display().to_string(),
+                "edit_mode": "insert"
+            }),
+        )
+        .expect_err("insert without source should fail");
+        assert!(missing_source.contains("new_source is required"));
+
+        let missing_cell = execute_tool(
+            "NotebookEdit",
+            &json!({
+                "notebook_path": empty_notebook.display().to_string(),
+                "edit_mode": "delete"
+            }),
+        )
+        .expect_err("delete on empty notebook should fail");
+        assert!(missing_cell.contains("Notebook has no cells to edit"));
+        let _ = fs::remove_file(empty_notebook);
+    }
+
+    #[test]
+    fn bash_tool_reports_success_exit_failure_timeout_and_background() {
+        let success = execute_tool("bash", &json!({ "command": "printf 'hello'" }))
+            .expect("bash should succeed");
+        let success_output: serde_json::Value = serde_json::from_str(&success).expect("json");
+        assert_eq!(success_output["stdout"], "hello");
+        assert_eq!(success_output["interrupted"], false);
+
+        let failure = execute_tool("bash", &json!({ "command": "printf 'oops' >&2; exit 7" }))
+            .expect("bash failure should still return structured output");
+        let failure_output: serde_json::Value = serde_json::from_str(&failure).expect("json");
+        assert_eq!(failure_output["returnCodeInterpretation"], "exit_code:7");
+        assert!(failure_output["stderr"]
+            .as_str()
+            .expect("stderr")
+            .contains("oops"));
+
+        let timeout = execute_tool("bash", &json!({ "command": "sleep 1", "timeout": 10 }))
+            .expect("bash timeout should return output");
+        let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
+        assert_eq!(timeout_output["interrupted"], true);
+        assert_eq!(timeout_output["returnCodeInterpretation"], "timeout");
+        assert!(timeout_output["stderr"]
+            .as_str()
+            .expect("stderr")
+            .contains("Command exceeded timeout"));
+
+        let background = execute_tool(
+            "bash",
+            &json!({ "command": "sleep 1", "run_in_background": true }),
+        )
+        .expect("bash background should succeed");
+        let background_output: serde_json::Value = serde_json::from_str(&background).expect("json");
+        assert!(background_output["backgroundTaskId"].as_str().is_some());
+        assert_eq!(background_output["noOutputExpected"], true);
+    }
+
+    #[test]
+    fn file_tools_cover_read_write_and_edit_behaviors() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("fs-suite");
+        fs::create_dir_all(&root).expect("create root");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let write_create = execute_tool(
+            "write_file",
+            &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
+        )
+        .expect("write create should succeed");
+        let write_create_output: serde_json::Value =
+            serde_json::from_str(&write_create).expect("json");
+        assert_eq!(write_create_output["type"], "create");
+        assert!(root.join("nested/demo.txt").exists());
+
+        let write_update = execute_tool(
+            "write_file",
+            &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\ngamma\n" }),
+        )
+        .expect("write update should succeed");
+        let write_update_output: serde_json::Value =
+            serde_json::from_str(&write_update).expect("json");
+        assert_eq!(write_update_output["type"], "update");
+        assert_eq!(write_update_output["originalFile"], "alpha\nbeta\nalpha\n");
+
+        let read_full = execute_tool("read_file", &json!({ "path": "nested/demo.txt" }))
+            .expect("read full should succeed");
+        let read_full_output: serde_json::Value = serde_json::from_str(&read_full).expect("json");
+        assert_eq!(read_full_output["file"]["content"], "alpha\nbeta\ngamma");
+        assert_eq!(read_full_output["file"]["startLine"], 1);
+
+        let read_slice = execute_tool(
+            "read_file",
+            &json!({ "path": "nested/demo.txt", "offset": 1, "limit": 1 }),
+        )
+        .expect("read slice should succeed");
+        let read_slice_output: serde_json::Value = serde_json::from_str(&read_slice).expect("json");
+        assert_eq!(read_slice_output["file"]["content"], "beta");
+        assert_eq!(read_slice_output["file"]["startLine"], 2);
+
+        let read_past_end = execute_tool(
+            "read_file",
+            &json!({ "path": "nested/demo.txt", "offset": 50 }),
+        )
+        .expect("read past EOF should succeed");
+        let read_past_end_output: serde_json::Value =
+            serde_json::from_str(&read_past_end).expect("json");
+        assert_eq!(read_past_end_output["file"]["content"], "");
+        assert_eq!(read_past_end_output["file"]["startLine"], 4);
+
+        let read_error = execute_tool("read_file", &json!({ "path": "missing.txt" }))
+            .expect_err("missing file should fail");
+        assert!(!read_error.is_empty());
+
+        let edit_once = execute_tool(
+            "edit_file",
+            &json!({ "path": "nested/demo.txt", "old_string": "alpha", "new_string": "omega" }),
+        )
+        .expect("single edit should succeed");
+        let edit_once_output: serde_json::Value = serde_json::from_str(&edit_once).expect("json");
+        assert_eq!(edit_once_output["replaceAll"], false);
+        assert_eq!(
+            fs::read_to_string(root.join("nested/demo.txt")).expect("read file"),
+            "omega\nbeta\ngamma\n"
+        );
+
+        execute_tool(
+            "write_file",
+            &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
+        )
+        .expect("reset file");
+        let edit_all = execute_tool(
+            "edit_file",
+            &json!({
+                "path": "nested/demo.txt",
+                "old_string": "alpha",
+                "new_string": "omega",
+                "replace_all": true
+            }),
+        )
+        .expect("replace all should succeed");
+        let edit_all_output: serde_json::Value = serde_json::from_str(&edit_all).expect("json");
+        assert_eq!(edit_all_output["replaceAll"], true);
+        assert_eq!(
+            fs::read_to_string(root.join("nested/demo.txt")).expect("read file"),
+            "omega\nbeta\nomega\n"
+        );
+
+        let edit_same = execute_tool(
+            "edit_file",
+            &json!({ "path": "nested/demo.txt", "old_string": "omega", "new_string": "omega" }),
+        )
+        .expect_err("identical old/new should fail");
+        assert!(edit_same.contains("must differ"));
+
+        let edit_missing = execute_tool(
+            "edit_file",
+            &json!({ "path": "nested/demo.txt", "old_string": "missing", "new_string": "omega" }),
+        )
+        .expect_err("missing substring should fail");
+        assert!(edit_missing.contains("old_string not found"));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn glob_and_grep_tools_cover_success_and_errors() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("search-suite");
+        fs::create_dir_all(root.join("nested")).expect("create root");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        fs::write(
+            root.join("nested/lib.rs"),
+            "fn main() {}\nlet alpha = 1;\nlet alpha = 2;\n",
+        )
+        .expect("write rust file");
+        fs::write(root.join("nested/notes.txt"), "alpha\nbeta\n").expect("write txt file");
+
+        let globbed = execute_tool("glob_search", &json!({ "pattern": "nested/*.rs" }))
+            .expect("glob should succeed");
+        let globbed_output: serde_json::Value = serde_json::from_str(&globbed).expect("json");
+        assert_eq!(globbed_output["numFiles"], 1);
+        assert!(globbed_output["filenames"][0]
+            .as_str()
+            .expect("filename")
+            .ends_with("nested/lib.rs"));
+
+        let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
+            .expect_err("invalid glob should fail");
+        assert!(!glob_error.is_empty());
+
+        let grep_content = execute_tool(
+            "grep_search",
+            &json!({
+                "pattern": "alpha",
+                "path": "nested",
+                "glob": "*.rs",
+                "output_mode": "content",
+                "-n": true,
+                "head_limit": 1,
+                "offset": 1
+            }),
+        )
+        .expect("grep content should succeed");
+        let grep_content_output: serde_json::Value =
+            serde_json::from_str(&grep_content).expect("json");
+        assert_eq!(grep_content_output["numFiles"], 0);
+        assert!(grep_content_output["appliedLimit"].is_null());
+        assert_eq!(grep_content_output["appliedOffset"], 1);
+        assert!(grep_content_output["content"]
+            .as_str()
+            .expect("content")
+            .contains("let alpha = 2;"));
+
+        let grep_count = execute_tool(
+            "grep_search",
+            &json!({ "pattern": "alpha", "path": "nested", "output_mode": "count" }),
+        )
+        .expect("grep count should succeed");
+        let grep_count_output: serde_json::Value = serde_json::from_str(&grep_count).expect("json");
+        assert_eq!(grep_count_output["numMatches"], 3);
+
+        let grep_error = execute_tool(
+            "grep_search",
+            &json!({ "pattern": "(alpha", "path": "nested" }),
+        )
+        .expect_err("invalid regex should fail");
+        assert!(!grep_error.is_empty());
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3054,6 +3477,15 @@ printf 'pwsh:%s' "$1"
                 status,
                 reason,
                 content_type: "text/html; charset=utf-8",
+                body: body.to_string(),
+            }
+        }
+
+        fn text(status: u16, reason: &'static str, body: &str) -> Self {
+            Self {
+                status,
+                reason,
+                content_type: "text/plain; charset=utf-8",
                 body: body.to_string(),
             }
         }
