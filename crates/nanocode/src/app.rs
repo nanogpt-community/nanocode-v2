@@ -1,24 +1,30 @@
 use std::collections::BTreeSet;
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use api::{
     resolve_api_key as resolve_nanogpt_api_key, ApiError, ChatCompletionAssistantMessage,
     ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionTool,
     ChatCompletionToolChoice, ContentBlockDelta, ImageSource, InputContentBlock, InputMessage,
     MessageRequest, MessageResponse, NanoGptClient, OutputContentBlock,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    StreamEvent as ApiStreamEvent, ThinkingConfig, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use reqwest::blocking::Client as BlockingClient;
 use reqwest::header::{HeaderName, HeaderValue};
+use serde::Deserialize;
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 
+use crate::init::initialize_repo;
 use crate::input;
 use crate::models::{
     default_model_or, max_output_tokens_for_model_or, open_model_picker, open_provider_picker,
@@ -30,28 +36,45 @@ use crate::proxy::{
     ProxyCommand, ProxyMessage, ProxySegment, RuntimeToolSpec,
 };
 use crate::render::{Spinner, TerminalRenderer};
-use commands::{handle_slash_command, slash_command_specs};
+use commands::{render_slash_command_help, slash_command_specs, SlashCommand};
 use compat_harness::{extract_manifest, UpstreamPaths};
 use runtime::{
-    load_system_prompt, mcp_tool_name, spawn_mcp_stdio_process, ApiClient, ApiRequest,
-    AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
-    McpClientAuth, McpClientBootstrap, McpClientTransport, McpInitializeClientInfo,
-    McpInitializeParams, McpListToolsParams, McpListToolsResult, McpToolCallParams,
-    McpToolCallResult, McpTransport, MessageRole, PermissionMode, PermissionPolicy,
-    PermissionPromptDecision, PermissionPrompter, PermissionRequest, RuntimeError,
-    ScopedMcpServerConfig, Session, TokenUsage, ToolError, ToolExecutor,
+    format_usd, load_system_prompt, mcp_tool_name, pricing_for_model, resolve_sandbox_status,
+    spawn_mcp_stdio_process, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
+    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, JsonRpcId,
+    JsonRpcRequest, JsonRpcResponse, McpClientAuth, McpClientBootstrap, McpClientTransport,
+    McpInitializeClientInfo, McpInitializeParams, McpListToolsParams, McpListToolsResult,
+    McpToolCallParams, McpToolCallResult, McpTransport, MessageRole, PermissionMode,
+    PermissionPolicy, PermissionPromptDecision, PermissionPrompter, PermissionRequest,
+    RuntimeError, ScopedMcpServerConfig, Session, SessionMetadata, TokenUsage, ToolError,
+    ToolExecutor, UsageTracker,
 };
 use tools::{execute_tool, mvp_tool_specs};
 
 const DEFAULT_MODEL: &str = "zai-org/glm-5.1";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
+const DEFAULT_THINKING_BUDGET_TOKENS: u32 = 2_048;
 const DEFAULT_DATE: &str = "2026-03-31";
 const MAX_TOOL_PREVIEW_CHARS: usize = 4_000;
 const MAX_TOOL_PREVIEW_LINES: usize = 48;
 const MCP_DISCOVERY_TIMEOUT_SECS: u64 = 30;
+const COST_WARNING_FRACTION: f64 = 0.8;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUILD_TARGET: Option<&str> = option_env!("NANOCODE_BUILD_TARGET");
 const IMAGE_REF_PREFIX: &str = "@";
+const SELF_UPDATE_REPOSITORY: &str = "nanogpt-community/nanocode-v2";
+const SELF_UPDATE_LATEST_RELEASE_URL: &str =
+    "https://api.github.com/repos/nanogpt-community/nanocode-v2/releases/latest";
+const SELF_UPDATE_USER_AGENT: &str = "nanocode-self-update";
+const OLD_SESSION_COMPACTION_AGE_SECS: u64 = 60 * 60 * 24;
+const CHECKSUM_ASSET_CANDIDATES: &[&str] = &[
+    "SHA256SUMS",
+    "SHA256SUMS.txt",
+    "sha256sums",
+    "sha256sums.txt",
+    "checksums.txt",
+    "checksums.sha256",
+];
 
 type AllowedToolSet = BTreeSet<String>;
 
@@ -65,22 +88,44 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Provider { provider } => handle_provider_action(provider)?,
         CliAction::Proxy { mode } => handle_proxy_action(mode)?,
         CliAction::Mcp { action } => handle_mcp_action(action)?,
+        CliAction::Init => run_init()?,
         CliAction::Doctor => run_doctor()?,
+        CliAction::SelfUpdate => run_self_update()?,
         CliAction::ResumeSession {
             session_path,
-            command,
-        } => resume_session(&session_path, command),
+            commands,
+        } => resume_session(&session_path, &commands),
         CliAction::Prompt {
             prompt,
             model,
             allowed_tools,
             permission_mode,
-        } => LiveCli::new(model, false, allowed_tools, permission_mode)?.run_turn(&prompt)?,
+            max_cost_usd,
+            thinking,
+            output_format,
+        } => LiveCli::new(
+            model,
+            false,
+            allowed_tools,
+            permission_mode,
+            max_cost_usd,
+            thinking,
+            matches!(output_format, CliOutputFormat::Text),
+        )?
+        .run_turn_with_output(&prompt, output_format)?,
         CliAction::Repl {
             model,
             allowed_tools,
             permission_mode,
-        } => run_repl(model, allowed_tools, permission_mode)?,
+            max_cost_usd,
+            thinking,
+        } => run_repl(
+            model,
+            allowed_tools,
+            permission_mode,
+            max_cost_usd,
+            thinking,
+        )?,
         CliAction::Login { api_key } => login(api_key)?,
         CliAction::Help => print_help(),
         CliAction::Version => print_version(),
@@ -88,7 +133,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum CliAction {
     DumpManifests,
     BootstrapPlan,
@@ -108,16 +153,21 @@ enum CliAction {
     Mcp {
         action: McpCommand,
     },
+    Init,
     Doctor,
+    SelfUpdate,
     ResumeSession {
         session_path: PathBuf,
-        command: Option<String>,
+        commands: Vec<String>,
     },
     Prompt {
         prompt: String,
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        max_cost_usd: Option<f64>,
+        thinking: bool,
+        output_format: CliOutputFormat,
     },
     Login {
         api_key: Option<String>,
@@ -126,9 +176,29 @@ enum CliAction {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        max_cost_usd: Option<f64>,
+        thinking: bool,
     },
     Help,
     Version,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliOutputFormat {
+    Text,
+    Json,
+}
+
+impl CliOutputFormat {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            other => Err(format!(
+                "unsupported value for --output-format: {other} (expected text or json)"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,9 +234,29 @@ struct McpCatalog {
     tools: Vec<McpToolBinding>,
 }
 
+#[derive(Debug, Clone)]
+struct SessionHandle {
+    id: String,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedSessionSummary {
+    id: String,
+    path: PathBuf,
+    modified_epoch_secs: u64,
+    message_count: usize,
+    model: Option<String>,
+    started_at: Option<String>,
+    last_prompt: Option<String>,
+}
+
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
-    let mut model = default_model_or(DEFAULT_MODEL);
+    let mut model = resolve_model_alias(&default_model_or(DEFAULT_MODEL)).to_string();
     let mut permission_mode = default_permission_mode();
+    let mut max_cost_usd: Option<f64> = None;
+    let mut thinking = false;
+    let mut output_format = CliOutputFormat::Text;
     let mut allowed_tool_values = Vec::new();
     let mut rest = Vec::new();
     let mut index = 0;
@@ -177,11 +267,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --model".to_string())?;
-                model = value.clone();
+                model = resolve_model_alias(value).to_string();
                 index += 2;
             }
             flag if flag.starts_with("--model=") => {
-                model = flag[8..].to_string();
+                model = resolve_model_alias(&flag[8..]).to_string();
                 index += 1;
             }
             "--permission-mode" => {
@@ -193,6 +283,32 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             flag if flag.starts_with("--permission-mode=") => {
                 permission_mode = parse_permission_mode_arg(&flag[18..])?;
+                index += 1;
+            }
+            "--max-cost" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --max-cost".to_string())?;
+                max_cost_usd = Some(parse_max_cost_arg(value)?);
+                index += 2;
+            }
+            flag if flag.starts_with("--max-cost=") => {
+                max_cost_usd = Some(parse_max_cost_arg(&flag[11..])?);
+                index += 1;
+            }
+            "--thinking" => {
+                thinking = true;
+                index += 1;
+            }
+            "--output-format" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --output-format".to_string())?;
+                output_format = CliOutputFormat::parse(value)?;
+                index += 2;
+            }
+            flag if flag.starts_with("--output-format=") => {
+                output_format = CliOutputFormat::parse(&flag[16..])?;
                 index += 1;
             }
             "--allowedTools" | "--allowed-tools" => {
@@ -224,6 +340,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             model,
             allowed_tools,
             permission_mode,
+            max_cost_usd,
+            thinking,
         });
     }
     if matches!(rest.first().map(String::as_str), Some("--help" | "-h")) {
@@ -245,7 +363,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "provider" | "providers" => parse_provider_args(&rest[1..]),
         "proxy" => parse_proxy_args(&rest[1..]),
         "mcp" => parse_mcp_args(&rest[1..]),
+        "init" => Ok(CliAction::Init),
         "doctor" => Ok(CliAction::Doctor),
+        "self-update" => Ok(CliAction::SelfUpdate),
         "prompt" => {
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
@@ -256,9 +376,31 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 model,
                 allowed_tools,
                 permission_mode,
+                max_cost_usd,
+                thinking,
+                output_format,
             })
         }
+        other if !other.starts_with('/') => Ok(CliAction::Prompt {
+            prompt: rest.join(" "),
+            model,
+            allowed_tools,
+            permission_mode,
+            max_cost_usd,
+            thinking,
+            output_format,
+        }),
         other => Err(format!("unknown subcommand: {other}")),
+    }
+}
+
+fn resolve_model_alias(model: &str) -> &str {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "default" | "glm" | "glm5.1" | "glm-5.1" | "glm_5_1" | "zai-org/glm-5.1" => {
+            "zai-org/glm-5.1"
+        }
+        "glm5" | "glm-5" | "glm_5" | "zai-org/glm-5" => "zai-org/glm-5",
+        _ => model,
     }
 }
 
@@ -403,15 +545,18 @@ fn parse_mcp_args(args: &[String]) -> Result<CliAction, String> {
 fn parse_resume_args(args: &[String]) -> Result<CliAction, String> {
     let session_path = args
         .first()
-        .ok_or_else(|| "missing session path for --resume".to_string())
+        .ok_or_else(|| "missing session id or path for --resume".to_string())
         .map(PathBuf::from)?;
-    let command = args.get(1).cloned();
-    if args.len() > 2 {
-        return Err("--resume accepts at most one trailing slash command".to_string());
+    let commands = args[1..].to_vec();
+    if commands
+        .iter()
+        .any(|command| !command.trim_start().starts_with('/'))
+    {
+        return Err("--resume trailing arguments must be slash commands".to_string());
     }
     Ok(CliAction::ResumeSession {
         session_path,
-        command,
+        commands,
     })
 }
 
@@ -447,8 +592,15 @@ fn print_system_prompt(cwd: PathBuf, date: String) {
     }
 }
 
-fn resume_session(session_path: &Path, command: Option<String>) {
-    let session = match Session::load_from_path(session_path) {
+fn resume_session(session_path: &Path, commands: &[String]) {
+    let handle = match resolve_session_reference(&session_path.display().to_string()) {
+        Ok(handle) => handle,
+        Err(error) => {
+            eprintln!("failed to resolve session: {error}");
+            std::process::exit(1);
+        }
+    };
+    let session = match Session::load_from_path(&handle.path) {
         Ok(session) => session,
         Err(error) => {
             eprintln!("failed to restore session: {error}");
@@ -456,35 +608,39 @@ fn resume_session(session_path: &Path, command: Option<String>) {
         }
     };
 
-    match command {
-        Some(command) if command.starts_with('/') => {
-            let Some(result) = handle_slash_command(
-                &command,
-                &session,
-                CompactionConfig {
-                    max_estimated_tokens: 0,
-                    ..CompactionConfig::default()
-                },
-            ) else {
-                eprintln!("unknown slash command: {command}");
-                std::process::exit(2);
-            };
-            if let Err(error) = result.session.save_to_path(session_path) {
-                eprintln!("failed to persist resumed session: {error}");
-                std::process::exit(1);
-            }
-            println!("{}", result.message);
-        }
-        Some(other) => {
-            eprintln!("unsupported resumed command: {other}");
+    if commands.is_empty() {
+        println!(
+            "Restored session from {} ({} messages).",
+            handle.path.display(),
+            session.messages.len()
+        );
+        return;
+    }
+
+    let mut session = session;
+    for raw_command in commands {
+        let Some(command) = SlashCommand::parse(raw_command) else {
+            eprintln!("unsupported resumed command: {raw_command}");
             std::process::exit(2);
-        }
-        None => {
-            println!(
-                "Restored session from {} ({} messages).",
-                session_path.display(),
-                session.messages.len()
-            );
+        };
+        match run_resume_command(&handle.path, &session, &command) {
+            Ok(ResumeCommandOutcome {
+                session: next_session,
+                message,
+            }) => {
+                session = next_session.clone();
+                if let Err(error) = next_session.save_to_path(&handle.path) {
+                    eprintln!("failed to persist resumed session: {error}");
+                    std::process::exit(1);
+                }
+                if let Some(message) = message {
+                    println!("{message}");
+                }
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
         }
     }
 }
@@ -502,6 +658,7 @@ fn login(api_key: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
 fn handle_model_action(model: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     match model {
         Some(model) => {
+            let model = resolve_model_alias(&model).to_string();
             persist_current_model(model.clone())?;
             println!("Selected model: {model}");
         }
@@ -677,6 +834,25 @@ fn parse_proxy_command(input: &str) -> Option<Result<ProxyCommand, String>> {
     ))
 }
 
+fn parse_thinking_command(input: &str) -> Option<Result<Option<bool>, String>> {
+    let mut parts = input.split_whitespace();
+    let command = parts.next()?;
+    if command != "/thinking" {
+        return None;
+    }
+
+    let remainder = parts.collect::<Vec<_>>().join(" ");
+    let trimmed = remainder.trim();
+    Some(match trimmed {
+        "" => Ok(None),
+        "on" => Ok(Some(true)),
+        "off" => Ok(Some(false)),
+        other => Err(format!(
+            "/thinking accepts one optional argument: on or off (got {other})"
+        )),
+    })
+}
+
 fn parse_mcp_command(input: &str) -> Option<Result<McpCommand, String>> {
     let mut parts = input.split_whitespace();
     let command = parts.next()?;
@@ -737,6 +913,18 @@ fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
             )
         })
         .map(permission_mode_from_label)
+}
+
+fn parse_max_cost_arg(value: &str) -> Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| format!("invalid value for --max-cost: {value}"))?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(format!(
+            "--max-cost must be a positive finite USD amount: {value}"
+        ));
+    }
+    Ok(parsed)
 }
 
 fn default_permission_mode() -> PermissionMode {
@@ -1454,6 +1642,652 @@ fn config_source_label(source: ConfigSource) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusContext {
+    cwd: PathBuf,
+    session_path: Option<PathBuf>,
+    loaded_config_files: usize,
+    discovered_config_files: usize,
+    instruction_file_count: usize,
+    memory_file_count: usize,
+    project_root: Option<PathBuf>,
+    git_branch: Option<String>,
+    sandbox_summary: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatusUsage {
+    message_count: usize,
+    turns: u32,
+    latest: TokenUsage,
+    cumulative: TokenUsage,
+    estimated_tokens: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ResumeCommandOutcome {
+    session: Session,
+    message: Option<String>,
+}
+
+fn status_context(
+    session_path: Option<&Path>,
+) -> Result<StatusContext, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let discovered_config_files = loader.discover().len();
+    let runtime_config = loader.load()?;
+    let sandbox_status = resolve_sandbox_status(runtime_config.sandbox(), &cwd);
+    let project_context = runtime::ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let (project_root, git_branch) =
+        parse_git_status_metadata(project_context.git_status.as_deref());
+    Ok(StatusContext {
+        cwd,
+        session_path: session_path.map(Path::to_path_buf),
+        loaded_config_files: runtime_config.loaded_entries().len(),
+        discovered_config_files,
+        instruction_file_count: project_context.instruction_files.len(),
+        memory_file_count: project_context.memory_files.len(),
+        project_root,
+        git_branch,
+        sandbox_summary: format_sandbox_status(&sandbox_status),
+    })
+}
+
+fn parse_git_status_metadata(status: Option<&str>) -> (Option<PathBuf>, Option<String>) {
+    let Some(status) = status else {
+        return (None, None);
+    };
+    let mut branch = None;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("## ") {
+            branch = Some(rest.split("...").next().unwrap_or(rest).trim().to_string());
+            break;
+        }
+    }
+    let project_root = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|stdout| PathBuf::from(stdout.trim()));
+    (project_root, branch)
+}
+
+fn format_status_report(
+    model: &str,
+    usage: StatusUsage,
+    permission_mode: &str,
+    provider: &str,
+    proxy_tool_calls: bool,
+    thinking_enabled: bool,
+    max_cost_usd: Option<f64>,
+    mcp_catalog: &McpCatalog,
+    context: &StatusContext,
+) -> String {
+    [
+        format!(
+            "Status\n  Model            {model}\n  Provider         {provider}\n  Permission mode  {permission_mode}\n  Proxy tools      {}\n  Thinking         {}\n  Messages         {}\n  Turns            {}\n  Estimated tokens {}",
+            if proxy_tool_calls { "enabled" } else { "disabled" },
+            if thinking_enabled { "enabled" } else { "disabled" },
+            usage.message_count,
+            usage.turns,
+            usage.estimated_tokens,
+        ),
+        format!(
+            "Usage\n  Latest total     {}\n  Cumulative input {}\n  Cumulative output {}\n  Cumulative total {}\n  Estimated cost   {}\n  Budget           {}",
+            usage.latest.total_tokens(),
+            usage.cumulative.input_tokens,
+            usage.cumulative.output_tokens,
+            usage.cumulative.total_tokens(),
+            format_usd(usage_cost_total(model, usage.cumulative)),
+            format_budget_line(usage_cost_total(model, usage.cumulative), max_cost_usd),
+        ),
+        format!(
+            "Workspace\n  Cwd              {}\n  Project root     {}\n  Git branch       {}\n  Session          {}\n  Config files     loaded {}/{}\n  Instruction files {}\n  Memory files     {}\n  MCP              servers={} tools={}",
+            context.cwd.display(),
+            context
+                .project_root
+                .as_ref()
+                .map_or_else(|| "unknown".to_string(), |path| path.display().to_string()),
+            context.git_branch.as_deref().unwrap_or("unknown"),
+            context.session_path.as_ref().map_or_else(
+                || "live-repl".to_string(),
+                |path| path.display().to_string()
+            ),
+            context.loaded_config_files,
+            context.discovered_config_files,
+            context.instruction_file_count,
+            context.memory_file_count,
+            mcp_catalog.servers.len(),
+            mcp_catalog.tools.len(),
+        ),
+        format!("Sandbox\n  {}", context.sandbox_summary),
+    ]
+    .join("\n\n")
+}
+
+fn format_resume_report(session_path: &str, message_count: usize, turns: u32) -> String {
+    format!(
+        "Session resumed\n  Session file     {session_path}\n  Messages         {message_count}\n  Turns            {turns}"
+    )
+}
+
+fn format_sandbox_status(status: &runtime::SandboxStatus) -> String {
+    let mode = status.filesystem_mode.as_str();
+    let active = if status.active { "active" } else { "inactive" };
+    let network = if status.network_active {
+        "isolated"
+    } else if status.requested.network_isolation {
+        "requested-unavailable"
+    } else {
+        "shared"
+    };
+    let namespace = if status.namespace_active {
+        "restricted"
+    } else if status.requested.namespace_restrictions {
+        "requested-unavailable"
+    } else {
+        "shared"
+    };
+    let mounts = if status.allowed_mounts.is_empty() {
+        "<none>".to_string()
+    } else {
+        status.allowed_mounts.join(", ")
+    };
+    let mut line = format!(
+        "Enabled          {}\n  Status           {}\n  Namespace        {}\n  Network          {}\n  Filesystem       {}\n  Allowed mounts   {}\n  Container        {}",
+        if status.enabled { "yes" } else { "no" },
+        active,
+        namespace,
+        network,
+        mode,
+        mounts,
+        if status.in_container { "yes" } else { "no" },
+    );
+    if let Some(reason) = &status.fallback_reason {
+        let _ = write!(line, "\n  Fallback         {reason}");
+    }
+    line
+}
+
+fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let path = cwd.join(".nanocode").join("sessions");
+    fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+fn create_managed_session_handle() -> Result<SessionHandle, Box<dyn std::error::Error>> {
+    let id = generate_session_id();
+    let path = sessions_dir()?.join(format!("{id}.json"));
+    Ok(SessionHandle { id, path })
+}
+
+fn generate_session_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    format!("session-{millis}")
+}
+
+fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn std::error::Error>> {
+    let direct = PathBuf::from(reference);
+    let cwd_relative = env::current_dir()?.join(reference);
+    let path = if direct.exists() {
+        direct
+    } else if cwd_relative.exists() {
+        cwd_relative
+    } else {
+        sessions_dir()?.join(format!("{reference}.json"))
+    };
+    if !path.exists() {
+        return Err(format!("session not found: {reference}").into());
+    }
+    let id = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(reference)
+        .to_string();
+    Ok(SessionHandle { id, path })
+}
+
+fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
+    let mut sessions = Vec::new();
+    for entry in fs::read_dir(sessions_dir()?)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        let modified_epoch_secs = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        let session = Session::load_from_path(&path).ok();
+        let derived_message_count = session.as_ref().map_or(0, |session| session.messages.len());
+        let stored = session
+            .as_ref()
+            .and_then(|session| session.metadata.as_ref());
+        let id = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        sessions.push(ManagedSessionSummary {
+            id,
+            path,
+            modified_epoch_secs,
+            message_count: stored.map_or(derived_message_count, |metadata| {
+                metadata.message_count as usize
+            }),
+            model: stored.map(|metadata| metadata.model.clone()),
+            started_at: stored.map(|metadata| metadata.started_at.clone()),
+            last_prompt: stored.and_then(|metadata| metadata.last_prompt.clone()),
+        });
+    }
+    sessions.sort_by(|left, right| right.modified_epoch_secs.cmp(&left.modified_epoch_secs));
+    Ok(sessions)
+}
+
+fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let sessions = list_managed_sessions()?;
+    let mut lines = vec![
+        "Sessions".to_string(),
+        format!("  Directory         {}", sessions_dir()?.display()),
+    ];
+    if sessions.is_empty() {
+        lines.push("  No managed sessions saved yet.".to_string());
+        return Ok(lines.join("\n"));
+    }
+    for session in sessions {
+        let marker = if session.id == active_session_id {
+            "● current"
+        } else {
+            "○ saved"
+        };
+        let model = session.model.as_deref().unwrap_or("unknown");
+        let started = session.started_at.as_deref().unwrap_or("unknown");
+        let last_prompt = session.last_prompt.as_deref().map_or_else(
+            || "-".to_string(),
+            |prompt| truncate_for_summary(prompt, 36),
+        );
+        lines.push(format!(
+            "  {id:<20} {marker:<10} msgs={msgs:<4} model={model:<24} started={started} modified={modified} last={last_prompt} path={path}",
+            id = session.id,
+            msgs = session.message_count,
+            model = model,
+            started = started,
+            modified = session.modified_epoch_secs,
+            last_prompt = last_prompt,
+            path = session.path.display(),
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn truncate_for_summary(text: &str, max_chars: usize) -> String {
+    let trimmed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = trimmed.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+fn current_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn current_timestamp_rfc3339ish() -> String {
+    format!("{}Z", current_epoch_secs())
+}
+
+fn last_prompt_from_session(session: &Session) -> Option<String> {
+    session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::User)
+        .and_then(|message| {
+            message.blocks.iter().find_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.trim().to_string()),
+                _ => None,
+            })
+        })
+        .filter(|text| !text.is_empty())
+}
+
+fn derive_session_metadata(session: &Session, model: &str) -> SessionMetadata {
+    let started_at = session
+        .metadata
+        .as_ref()
+        .map_or_else(current_timestamp_rfc3339ish, |metadata| {
+            metadata.started_at.clone()
+        });
+    SessionMetadata {
+        started_at,
+        model: model.to_string(),
+        message_count: session.messages.len().try_into().unwrap_or(u32::MAX),
+        last_prompt: last_prompt_from_session(session),
+    }
+}
+
+fn session_age_secs(modified_epoch_secs: u64) -> u64 {
+    current_epoch_secs().saturating_sub(modified_epoch_secs)
+}
+
+fn auto_compact_inactive_sessions(
+    active_session_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for summary in list_managed_sessions()? {
+        if summary.id == active_session_id
+            || session_age_secs(summary.modified_epoch_secs) < OLD_SESSION_COMPACTION_AGE_SECS
+        {
+            continue;
+        }
+        let path = summary.path.clone();
+        let Ok(session) = Session::load_from_path(&path) else {
+            continue;
+        };
+        if !runtime::should_compact(&session, CompactionConfig::default()) {
+            continue;
+        }
+        let mut compacted =
+            runtime::compact_session(&session, CompactionConfig::default()).compacted_session;
+        let model = compacted.metadata.as_ref().map_or_else(
+            || DEFAULT_MODEL.to_string(),
+            |metadata| metadata.model.clone(),
+        );
+        compacted.metadata = Some(derive_session_metadata(&compacted, &model));
+        compacted.save_to_path(&path)?;
+    }
+    Ok(())
+}
+
+fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let discovered = loader.discover();
+    let runtime_config = loader.load()?;
+
+    let mut lines = vec![
+        format!(
+            "Config\n  Working directory {}\n  Loaded files      {}\n  Merged keys       {}",
+            cwd.display(),
+            runtime_config.loaded_entries().len(),
+            runtime_config.merged().len()
+        ),
+        "Discovered files".to_string(),
+    ];
+    for entry in discovered {
+        let source = config_source_label(entry.source);
+        let status = if runtime_config
+            .loaded_entries()
+            .iter()
+            .any(|loaded_entry| loaded_entry.path == entry.path)
+        {
+            "loaded"
+        } else {
+            "missing"
+        };
+        lines.push(format!(
+            "  {source:<7} {status:<7} {}",
+            entry.path.display()
+        ));
+    }
+
+    if let Some(section) = section {
+        lines.push(format!("Merged section: {section}"));
+        let value = match section {
+            "env" => runtime_config.get("env"),
+            "hooks" => runtime_config.get("hooks"),
+            "model" => runtime_config.get("model"),
+            other => {
+                lines.push(format!(
+                    "  Unsupported config section '{other}'. Use env, hooks, or model."
+                ));
+                return Ok(lines.join("\n"));
+            }
+        };
+        lines.push(format!(
+            "  {}",
+            match value {
+                Some(value) => value.render(),
+                None => "<unset>".to_string(),
+            }
+        ));
+        return Ok(lines.join("\n"));
+    }
+
+    lines.push("Merged JSON".to_string());
+    lines.push(format!("  {}", runtime_config.as_json().render()));
+    Ok(lines.join("\n"))
+}
+
+fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let project_context = runtime::ProjectContext::discover(&cwd, DEFAULT_DATE)?;
+    let mut lines = vec![format!(
+        "Memory\n  Working directory {}\n  Instruction files {}\n  Memory files      {}",
+        cwd.display(),
+        project_context.instruction_files.len(),
+        project_context.memory_files.len(),
+    )];
+
+    lines.push("Instruction files".to_string());
+    if project_context.instruction_files.is_empty() {
+        lines.push("  No instruction markdown files discovered.".to_string());
+    } else {
+        for (index, file) in project_context.instruction_files.iter().enumerate() {
+            let preview = file.content.lines().next().unwrap_or("").trim();
+            lines.push(format!("  {}. {}", index + 1, file.path.display()));
+            lines.push(format!(
+                "     lines={} preview={}",
+                file.content.lines().count(),
+                if preview.is_empty() {
+                    "<empty>"
+                } else {
+                    preview
+                }
+            ));
+        }
+    }
+
+    lines.push("Memory files".to_string());
+    if project_context.memory_files.is_empty() {
+        lines.push("  No `.nanocode/memory` files discovered.".to_string());
+    } else {
+        for (index, file) in project_context.memory_files.iter().enumerate() {
+            let preview = file.content.lines().next().unwrap_or("").trim();
+            lines.push(format!("  {}. {}", index + 1, file.path.display()));
+            lines.push(format!(
+                "     lines={} preview={}",
+                file.content.lines().count(),
+                if preview.is_empty() {
+                    "<empty>"
+                } else {
+                    preview
+                }
+            ));
+        }
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn render_diff_report() -> Result<String, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let staged = run_git_capture(&cwd, &["diff", "--cached"])?;
+    let unstaged = run_git_capture(&cwd, &["diff"])?;
+
+    let mut sections = Vec::new();
+    if !staged.trim().is_empty() {
+        sections.push(format!("Staged changes:\n{}", staged.trim_end()));
+    }
+    if !unstaged.trim().is_empty() {
+        sections.push(format!("Unstaged changes:\n{}", unstaged.trim_end()));
+    }
+
+    if sections.is_empty() {
+        return Ok(
+            "Diff\n  Result           clean working tree\n  Detail           no current changes"
+                .to_string(),
+        );
+    }
+
+    Ok(format!("Diff\n\n{}", sections.join("\n\n")))
+}
+
+fn run_git_capture(cwd: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
+    let output = Command::new("git").args(args).current_dir(cwd).output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("git {} failed: {stderr}", args.join(" ")).into());
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+fn render_version_report() -> String {
+    let target = BUILD_TARGET.unwrap_or("unknown");
+    format!(
+        "Version\n  Version          {VERSION}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+    )
+}
+
+fn render_export_text(session: &Session) -> String {
+    let mut lines = vec!["# Conversation Export".to_string(), String::new()];
+    for (index, message) in session.messages.iter().enumerate() {
+        let role = match message.role {
+            MessageRole::System => "system",
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::Tool => "tool",
+        };
+        lines.push(format!("## {}. {role}", index + 1));
+        for block in &message.blocks {
+            match block {
+                ContentBlock::Text { text } => lines.push(text.clone()),
+                ContentBlock::Thinking { text, signature } => {
+                    lines.push(format!(
+                        "[thinking hidden chars={} signature={}]",
+                        text.chars().count(),
+                        if signature.is_some() {
+                            "present"
+                        } else {
+                            "absent"
+                        }
+                    ));
+                }
+                ContentBlock::ToolUse { id, name, input } => {
+                    lines.push(format!("[tool_use id={id} name={name}] {input}"));
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    output,
+                    is_error,
+                } => {
+                    lines.push(format!(
+                        "[tool_result id={tool_use_id} name={tool_name} error={is_error}] {output}"
+                    ));
+                }
+            }
+        }
+        lines.push(String::new());
+    }
+    lines.join("\n")
+}
+
+fn assistant_text_from_messages(messages: &[ConversationMessage]) -> String {
+    messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn default_export_filename(session: &Session) -> String {
+    let stem = session
+        .messages
+        .iter()
+        .find_map(|message| match message.role {
+            MessageRole::User => message.blocks.iter().find_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .map_or("conversation", |text| {
+            text.lines().next().unwrap_or("conversation")
+        })
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .take(8)
+        .collect::<Vec<_>>()
+        .join("-");
+    let fallback = if stem.is_empty() {
+        "conversation"
+    } else {
+        &stem
+    };
+    format!("{fallback}.txt")
+}
+
+fn resolve_export_path(
+    requested_path: Option<&str>,
+    session: &Session,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let file_name =
+        requested_path.map_or_else(|| default_export_filename(session), ToOwned::to_owned);
+    let final_name = if Path::new(&file_name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+    {
+        file_name
+    } else {
+        format!("{file_name}.txt")
+    };
+    Ok(cwd.join(final_name))
+}
+
+fn render_repl_help() -> String {
+    let mut lines = vec![render_slash_command_help()];
+    lines.push("Additional NanoCode commands".to_string());
+    lines.push("  /login               Save a NanoGPT API key".to_string());
+    lines.push("  /auth                Alias for /login".to_string());
+    lines.push("  /provider [provider] Set provider override for current model".to_string());
+    lines.push("  /proxy [on|off|status] Toggle XML proxy tool calling".to_string());
+    lines.push("  /exit                Quit the REPL".to_string());
+    lines.push("  /quit                Quit the REPL".to_string());
+    lines.join("\n")
+}
+
 impl McpCatalog {
     fn tool_specs(&self) -> Vec<RuntimeToolSpec> {
         self.tools
@@ -1479,14 +2313,24 @@ fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    max_cost_usd: Option<f64>,
+    thinking_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+    let mut cli = LiveCli::new(
+        model,
+        true,
+        allowed_tools,
+        permission_mode,
+        max_cost_usd,
+        thinking_enabled,
+        true,
+    )?;
     let completions = slash_command_specs()
         .iter()
         .map(|spec| format!("/{}", spec.name))
         .chain(["/login", "/auth", "/provider", "/proxy", "/exit", "/quit"].map(str::to_string))
         .collect();
-    let mut editor = input::LineEditor::new("› ", completions);
+    let mut editor = input::LineEditor::new("> ", completions);
     println!("NanoCode interactive mode");
     println!("Type /help for commands. Shift+Enter or Ctrl+J inserts a newline.");
 
@@ -1531,6 +2375,10 @@ fn run_repl(
             handle_proxy_runtime_command(&mut cli, mode?)?;
             continue;
         }
+        if let Some(enabled) = parse_thinking_command(trimmed) {
+            cli.set_thinking(enabled?)?;
+            continue;
+        }
         if let Some(command) = parse_mcp_command(trimmed) {
             handle_mcp_runtime_command(&mut cli, command?)?;
             continue;
@@ -1541,22 +2389,39 @@ fn run_repl(
         }
         match trimmed {
             "/exit" | "/quit" => break,
-            "/help" => {
-                println!("Available commands:");
-                println!("  /help    Show help");
-                println!("  /login   Save a NanoGPT API key");
-                println!("  /auth    Alias for /login");
-                println!("  /model   Choose the active NanoGPT model");
-                println!("  /provider Choose a provider override for the current model only");
-                println!("  /proxy   Toggle XML tool-call proxy mode (or /proxy on|off|status)");
-                println!("  /mcp     Show MCP status, tools, or reload config (/mcp [status|tools|reload])");
-                println!("  /permissions Show or switch permission mode");
-                println!("  /status  Show session status");
-                println!("  /compact Compact session history");
-                println!("  /exit    Quit the REPL");
+            _ if trimmed.starts_with('/') => {
+                let Some(command) = SlashCommand::parse(trimmed) else {
+                    continue;
+                };
+                match command {
+                    SlashCommand::Help => println!("{}", render_repl_help()),
+                    SlashCommand::Status => cli.print_status(),
+                    SlashCommand::Compact => cli.compact()?,
+                    SlashCommand::Thinking { enabled } => cli.set_thinking(enabled)?,
+                    SlashCommand::Permissions { mode } => cli.set_permissions(
+                        mode.as_deref().map(parse_permission_mode_arg).transpose()?,
+                    )?,
+                    SlashCommand::Cost => cli.print_cost(),
+                    SlashCommand::Clear { confirm } => cli.clear_session(confirm)?,
+                    SlashCommand::Resume { session_path } => cli.resume_session(session_path)?,
+                    SlashCommand::Config { section } => {
+                        println!("{}", render_config_report(section.as_deref())?)
+                    }
+                    SlashCommand::Memory => println!("{}", render_memory_report()?),
+                    SlashCommand::Init => run_init()?,
+                    SlashCommand::Diff => println!("{}", render_diff_report()?),
+                    SlashCommand::Version => print_version(),
+                    SlashCommand::Export { path } => cli.export_session(path.as_deref())?,
+                    SlashCommand::Session { action, target } => {
+                        cli.handle_session_command(action.as_deref(), target.as_deref())?
+                    }
+                    SlashCommand::Sessions => println!("{}", render_session_list(&cli.session.id)?),
+                    SlashCommand::Unknown(name) => eprintln!("unknown slash command: /{name}"),
+                    SlashCommand::Model { .. } | SlashCommand::Mcp { .. } => {
+                        unreachable!("handled before shared slash command dispatch")
+                    }
+                }
             }
-            "/status" => cli.print_status(),
-            "/compact" => cli.compact()?,
             _ => cli.run_turn(trimmed)?,
         }
     }
@@ -1568,10 +2433,14 @@ struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    max_cost_usd: Option<f64>,
+    thinking_enabled: bool,
     system_prompt: Vec<String>,
     proxy_tool_calls: bool,
     mcp_catalog: McpCatalog,
     runtime: ConversationRuntime<NanoCodeRuntimeClient, CliToolExecutor>,
+    session: SessionHandle,
+    render_model_output: bool,
 }
 
 impl LiveCli {
@@ -1580,10 +2449,15 @@ impl LiveCli {
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        max_cost_usd: Option<f64>,
+        thinking_enabled: bool,
+        render_model_output: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let proxy_tool_calls = proxy_tool_calls_enabled();
         let mcp_catalog = load_mcp_catalog(&env::current_dir()?)?;
+        let session = create_managed_session_handle()?;
+        auto_compact_inactive_sessions(&session.id)?;
         let runtime = build_runtime(
             Session::new(),
             model.clone(),
@@ -1593,19 +2467,39 @@ impl LiveCli {
             mcp_catalog.clone(),
             allowed_tools.clone(),
             permission_mode,
+            thinking_enabled,
+            render_model_output,
         )?;
-        Ok(Self {
+        let cli = Self {
             model,
             allowed_tools,
             permission_mode,
+            max_cost_usd,
+            thinking_enabled,
             system_prompt,
             proxy_tool_calls,
             mcp_catalog,
             runtime,
-        })
+            session,
+            render_model_output,
+        };
+        cli.persist_session()?;
+        Ok(cli)
+    }
+
+    fn run_turn_with_output(
+        &mut self,
+        input: &str,
+        output_format: CliOutputFormat,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match output_format {
+            CliOutputFormat::Text => self.run_turn(input),
+            CliOutputFormat::Json => self.run_prompt_json(input),
+        }
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.enforce_budget_before_turn()?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
@@ -1616,12 +2510,14 @@ impl LiveCli {
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
         match result {
-            Ok(_) => {
+            Ok(summary) => {
                 spinner.finish(
                     "NanoCode response complete",
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
+                self.persist_session()?;
+                self.print_budget_notice(summary.usage);
                 println!();
                 Ok(())
             }
@@ -1636,29 +2532,54 @@ impl LiveCli {
         }
     }
 
+    fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.enforce_budget_before_turn()?;
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let summary = self
+            .runtime
+            .run_turn(input, Some(&mut permission_prompter))?;
+        self.persist_session()?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "message": assistant_text_from_messages(&summary.assistant_messages),
+                "model": self.model,
+                "usage": {
+                    "input_tokens": summary.usage.input_tokens,
+                    "output_tokens": summary.usage.output_tokens,
+                    "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
+                    "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
+                }
+            })
+        );
+        Ok(())
+    }
+
     fn print_status(&self) {
-        let usage = self.runtime.usage().cumulative_usage();
         let provider =
             provider_for_model(&self.model).unwrap_or_else(|| "<platform default>".to_string());
+        let cumulative = self.runtime.usage().cumulative_usage();
+        let latest = self.runtime.usage().current_turn_usage();
+        let context = status_context(Some(&self.session.path)).expect("status context should load");
         println!(
-            "status: model={} permission_mode={} provider_for_current_model={} proxy_tool_calls={} messages={} turns={} input_tokens={} output_tokens={}",
-            self.model,
-            self.permission_mode.as_str(),
-            provider,
-            if self.proxy_tool_calls {
-                "enabled"
-            } else {
-                "disabled"
-            },
-            self.runtime.session().messages.len(),
-            self.runtime.usage().turns(),
-            usage.input_tokens,
-            usage.output_tokens
-        );
-        println!(
-            "status: mcp_servers={} mcp_tools={}",
-            self.mcp_catalog.servers.len(),
-            self.mcp_catalog.tools.len()
+            "{}",
+            format_status_report(
+                &self.model,
+                StatusUsage {
+                    message_count: self.runtime.session().messages.len(),
+                    turns: self.runtime.usage().turns(),
+                    latest,
+                    cumulative,
+                    estimated_tokens: self.runtime.estimated_tokens(),
+                },
+                self.permission_mode.as_str(),
+                &provider,
+                self.proxy_tool_calls,
+                self.thinking_enabled,
+                self.max_cost_usd,
+                &self.mcp_catalog,
+                &context,
+            )
         );
         if self.model == DEFAULT_MODEL {
             println!("status: active model is the default fallback model.");
@@ -1679,12 +2600,16 @@ impl LiveCli {
             self.mcp_catalog.clone(),
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.thinking_enabled,
+            self.render_model_output,
         )?;
+        self.persist_session()?;
         println!("Compacted {removed} messages.");
         Ok(())
     }
 
     fn set_model(&mut self, model: String) -> Result<(), Box<dyn std::error::Error>> {
+        let model = resolve_model_alias(&model).to_string();
         let session = self.runtime.session().clone();
         persist_current_model(model.clone())?;
         self.runtime = build_runtime(
@@ -1696,8 +2621,11 @@ impl LiveCli {
             self.mcp_catalog.clone(),
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.thinking_enabled,
+            self.render_model_output,
         )?;
         self.model = model.clone();
+        self.persist_session()?;
         let provider =
             provider_for_model(&self.model).unwrap_or_else(|| "<platform default>".to_string());
         println!("Switched to model: {model}");
@@ -1723,7 +2651,10 @@ impl LiveCli {
             self.mcp_catalog.clone(),
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.thinking_enabled,
+            self.render_model_output,
         )?;
+        self.persist_session()?;
         if provider_label == "<platform default>" {
             println!(
                 "Provider override for current model {}: {}",
@@ -1750,8 +2681,11 @@ impl LiveCli {
             self.mcp_catalog.clone(),
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.thinking_enabled,
+            self.render_model_output,
         )?;
         self.proxy_tool_calls = enabled;
+        self.persist_session()?;
         println!(
             "Proxy tool-call translation: {}",
             if enabled { "enabled" } else { "disabled" }
@@ -1776,8 +2710,11 @@ impl LiveCli {
             catalog.clone(),
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.thinking_enabled,
+            self.render_model_output,
         )?;
         self.mcp_catalog = catalog;
+        self.persist_session()?;
         println!("Reloaded MCP config.");
         self.print_mcp_status();
         Ok(())
@@ -1815,8 +2752,219 @@ impl LiveCli {
             self.mcp_catalog.clone(),
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.thinking_enabled,
+            self.render_model_output,
         )?;
+        self.persist_session()?;
         println!("Permission mode: {}", self.permission_mode.as_str());
+        Ok(())
+    }
+
+    fn set_thinking(&mut self, enabled: Option<bool>) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(enabled) = enabled else {
+            println!("{}", format_thinking_report(self.thinking_enabled));
+            return Ok(());
+        };
+        if enabled == self.thinking_enabled {
+            println!("{}", format_thinking_report(self.thinking_enabled));
+            return Ok(());
+        }
+
+        let session = self.runtime.session().clone();
+        self.thinking_enabled = enabled;
+        self.runtime = build_runtime(
+            session,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            self.proxy_tool_calls,
+            self.mcp_catalog.clone(),
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            self.thinking_enabled,
+            self.render_model_output,
+        )?;
+        self.persist_session()?;
+        println!("{}", format_thinking_switch_report(self.thinking_enabled));
+        Ok(())
+    }
+
+    fn print_cost(&self) {
+        println!(
+            "{}",
+            format_cost_report(
+                &self.model,
+                self.runtime.usage().cumulative_usage(),
+                self.max_cost_usd
+            )
+        );
+    }
+
+    fn enforce_budget_before_turn(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(limit) = self.max_cost_usd else {
+            return Ok(());
+        };
+        let cumulative = usage_cost_total(&self.model, self.runtime.usage().cumulative_usage());
+        if cumulative >= limit {
+            return Err(format!(
+                "cost budget exceeded before starting turn: cumulative={} budget={}",
+                format_usd(cumulative),
+                format_usd(limit)
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn print_budget_notice(&self, usage: TokenUsage) {
+        if let Some(message) = budget_notice_message(&self.model, usage, self.max_cost_usd) {
+            eprintln!("warning: {message}");
+        }
+    }
+
+    fn clear_session(&mut self, confirm: bool) -> Result<(), Box<dyn std::error::Error>> {
+        if !confirm {
+            println!(
+                "clear: confirmation required; run /clear --confirm to start a fresh session."
+            );
+            return Ok(());
+        }
+
+        self.session = create_managed_session_handle()?;
+        self.runtime = build_runtime(
+            Session::new(),
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            self.proxy_tool_calls,
+            self.mcp_catalog.clone(),
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            self.thinking_enabled,
+            self.render_model_output,
+        )?;
+        self.persist_session()?;
+        println!(
+            "Session cleared\n  Mode             fresh session\n  Preserved model  {}\n  Permission mode  {}\n  Session          {}",
+            self.model,
+            self.permission_mode.as_str(),
+            self.session.id,
+        );
+        Ok(())
+    }
+
+    fn resume_session(
+        &mut self,
+        session_path: Option<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(session_ref) = session_path else {
+            println!("Usage: /resume <session-id-or-path>");
+            return Ok(());
+        };
+        let handle = resolve_session_reference(&session_ref)?;
+        let session = Session::load_from_path(&handle.path)?;
+        let message_count = session.messages.len();
+        if let Some(model) = session
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.model.clone())
+        {
+            self.model = model;
+        }
+        self.runtime = build_runtime(
+            session,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            self.proxy_tool_calls,
+            self.mcp_catalog.clone(),
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            self.thinking_enabled,
+            self.render_model_output,
+        )?;
+        self.session = handle;
+        self.persist_session()?;
+        println!(
+            "{}",
+            format_resume_report(
+                &self.session.path.display().to_string(),
+                message_count,
+                self.runtime.usage().turns(),
+            )
+        );
+        Ok(())
+    }
+
+    fn export_session(
+        &self,
+        requested_path: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let export_path = resolve_export_path(requested_path, self.runtime.session())?;
+        fs::write(&export_path, render_export_text(self.runtime.session()))?;
+        println!(
+            "Export\n  Result           wrote transcript\n  File             {}\n  Messages         {}",
+            export_path.display(),
+            self.runtime.session().messages.len(),
+        );
+        Ok(())
+    }
+
+    fn handle_session_command(
+        &mut self,
+        action: Option<&str>,
+        target: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match action {
+            None | Some("list") => println!("{}", render_session_list(&self.session.id)?),
+            Some("switch") => {
+                let Some(target) = target else {
+                    println!("Usage: /session switch <session-id>");
+                    return Ok(());
+                };
+                let handle = resolve_session_reference(target)?;
+                let session = Session::load_from_path(&handle.path)?;
+                let message_count = session.messages.len();
+                if let Some(model) = session
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.model.clone())
+                {
+                    self.model = model;
+                }
+                self.runtime = build_runtime(
+                    session,
+                    self.model.clone(),
+                    self.system_prompt.clone(),
+                    true,
+                    self.proxy_tool_calls,
+                    self.mcp_catalog.clone(),
+                    self.allowed_tools.clone(),
+                    self.permission_mode,
+                    self.thinking_enabled,
+                    self.render_model_output,
+                )?;
+                self.session = handle;
+                self.persist_session()?;
+                println!(
+                    "Session switched\n  Active session   {}\n  File             {}\n  Messages         {}",
+                    self.session.id,
+                    self.session.path.display(),
+                    message_count,
+                );
+            }
+            Some(other) => println!(
+                "Unknown /session action '{other}'. Use /session list or /session switch <session-id>."
+            ),
+        }
+        Ok(())
+    }
+
+    fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = self.runtime.session().clone();
+        session.metadata = Some(derive_session_metadata(&session, &self.model));
+        session.save_to_path(&self.session.path)?;
+        auto_compact_inactive_sessions(&self.session.id)?;
         Ok(())
     }
 }
@@ -1921,6 +3069,8 @@ fn build_runtime(
     mcp_catalog: McpCatalog,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    thinking_enabled: bool,
+    render_model_output: bool,
 ) -> Result<ConversationRuntime<NanoCodeRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     let tool_specs = if enable_tools {
@@ -1945,6 +3095,8 @@ fn build_runtime(
             enable_tools,
             proxy_tool_calls,
             tool_specs.clone(),
+            thinking_enabled,
+            render_model_output,
         )?,
         CliToolExecutor::new(mcp_catalog, tool_specs, allowed_tools),
         permission_policy,
@@ -1960,6 +3112,8 @@ struct NanoCodeRuntimeClient {
     enable_tools: bool,
     proxy_tool_calls: bool,
     tool_specs: Vec<RuntimeToolSpec>,
+    thinking_enabled: bool,
+    render_output: bool,
 }
 
 impl NanoCodeRuntimeClient {
@@ -1969,6 +3123,8 @@ impl NanoCodeRuntimeClient {
         enable_tools: bool,
         proxy_tool_calls: bool,
         tool_specs: Vec<RuntimeToolSpec>,
+        thinking_enabled: bool,
+        render_output: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
@@ -1978,6 +3134,8 @@ impl NanoCodeRuntimeClient {
             enable_tools,
             proxy_tool_calls,
             tool_specs,
+            thinking_enabled,
+            render_output,
         })
     }
 }
@@ -2007,6 +3165,9 @@ impl ApiClient for NanoCodeRuntimeClient {
                     .collect()
             }),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
+            thinking: self
+                .thinking_enabled
+                .then_some(ThinkingConfig::enabled(DEFAULT_THINKING_BUDGET_TOKENS)),
             stream: true,
         };
 
@@ -2016,7 +3177,11 @@ impl ApiClient for NanoCodeRuntimeClient {
                 .stream_message(&message_request)
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
-            let mut stdout = io::stdout();
+            let mut output: Box<dyn Write> = if self.render_output {
+                Box::new(io::stdout())
+            } else {
+                Box::new(io::sink())
+            };
             let mut events = Vec::new();
             let mut pending_tool: Option<(String, String, String)> = None;
             let mut saw_stop = false;
@@ -2047,13 +3212,18 @@ impl ApiClient for NanoCodeRuntimeClient {
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
                         for block in start.message.content {
-                            push_output_block(block, &mut stdout, &mut events, &mut pending_tool)?;
+                            push_output_block(
+                                block,
+                                output.as_mut(),
+                                &mut events,
+                                &mut pending_tool,
+                            )?;
                         }
                     }
                     ApiStreamEvent::ContentBlockStart(start) => {
                         push_output_block(
                             start.content_block,
-                            &mut stdout,
+                            output.as_mut(),
                             &mut events,
                             &mut pending_tool,
                         )?;
@@ -2061,10 +3231,20 @@ impl ApiClient for NanoCodeRuntimeClient {
                     ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                         ContentBlockDelta::TextDelta { text } => {
                             if !text.is_empty() {
-                                write!(stdout, "{text}")
-                                    .and_then(|_| stdout.flush())
+                                write!(output, "{text}")
+                                    .and_then(|_| output.flush())
                                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                                 events.push(AssistantEvent::TextDelta(text));
+                            }
+                        }
+                        ContentBlockDelta::ThinkingDelta { thinking } => {
+                            if !thinking.is_empty() {
+                                events.push(AssistantEvent::ThinkingDelta(thinking));
+                            }
+                        }
+                        ContentBlockDelta::SignatureDelta { signature } => {
+                            if !signature.is_empty() {
+                                events.push(AssistantEvent::ThinkingSignature(signature));
                             }
                         }
                         ContentBlockDelta::InputJsonDelta { partial_json } => {
@@ -2097,6 +3277,8 @@ impl ApiClient for NanoCodeRuntimeClient {
                 && !saw_stop
                 && events.iter().any(|event| {
                     matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
+                        || matches!(event, AssistantEvent::ThinkingDelta(text) if !text.is_empty())
+                        || matches!(event, AssistantEvent::ThinkingSignature(_))
                         || matches!(event, AssistantEvent::ToolUse { .. })
                 })
             {
@@ -2118,7 +3300,7 @@ impl ApiClient for NanoCodeRuntimeClient {
                 })
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
-            response_to_events(response, &mut stdout)
+            response_to_events(response, output.as_mut())
         })
     }
 }
@@ -2146,6 +3328,9 @@ impl NanoCodeRuntimeClient {
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: None,
             tool_choice: None,
+            thinking: self
+                .thinking_enabled
+                .then_some(ThinkingConfig::enabled(DEFAULT_THINKING_BUDGET_TOKENS)),
             stream: false,
         };
 
@@ -2170,14 +3355,22 @@ impl NanoCodeRuntimeClient {
                     .send_message(&retry_request)
                     .await
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
-                let mut stdout = io::stdout();
-                return proxy_response_to_events(retry_response, &mut stdout, &self.tool_specs);
+                let mut output: Box<dyn Write> = if self.render_output {
+                    Box::new(io::stdout())
+                } else {
+                    Box::new(io::sink())
+                };
+                return proxy_response_to_events(retry_response, output.as_mut(), &self.tool_specs);
             }
 
-            let mut stdout = io::stdout();
-            stdout
+            let mut output: Box<dyn Write> = if self.render_output {
+                Box::new(io::stdout())
+            } else {
+                Box::new(io::sink())
+            };
+            output
                 .write_all(&first_render)
-                .and_then(|_| stdout.flush())
+                .and_then(|_| output.flush())
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             Ok(first_events)
         })
@@ -2220,7 +3413,12 @@ impl NanoCodeRuntimeClient {
                 .send_chat_completion(&completion_request)
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
-            chat_completion_response_to_events(response, &mut io::stdout())
+            let mut output: Box<dyn Write> = if self.render_output {
+                Box::new(io::stdout())
+            } else {
+                Box::new(io::sink())
+            };
+            chat_completion_response_to_events(response, output.as_mut())
         })
     }
 
@@ -2271,18 +3469,26 @@ impl NanoCodeRuntimeClient {
                     .send_chat_completion(&retry_request)
                     .await
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
-                let mut stdout = io::stdout();
+                let mut output: Box<dyn Write> = if self.render_output {
+                    Box::new(io::stdout())
+                } else {
+                    Box::new(io::sink())
+                };
                 return proxy_chat_completion_response_to_events(
                     retry_response,
-                    &mut stdout,
+                    output.as_mut(),
                     &self.tool_specs,
                 );
             }
 
-            let mut stdout = io::stdout();
-            stdout
+            let mut output: Box<dyn Write> = if self.render_output {
+                Box::new(io::stdout())
+            } else {
+                Box::new(io::sink())
+            };
+            output
                 .write_all(&first_render)
-                .and_then(|_| stdout.flush())
+                .and_then(|_| output.flush())
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             Ok(first_events)
         })
@@ -2341,7 +3547,7 @@ fn should_retry_proxy_tool_prompt(events: &[AssistantEvent]) -> bool {
 
 fn push_output_block(
     block: OutputContentBlock,
-    out: &mut impl Write,
+    out: &mut (impl Write + ?Sized),
     events: &mut Vec<AssistantEvent>,
     pending_tool: &mut Option<(String, String, String)>,
 ) -> Result<(), RuntimeError> {
@@ -2354,6 +3560,18 @@ fn push_output_block(
                 events.push(AssistantEvent::TextDelta(text));
             }
         }
+        OutputContentBlock::Thinking {
+            thinking,
+            signature,
+        } => {
+            render_thinking_block_summary(&thinking, out)?;
+            if !thinking.is_empty() {
+                events.push(AssistantEvent::ThinkingDelta(thinking));
+            }
+            if let Some(signature) = signature.filter(|signature| !signature.is_empty()) {
+                events.push(AssistantEvent::ThinkingSignature(signature));
+            }
+        }
         OutputContentBlock::ToolUse { id, name, input } => {
             *pending_tool = Some((id, name, input.to_string()));
         }
@@ -2361,9 +3579,18 @@ fn push_output_block(
     Ok(())
 }
 
+fn render_thinking_block_summary(
+    text: &str,
+    out: &mut (impl Write + ?Sized),
+) -> Result<(), RuntimeError> {
+    writeln!(out, "\n▶ Thinking ({} chars hidden)", text.chars().count())
+        .and_then(|_| out.flush())
+        .map_err(|error| RuntimeError::new(error.to_string()))
+}
+
 fn response_to_events(
     response: MessageResponse,
-    out: &mut impl Write,
+    out: &mut (impl Write + ?Sized),
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let mut pending_tool = None;
@@ -2387,7 +3614,7 @@ fn response_to_events(
 
 fn proxy_response_to_events(
     response: MessageResponse,
-    out: &mut impl Write,
+    out: &mut (impl Write + ?Sized),
     tool_specs: &[RuntimeToolSpec],
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
@@ -2395,6 +3622,18 @@ fn proxy_response_to_events(
         match block {
             OutputContentBlock::Text { text } => {
                 append_proxy_text_events(&text, out, &mut events, tool_specs)?;
+            }
+            OutputContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                render_thinking_block_summary(&thinking, out)?;
+                if !thinking.is_empty() {
+                    events.push(AssistantEvent::ThinkingDelta(thinking));
+                }
+                if let Some(signature) = signature.filter(|signature| !signature.is_empty()) {
+                    events.push(AssistantEvent::ThinkingSignature(signature));
+                }
             }
             OutputContentBlock::ToolUse { id, name, input } => {
                 events.push(AssistantEvent::ToolUse {
@@ -2418,7 +3657,7 @@ fn proxy_response_to_events(
 
 fn chat_completion_response_to_events(
     response: ChatCompletionResponse,
-    out: &mut impl Write,
+    out: &mut (impl Write + ?Sized),
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
     let Some(choice) = response.choices.into_iter().next() else {
@@ -2464,7 +3703,7 @@ fn chat_completion_response_to_events(
 
 fn proxy_chat_completion_response_to_events(
     response: ChatCompletionResponse,
-    out: &mut impl Write,
+    out: &mut (impl Write + ?Sized),
     tool_specs: &[RuntimeToolSpec],
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
     let mut events = Vec::new();
@@ -2507,7 +3746,7 @@ fn proxy_chat_completion_response_to_events(
 
 fn append_proxy_text_events(
     text: &str,
-    out: &mut impl Write,
+    out: &mut (impl Write + ?Sized),
     events: &mut Vec<AssistantEvent>,
     tool_specs: &[RuntimeToolSpec],
 ) -> Result<(), RuntimeError> {
@@ -2938,6 +4177,7 @@ fn convert_messages(messages: &[ConversationMessage]) -> Result<Vec<InputMessage
                                 acc.push(InputContentBlock::Text { text: text.clone() });
                             }
                         }
+                        ContentBlock::Thinking { .. } => {}
                         ContentBlock::ToolUse { id, name, input } => {
                             acc.push(InputContentBlock::ToolUse {
                                 id: id.clone(),
@@ -3272,17 +4512,242 @@ fn collect_text_blocks(blocks: &[ContentBlock]) -> String {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => Some(text.as_str()),
+            ContentBlock::Thinking { .. } => None,
             _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n\n")
 }
 
+fn format_thinking_report(enabled: bool) -> String {
+    let state = if enabled { "on" } else { "off" };
+    let budget = if enabled {
+        DEFAULT_THINKING_BUDGET_TOKENS.to_string()
+    } else {
+        "disabled".to_string()
+    };
+    format!(
+        "Thinking\n  Active mode      {state}\n  Budget tokens    {budget}\n\nUsage\n  Inspect current mode with /thinking\n  Toggle with /thinking on or /thinking off"
+    )
+}
+
+fn format_thinking_switch_report(enabled: bool) -> String {
+    let state = if enabled { "enabled" } else { "disabled" };
+    format!(
+        "Thinking updated\n  Result           {state}\n  Budget tokens    {}\n  Applies to       subsequent requests",
+        if enabled {
+            DEFAULT_THINKING_BUDGET_TOKENS.to_string()
+        } else {
+            "disabled".to_string()
+        }
+    )
+}
+
+fn format_cost_report(model: &str, usage: TokenUsage, max_cost_usd: Option<f64>) -> String {
+    let estimate = usage_cost_estimate(model, usage);
+    format!(
+        "Cost\n  Model            {model}\n  Input tokens     {}\n  Output tokens    {}\n  Cache create     {}\n  Cache read       {}\n  Total tokens     {}\n  Input cost       {}\n  Output cost      {}\n  Cache create usd {}\n  Cache read usd   {}\n  Estimated cost   {}\n  Budget           {}",
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_creation_input_tokens,
+        usage.cache_read_input_tokens,
+        usage.total_tokens(),
+        format_usd(estimate.input_cost_usd),
+        format_usd(estimate.output_cost_usd),
+        format_usd(estimate.cache_creation_cost_usd),
+        format_usd(estimate.cache_read_cost_usd),
+        format_usd(estimate.total_cost_usd()),
+        format_budget_line(estimate.total_cost_usd(), max_cost_usd),
+    )
+}
+
+fn usage_cost_estimate(model: &str, usage: TokenUsage) -> runtime::UsageCostEstimate {
+    pricing_for_model(model).map_or_else(
+        || usage.estimate_cost_usd(),
+        |pricing| usage.estimate_cost_usd_with_pricing(pricing),
+    )
+}
+
+fn usage_cost_total(model: &str, usage: TokenUsage) -> f64 {
+    usage_cost_estimate(model, usage).total_cost_usd()
+}
+
+fn format_budget_line(cost_usd: f64, max_cost_usd: Option<f64>) -> String {
+    match max_cost_usd {
+        Some(limit) => format!("{} / {}", format_usd(cost_usd), format_usd(limit)),
+        None => format!("{} (unlimited)", format_usd(cost_usd)),
+    }
+}
+
+fn budget_notice_message(
+    model: &str,
+    usage: TokenUsage,
+    max_cost_usd: Option<f64>,
+) -> Option<String> {
+    let limit = max_cost_usd?;
+    let cost = usage_cost_total(model, usage);
+    if cost >= limit {
+        Some(format!(
+            "cost budget exceeded: cumulative={} budget={}",
+            format_usd(cost),
+            format_usd(limit)
+        ))
+    } else if cost >= limit * COST_WARNING_FRACTION {
+        Some(format!(
+            "approaching cost budget: cumulative={} budget={}",
+            format_usd(cost),
+            format_usd(limit)
+        ))
+    } else {
+        None
+    }
+}
+
+fn run_resume_command(
+    session_path: &Path,
+    session: &Session,
+    command: &SlashCommand,
+) -> Result<ResumeCommandOutcome, Box<dyn std::error::Error>> {
+    match command {
+        SlashCommand::Help => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_repl_help()),
+        }),
+        SlashCommand::Compact => {
+            let result = runtime::compact_session(
+                session,
+                CompactionConfig {
+                    max_estimated_tokens: 0,
+                    ..CompactionConfig::default()
+                },
+            );
+            let removed = result.removed_message_count;
+            let kept = result.compacted_session.messages.len();
+            let skipped = removed == 0;
+            Ok(ResumeCommandOutcome {
+                session: result.compacted_session,
+                message: Some(if skipped {
+                    format!(
+                        "Compact\n  Result           skipped\n  Reason           session below compaction threshold\n  Messages kept    {kept}"
+                    )
+                } else {
+                    format!(
+                        "Compact\n  Result           compacted\n  Messages removed {removed}\n  Messages kept    {kept}"
+                    )
+                }),
+            })
+        }
+        SlashCommand::Clear { confirm } => {
+            if !confirm {
+                return Ok(ResumeCommandOutcome {
+                    session: session.clone(),
+                    message: Some(
+                        "clear: confirmation required; rerun with /clear --confirm".to_string(),
+                    ),
+                });
+            }
+            let cleared = Session::new();
+            Ok(ResumeCommandOutcome {
+                session: cleared,
+                message: Some(format!(
+                    "Cleared resumed session file {}.",
+                    session_path.display()
+                )),
+            })
+        }
+        SlashCommand::Status => {
+            let tracker = UsageTracker::from_session(session);
+            let usage = tracker.cumulative_usage();
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format_status_report(
+                    session
+                        .metadata
+                        .as_ref()
+                        .map(|metadata| metadata.model.as_str())
+                        .unwrap_or("restored-session"),
+                    StatusUsage {
+                        message_count: session.messages.len(),
+                        turns: tracker.turns(),
+                        latest: tracker.current_turn_usage(),
+                        cumulative: usage,
+                        estimated_tokens: 0,
+                    },
+                    default_permission_mode().as_str(),
+                    "<platform default>",
+                    false,
+                    false,
+                    None,
+                    &McpCatalog::default(),
+                    &status_context(Some(session_path))?,
+                )),
+            })
+        }
+        SlashCommand::Cost => {
+            let model = session
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.model.as_str())
+                .unwrap_or(DEFAULT_MODEL);
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format_cost_report(
+                    model,
+                    UsageTracker::from_session(session).cumulative_usage(),
+                    None,
+                )),
+            })
+        }
+        SlashCommand::Config { section } => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_config_report(section.as_deref())?),
+        }),
+        SlashCommand::Memory => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_memory_report()?),
+        }),
+        SlashCommand::Init => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(initialize_repo(&env::current_dir()?)?.render()),
+        }),
+        SlashCommand::Diff => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_diff_report()?),
+        }),
+        SlashCommand::Version => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_version_report()),
+        }),
+        SlashCommand::Export { path } => {
+            let export_path = resolve_export_path(path.as_deref(), session)?;
+            fs::write(&export_path, render_export_text(session))?;
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(format!(
+                    "Export\n  Result           wrote transcript\n  File             {}\n  Messages         {}",
+                    export_path.display(),
+                    session.messages.len(),
+                )),
+            })
+        }
+        SlashCommand::Resume { .. }
+        | SlashCommand::Model { .. }
+        | SlashCommand::Mcp { .. }
+        | SlashCommand::Permissions { .. }
+        | SlashCommand::Thinking { .. }
+        | SlashCommand::Session { .. }
+        | SlashCommand::Sessions
+        | SlashCommand::Unknown(_) => Err("unsupported resumed slash command".into()),
+    }
+}
+
 fn print_help() {
     println!("nanocode");
     println!();
     println!("Usage:");
-    println!("  nanocode [--model MODEL] [--permission-mode MODE] [--allowedTools TOOL[,TOOL...]]");
+    println!(
+        "  nanocode [--model MODEL] [--permission-mode MODE] [--max-cost USD] [--thinking] [--allowedTools TOOL[,TOOL...]]"
+    );
     println!("                                               Start interactive REPL");
     println!("  nanocode login [--api-key KEY]              Save a NanoGPT API key");
     println!("  nanocode model [MODEL_ID]                   Choose or persist a default model");
@@ -3293,23 +4758,418 @@ fn print_help() {
     println!(
         "  nanocode mcp [status|tools|reload]          Inspect configured MCP servers and tools"
     );
+    println!("  nanocode init                               Create starter NanoCode project files");
     println!("  nanocode doctor                             Run local environment diagnostics");
+    println!("  nanocode self-update                        Update from GitHub releases");
+    println!("  nanocode --resume SESSION_ID_OR_PATH [/status] [/compact] [...]");
+    println!("                                               Resume a saved session and run slash commands");
     println!(
-        "  nanocode [--model MODEL] [--permission-mode MODE] [--allowedTools TOOL[,TOOL...]] prompt TEXT"
+        "  nanocode prompt [--model MODEL] [--permission-mode MODE] [--max-cost USD] [--thinking] [--output-format text|json] TEXT"
     );
     println!(
         "                                               Send one prompt and stream the response"
     );
+    println!(
+        "  nanocode [--model MODEL] [--permission-mode MODE] [--max-cost USD] [--thinking] [--output-format text|json] TEXT"
+    );
+    println!(
+        "                                               Shorthand non-interactive prompt mode"
+    );
     println!("  nanocode dump-manifests");
     println!("  nanocode bootstrap-plan");
     println!("  nanocode system-prompt [--cwd PATH] [--date YYYY-MM-DD]");
-    println!("  nanocode --resume SESSION.json [/compact]");
     println!("  nanocode --version");
-    println!("  --permission-mode MODE                     read-only, workspace-write, or danger-full-access");
+    println!(
+        "  --permission-mode MODE                     read-only, workspace-write, or danger-full-access"
+    );
+    println!(
+        "  --max-cost USD                             Warn at 80% of budget and stop at/exceeding the budget"
+    );
+    println!(
+        "  --thinking                                 Enable extended thinking with the default budget"
+    );
+    println!(
+        "  --output-format FORMAT                     Non-interactive output format: text or json"
+    );
 }
 
 fn print_version() {
-    println!("{VERSION}");
+    println!("{}", render_version_report());
+}
+
+fn run_init() -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    println!("{}", initialize_repo(&cwd)?.render());
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct GitHubRelease {
+    tag_name: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    assets: Vec<GitHubReleaseAsset>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct GitHubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedReleaseAssets {
+    binary: GitHubReleaseAsset,
+    checksum: GitHubReleaseAsset,
+}
+
+fn run_self_update() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(release) = fetch_latest_release()? else {
+        println!(
+            "{}",
+            render_update_report(
+                "No published release available",
+                Some(VERSION),
+                None,
+                Some("GitHub latest release endpoint returned no published release for nanogpt-community/nanocode-v2."),
+                None,
+            )
+        );
+        return Ok(());
+    };
+
+    let latest_version = normalize_version_tag(&release.tag_name);
+    if !is_newer_version(VERSION, &latest_version) {
+        println!(
+            "{}",
+            render_update_report(
+                "Already up to date",
+                Some(VERSION),
+                Some(&latest_version),
+                Some("Current binary already matches the latest published release."),
+                Some(&release.body),
+            )
+        );
+        return Ok(());
+    }
+
+    let selected = match select_release_assets(&release) {
+        Ok(selected) => selected,
+        Err(message) => {
+            println!(
+                "{}",
+                render_update_report(
+                    "Release found, but no installable asset matched this platform",
+                    Some(VERSION),
+                    Some(&latest_version),
+                    Some(&message),
+                    Some(&release.body),
+                )
+            );
+            return Ok(());
+        }
+    };
+
+    let client = build_self_update_client()?;
+    let binary_bytes = download_bytes(&client, &selected.binary.browser_download_url)?;
+    let checksum_manifest = download_text(&client, &selected.checksum.browser_download_url)?;
+    let expected_checksum = parse_checksum_for_asset(&checksum_manifest, &selected.binary.name)
+        .ok_or_else(|| {
+            format!(
+                "checksum manifest did not contain an entry for {}",
+                selected.binary.name
+            )
+        })?;
+    let actual_checksum = sha256_hex(&binary_bytes);
+    if actual_checksum != expected_checksum {
+        return Err(format!(
+            "downloaded asset checksum mismatch for {} (expected {}, got {})",
+            selected.binary.name, expected_checksum, actual_checksum
+        )
+        .into());
+    }
+
+    replace_current_executable(&binary_bytes)?;
+
+    println!(
+        "{}",
+        render_update_report(
+            "Update installed",
+            Some(VERSION),
+            Some(&latest_version),
+            Some(&format!(
+                "Installed {} from GitHub release assets for {}.",
+                selected.binary.name,
+                current_target()
+            )),
+            Some(&release.body),
+        )
+    );
+    Ok(())
+}
+
+fn fetch_latest_release() -> Result<Option<GitHubRelease>, Box<dyn std::error::Error>> {
+    let client = build_self_update_client()?;
+    let response = client
+        .get(SELF_UPDATE_LATEST_RELEASE_URL)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()?;
+
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+
+    let response = response.error_for_status()?;
+    Ok(Some(response.json()?))
+}
+
+fn build_self_update_client() -> Result<BlockingClient, reqwest::Error> {
+    BlockingClient::builder()
+        .user_agent(SELF_UPDATE_USER_AGENT)
+        .build()
+}
+
+fn download_bytes(
+    client: &BlockingClient,
+    url: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let response = client.get(url).send()?.error_for_status()?;
+    Ok(response.bytes()?.to_vec())
+}
+
+fn download_text(client: &BlockingClient, url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let response = client.get(url).send()?.error_for_status()?;
+    Ok(response.text()?)
+}
+
+fn normalize_version_tag(version: &str) -> String {
+    version.trim().trim_start_matches('v').to_string()
+}
+
+fn is_newer_version(current: &str, latest: &str) -> bool {
+    compare_versions(latest, current).is_gt()
+}
+
+fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    let left = normalize_version_tag(left);
+    let right = normalize_version_tag(right);
+    let left_parts = version_components(&left);
+    let right_parts = version_components(&right);
+    let max_len = left_parts.len().max(right_parts.len());
+    for index in 0..max_len {
+        let left_part = *left_parts.get(index).unwrap_or(&0);
+        let right_part = *right_parts.get(index).unwrap_or(&0);
+        match left_part.cmp(&right_part) {
+            std::cmp::Ordering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn version_components(version: &str) -> Vec<u64> {
+    version
+        .split(['.', '-'])
+        .map(|part| {
+            part.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect()
+}
+
+fn current_target() -> String {
+    BUILD_TARGET.map_or_else(default_target_triple, str::to_string)
+}
+
+fn default_target_triple() -> String {
+    let os = match env::consts::OS {
+        "linux" => "unknown-linux-gnu",
+        "macos" => "apple-darwin",
+        "windows" => "pc-windows-msvc",
+        other => other,
+    };
+    format!("{}-{os}", env::consts::ARCH)
+}
+
+fn target_name_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(target) = BUILD_TARGET {
+        candidates.push(target.to_string());
+    }
+    candidates.push(default_target_triple());
+    candidates.push(format!("{}-{}", env::consts::ARCH, env::consts::OS));
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn release_asset_candidates() -> Vec<String> {
+    let mut candidates = target_name_candidates()
+        .into_iter()
+        .flat_map(|target| {
+            let mut names = vec![format!("nanocode-{target}")];
+            if env::consts::OS == "windows" {
+                names.push(format!("nanocode-{target}.exe"));
+            }
+            names
+        })
+        .collect::<Vec<_>>();
+    if env::consts::OS == "windows" {
+        candidates.push("nanocode.exe".to_string());
+    }
+    candidates.push("nanocode".to_string());
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn select_release_assets(release: &GitHubRelease) -> Result<SelectedReleaseAssets, String> {
+    let binary = release_asset_candidates()
+        .into_iter()
+        .find_map(|candidate| {
+            release
+                .assets
+                .iter()
+                .find(|asset| asset.name == candidate)
+                .cloned()
+        })
+        .ok_or_else(|| {
+            format!(
+                "no binary asset matched target {} (expected one of: {})",
+                current_target(),
+                release_asset_candidates().join(", ")
+            )
+        })?;
+
+    let checksum = CHECKSUM_ASSET_CANDIDATES
+        .iter()
+        .find_map(|candidate| {
+            release
+                .assets
+                .iter()
+                .find(|asset| asset.name == *candidate)
+                .cloned()
+        })
+        .ok_or_else(|| {
+            format!(
+                "release did not include a checksum manifest (expected one of: {})",
+                CHECKSUM_ASSET_CANDIDATES.join(", ")
+            )
+        })?;
+
+    Ok(SelectedReleaseAssets { binary, checksum })
+}
+
+fn parse_checksum_for_asset(manifest: &str, asset_name: &str) -> Option<String> {
+    manifest.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Some((left, right)) = trimmed.split_once(" = ") {
+            return left
+                .strip_prefix("SHA256 (")
+                .and_then(|value| value.strip_suffix(')'))
+                .filter(|file| *file == asset_name)
+                .map(|_| right.to_ascii_lowercase());
+        }
+        let mut parts = trimmed.split_whitespace();
+        let checksum = parts.next()?;
+        let file = parts
+            .next_back()
+            .or_else(|| parts.next())?
+            .trim_start_matches('*');
+        (file == asset_name).then(|| checksum.to_ascii_lowercase())
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn replace_current_executable(binary_bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let current = env::current_exe()?;
+    replace_executable_at(&current, binary_bytes)
+}
+
+fn replace_executable_at(
+    current: &Path,
+    binary_bytes: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp_path = current.with_extension("download");
+    let backup_path = current.with_extension("bak");
+
+    if backup_path.exists() {
+        fs::remove_file(&backup_path)?;
+    }
+    fs::write(&temp_path, binary_bytes)?;
+    copy_executable_permissions(current, &temp_path)?;
+
+    fs::rename(current, &backup_path)?;
+    if let Err(error) = fs::rename(&temp_path, current) {
+        let _ = fs::rename(&backup_path, current);
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("failed to replace current executable: {error}").into());
+    }
+
+    if let Err(error) = fs::remove_file(&backup_path) {
+        eprintln!(
+            "warning: failed to remove self-update backup {}: {error}",
+            backup_path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_executable_permissions(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = fs::metadata(source)?.permissions().mode();
+    fs::set_permissions(destination, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn copy_executable_permissions(
+    _source: &Path,
+    _destination: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
+}
+
+fn render_update_report(
+    result: &str,
+    current_version: Option<&str>,
+    latest_version: Option<&str>,
+    detail: Option<&str>,
+    changelog: Option<&str>,
+) -> String {
+    let mut report = String::from("Self-update\n");
+    let _ = writeln!(report, "  Repository       {SELF_UPDATE_REPOSITORY}");
+    let _ = writeln!(report, "  Result           {result}");
+    if let Some(current_version) = current_version {
+        let _ = writeln!(report, "  Current version  {current_version}");
+    }
+    if let Some(latest_version) = latest_version {
+        let _ = writeln!(report, "  Latest version   {latest_version}");
+    }
+    if let Some(detail) = detail {
+        let _ = writeln!(report, "  Detail           {detail}");
+    }
+    let trimmed = changelog.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(changelog) = trimmed {
+        report.push_str("\nChangelog\n");
+        report.push_str(changelog);
+    }
+    report.trim_end().to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3461,6 +5321,7 @@ fn check_api_key_validity() -> DiagnosticCheck {
         system: None,
         tools: None,
         tool_choice: None,
+        thinking: None,
         stream: false,
     };
 
@@ -3726,11 +5587,29 @@ fn check_system_info(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> Dia
         format!("cli_version={VERSION}"),
     ];
     if let Some(config) = config {
+        let sandbox_status = resolve_sandbox_status(config.sandbox(), cwd);
         details.push(format!(
             "resolved_model={} loaded_config_files={}",
             config.model().unwrap_or(DEFAULT_MODEL),
             config.loaded_entries().len()
         ));
+        details.push(format!(
+            "sandbox enabled={} active={} namespace_active={} network_active={} filesystem_mode={}",
+            sandbox_status.enabled,
+            sandbox_status.active,
+            sandbox_status.namespace_active,
+            sandbox_status.network_active,
+            sandbox_status.filesystem_mode.as_str()
+        ));
+        if !sandbox_status.allowed_mounts.is_empty() {
+            details.push(format!(
+                "sandbox_allowed_mounts={}",
+                sandbox_status.allowed_mounts.join(", ")
+            ));
+        }
+        if let Some(reason) = sandbox_status.fallback_reason {
+            details.push(format!("sandbox_fallback={reason}"));
+        }
     }
     DiagnosticCheck::new(
         "System info",
@@ -3744,11 +5623,13 @@ fn check_system_info(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> Dia
 mod tests {
     use super::{
         append_proxy_text_events, available_runtime_tool_specs, extract_first_json_object,
-        filter_runtime_tool_specs, parse_args, parse_auth_command, parse_mcp_command,
-        parse_model_command, parse_provider_command, parse_proxy_command, parse_tool_input_value,
-        prompt_to_content_blocks, proxy_chat_completion_response_to_events,
-        proxy_response_to_events, render_tool_result_markdown, should_retry_proxy_tool_prompt,
-        AssistantEvent, CliAction, McpCatalog, McpCommand, RuntimeToolSpec, DEFAULT_MODEL,
+        filter_runtime_tool_specs, parse_args, parse_auth_command, parse_checksum_for_asset,
+        parse_mcp_command, parse_model_command, parse_provider_command, parse_proxy_command,
+        parse_tool_input_value, prompt_to_content_blocks, proxy_chat_completion_response_to_events,
+        proxy_response_to_events, render_tool_result_markdown, render_update_report,
+        resolve_model_alias, should_retry_proxy_tool_prompt, AssistantEvent, CliAction,
+        CliOutputFormat, GitHubRelease, GitHubReleaseAsset, McpCatalog, McpCommand,
+        RuntimeToolSpec, DEFAULT_MODEL,
     };
     use crate::proxy::ProxyCommand;
     use api::{
@@ -3799,6 +5680,8 @@ mod tests {
                     model: DEFAULT_MODEL.to_string(),
                     allowed_tools: None,
                     permission_mode: PermissionMode::WorkspaceWrite,
+                    max_cost_usd: None,
+                    thinking: false,
                 }
             );
         });
@@ -3819,6 +5702,33 @@ mod tests {
                     model: DEFAULT_MODEL.to_string(),
                     allowed_tools: None,
                     permission_mode: PermissionMode::WorkspaceWrite,
+                    max_cost_usd: None,
+                    thinking: false,
+                    output_format: CliOutputFormat::Text,
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn parses_bare_prompt_with_json_output_flag() {
+        with_isolated_config_home(|| {
+            let args = vec![
+                "--output-format=json".to_string(),
+                "summarize".to_string(),
+                "this".to_string(),
+                "repo".to_string(),
+            ];
+            assert_eq!(
+                parse_args(&args).expect("args should parse"),
+                CliAction::Prompt {
+                    prompt: "summarize this repo".to_string(),
+                    model: DEFAULT_MODEL.to_string(),
+                    allowed_tools: None,
+                    permission_mode: PermissionMode::WorkspaceWrite,
+                    max_cost_usd: None,
+                    thinking: false,
+                    output_format: CliOutputFormat::Json,
                 }
             );
         });
@@ -3843,6 +5753,8 @@ mod tests {
                             .collect()
                     ),
                     permission_mode: PermissionMode::WorkspaceWrite,
+                    max_cost_usd: None,
+                    thinking: false,
                 }
             );
         });
@@ -3858,6 +5770,8 @@ mod tests {
                     model: DEFAULT_MODEL.to_string(),
                     allowed_tools: None,
                     permission_mode: PermissionMode::ReadOnly,
+                    max_cost_usd: None,
+                    thinking: false,
                 }
             );
         });
@@ -3969,7 +5883,26 @@ mod tests {
                 parse_args(&args).expect("args should parse"),
                 CliAction::ResumeSession {
                     session_path: PathBuf::from("session.json"),
-                    command: Some("/compact".to_string()),
+                    commands: vec!["/compact".to_string()],
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn parses_resume_flag_with_multiple_slash_commands() {
+        with_isolated_config_home(|| {
+            let args = vec![
+                "--resume".to_string(),
+                "session.json".to_string(),
+                "/status".to_string(),
+                "/export".to_string(),
+            ];
+            assert_eq!(
+                parse_args(&args).expect("args should parse"),
+                CliAction::ResumeSession {
+                    session_path: PathBuf::from("session.json"),
+                    commands: vec!["/status".to_string(), "/export".to_string()],
                 }
             );
         });
@@ -3984,6 +5917,60 @@ mod tests {
                 CliAction::Version
             );
         });
+    }
+
+    #[test]
+    fn parses_self_update_subcommand() {
+        with_isolated_config_home(|| {
+            assert_eq!(
+                parse_args(&["self-update".to_string()]).expect("self-update should parse"),
+                CliAction::SelfUpdate
+            );
+        });
+    }
+
+    #[test]
+    fn parses_checksum_manifest_for_named_asset() {
+        let manifest = "abc123 *nanocode-aarch64-apple-darwin\ndef456 other-file\n";
+        assert_eq!(
+            parse_checksum_for_asset(manifest, "nanocode-aarch64-apple-darwin"),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn select_release_assets_requires_checksum_file() {
+        let asset_name = super::release_asset_candidates()
+            .into_iter()
+            .next()
+            .expect("at least one asset candidate");
+        let release = GitHubRelease {
+            tag_name: "v0.2.0".to_string(),
+            body: String::new(),
+            assets: vec![GitHubReleaseAsset {
+                name: asset_name,
+                browser_download_url: "https://example.invalid/nanocode".to_string(),
+            }],
+        };
+
+        let error =
+            super::select_release_assets(&release).expect_err("missing checksum should error");
+        assert!(error.contains("checksum manifest"));
+    }
+
+    #[test]
+    fn update_report_includes_changelog_when_present() {
+        let report = render_update_report(
+            "Already up to date",
+            Some("0.1.3"),
+            Some("0.1.3"),
+            Some("No action taken."),
+            Some("- Added self-update"),
+        );
+        assert!(report.contains("Self-update"));
+        assert!(report.contains("Changelog"));
+        assert!(report.contains("- Added self-update"));
+        assert!(report.contains("nanogpt-community/nanocode-v2"));
     }
 
     #[test]
@@ -4021,6 +6008,15 @@ mod tests {
             Some(Some("openai/gpt-5.2".to_string()))
         );
         assert_eq!(parse_model_command("/status"), None);
+    }
+
+    #[test]
+    fn resolves_known_nanocode_model_aliases() {
+        assert_eq!(resolve_model_alias("default"), "zai-org/glm-5.1");
+        assert_eq!(resolve_model_alias("glm"), "zai-org/glm-5.1");
+        assert_eq!(resolve_model_alias("glm5"), "zai-org/glm-5");
+        assert_eq!(resolve_model_alias("glm-5.1"), "zai-org/glm-5.1");
+        assert_eq!(resolve_model_alias("openai/gpt-5.2"), "openai/gpt-5.2");
     }
 
     #[test]

@@ -1650,6 +1650,7 @@ impl ApiClient for NanoCodeAgentApiClient {
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: Some(agent_tool_definitions()),
             tool_choice: Some(ToolChoice::Auto),
+            thinking: None,
             stream: false,
         };
 
@@ -1756,26 +1757,29 @@ fn convert_agent_messages(messages: &[ConversationMessage]) -> Vec<InputMessage>
             let content = message
                 .blocks
                 .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => {
+                        Some(InputContentBlock::Text { text: text.clone() })
+                    }
+                    ContentBlock::Thinking { .. } => None,
+                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
-                        input: serde_json::from_str(input)
+                        input: serde_json::from_str(&input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
+                    }),
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
+                    } => Some(InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![api::ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
                         is_error: *is_error,
-                    },
+                    }),
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -1793,6 +1797,17 @@ fn agent_response_to_events(response: api::MessageResponse) -> Vec<AssistantEven
             OutputContentBlock::Text { text } => {
                 if !text.is_empty() {
                     events.push(AssistantEvent::TextDelta(text));
+                }
+            }
+            OutputContentBlock::Thinking {
+                thinking,
+                signature,
+            } => {
+                if !thinking.is_empty() {
+                    events.push(AssistantEvent::ThinkingDelta(thinking));
+                }
+                if let Some(signature) = signature.filter(|signature| !signature.is_empty()) {
+                    events.push(AssistantEvent::ThinkingSignature(signature));
                 }
             }
             OutputContentBlock::ToolUse { id, name, input } => {
@@ -2677,6 +2692,7 @@ fn execute_shell_command(
             structured_content: None,
             persisted_output_path: None,
             persisted_output_size: None,
+            sandbox_status: None,
         });
     }
 
@@ -2714,6 +2730,7 @@ fn execute_shell_command(
                     structured_content: None,
                     persisted_output_path: None,
                     persisted_output_size: None,
+                    sandbox_status: None,
                 });
             }
             if started.elapsed() >= Duration::from_millis(timeout_ms) {
@@ -2744,6 +2761,7 @@ Command exceeded timeout of {timeout_ms} ms",
                     structured_content: None,
                     persisted_output_path: None,
                     persisted_output_size: None,
+                    sandbox_status: None,
                 });
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -2770,6 +2788,7 @@ Command exceeded timeout of {timeout_ms} ms",
         structured_content: None,
         persisted_output_path: None,
         persisted_output_size: None,
+        sandbox_status: None,
     })
 }
 

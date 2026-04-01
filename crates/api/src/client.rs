@@ -572,6 +572,7 @@ mod tests {
             system: None,
             tools: None,
             tool_choice: None,
+            thinking: None,
             stream: false,
         };
 

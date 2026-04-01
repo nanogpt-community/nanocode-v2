@@ -21,6 +21,7 @@ pub struct ColorTheme {
     inline_code: Color,
     link: Color,
     quote: Color,
+    table_border: Color,
     spinner_active: Color,
     spinner_done: Color,
     spinner_failed: Color,
@@ -35,6 +36,7 @@ impl Default for ColorTheme {
             inline_code: Color::Green,
             link: Color::Blue,
             quote: Color::DarkGrey,
+            table_border: Color::DarkCyan,
             spinner_active: Color::Blue,
             spinner_done: Color::Green,
             spinner_failed: Color::Red,
@@ -107,24 +109,70 @@ impl Spinner {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ListKind {
+    Unordered,
+    Ordered { next_index: u64 },
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TableState {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    current_row: Vec<String>,
+    current_cell: String,
+    in_head: bool,
+}
+
+impl TableState {
+    fn push_cell(&mut self) {
+        let cell = self.current_cell.trim().to_string();
+        self.current_row.push(cell);
+        self.current_cell.clear();
+    }
+
+    fn finish_row(&mut self) {
+        if self.current_row.is_empty() {
+            return;
+        }
+        let row = std::mem::take(&mut self.current_row);
+        if self.in_head {
+            self.headers = row;
+        } else {
+            self.rows.push(row);
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct RenderState {
     emphasis: usize,
     strong: usize,
     quote: usize,
-    list: usize,
+    list_stack: Vec<ListKind>,
+    table: Option<TableState>,
 }
 
 impl RenderState {
     fn style_text(&self, text: &str, theme: &ColorTheme) -> String {
+        let mut styled = text.to_string();
         if self.strong > 0 {
-            format!("{}", text.bold().with(theme.strong))
-        } else if self.emphasis > 0 {
-            format!("{}", text.italic().with(theme.emphasis))
-        } else if self.quote > 0 {
-            format!("{}", text.with(theme.quote))
+            styled = format!("{}", styled.bold().with(theme.strong));
+        }
+        if self.emphasis > 0 {
+            styled = format!("{}", styled.italic().with(theme.emphasis));
+        }
+        if self.quote > 0 {
+            styled = format!("{}", styled.with(theme.quote));
+        }
+        styled
+    }
+
+    fn capture_target_mut<'a>(&'a mut self, output: &'a mut String) -> &'a mut String {
+        if let Some(table) = self.table.as_mut() {
+            &mut table.current_cell
         } else {
-            text.to_string()
+            output
         }
     }
 }
@@ -197,12 +245,22 @@ impl TerminalRenderer {
             Event::Start(Tag::Heading { level, .. }) => self.start_heading(level as u8, output),
             Event::End(TagEnd::Heading(..) | TagEnd::Paragraph) => output.push_str("\n\n"),
             Event::Start(Tag::BlockQuote(..)) => self.start_quote(state, output),
-            Event::End(TagEnd::BlockQuote(..) | TagEnd::Item)
-            | Event::SoftBreak
-            | Event::HardBreak => output.push('\n'),
-            Event::Start(Tag::List(_)) => state.list += 1,
+            Event::End(TagEnd::BlockQuote(..)) => {
+                state.quote = state.quote.saturating_sub(1);
+                output.push('\n');
+            }
+            Event::End(TagEnd::Item) | Event::SoftBreak | Event::HardBreak => {
+                state.capture_target_mut(output).push('\n');
+            }
+            Event::Start(Tag::List(first_item)) => {
+                let kind = match first_item {
+                    Some(index) => ListKind::Ordered { next_index: index },
+                    None => ListKind::Unordered,
+                };
+                state.list_stack.push(kind);
+            }
             Event::End(TagEnd::List(..)) => {
-                state.list = state.list.saturating_sub(1);
+                state.list_stack.pop();
                 output.push('\n');
             }
             Event::Start(Tag::Item) => Self::start_item(state, output),
@@ -226,57 +284,85 @@ impl TerminalRenderer {
             Event::Start(Tag::Strong) => state.strong += 1,
             Event::End(TagEnd::Strong) => state.strong = state.strong.saturating_sub(1),
             Event::Code(code) => {
-                let _ = write!(
-                    output,
-                    "{}",
-                    format!("`{code}`").with(self.color_theme.inline_code)
-                );
+                let rendered =
+                    format!("{}", format!("`{code}`").with(self.color_theme.inline_code));
+                state.capture_target_mut(output).push_str(&rendered);
             }
             Event::Rule => output.push_str("---\n"),
             Event::Text(text) => {
                 self.push_text(text.as_ref(), state, output, code_buffer, *in_code_block);
             }
-            Event::Html(html) | Event::InlineHtml(html) => output.push_str(&html),
-            Event::FootnoteReference(reference) => {
-                let _ = write!(output, "[{reference}]");
+            Event::Html(html) | Event::InlineHtml(html) => {
+                state.capture_target_mut(output).push_str(&html);
             }
-            Event::TaskListMarker(done) => output.push_str(if done { "[x] " } else { "[ ] " }),
-            Event::InlineMath(math) | Event::DisplayMath(math) => output.push_str(&math),
+            Event::FootnoteReference(reference) => {
+                let _ = write!(state.capture_target_mut(output), "[{reference}]");
+            }
+            Event::TaskListMarker(done) => {
+                state
+                    .capture_target_mut(output)
+                    .push_str(if done { "[x] " } else { "[ ] " });
+            }
+            Event::InlineMath(math) | Event::DisplayMath(math) => {
+                state.capture_target_mut(output).push_str(&math);
+            }
             Event::Start(Tag::Link { dest_url, .. }) => {
-                let _ = write!(
-                    output,
+                let rendered = format!(
                     "{}",
                     format!("[{dest_url}]")
                         .underlined()
                         .with(self.color_theme.link)
                 );
+                state.capture_target_mut(output).push_str(&rendered);
             }
             Event::Start(Tag::Image { dest_url, .. }) => {
-                let _ = write!(
-                    output,
+                let rendered = format!(
                     "{}",
                     format!("[image:{dest_url}]").with(self.color_theme.link)
                 );
+                state.capture_target_mut(output).push_str(&rendered);
             }
-            Event::Start(
-                Tag::Paragraph
-                | Tag::Table(..)
-                | Tag::TableHead
-                | Tag::TableRow
-                | Tag::TableCell
-                | Tag::MetadataBlock(..)
-                | _,
-            )
-            | Event::End(
-                TagEnd::Link
-                | TagEnd::Image
-                | TagEnd::Table
-                | TagEnd::TableHead
-                | TagEnd::TableRow
-                | TagEnd::TableCell
-                | TagEnd::MetadataBlock(..)
-                | _,
-            ) => {}
+            Event::Start(Tag::Table(..)) => state.table = Some(TableState::default()),
+            Event::End(TagEnd::Table) => {
+                if let Some(table) = state.table.take() {
+                    output.push_str(&self.render_table(&table));
+                    output.push_str("\n\n");
+                }
+            }
+            Event::Start(Tag::TableHead) => {
+                if let Some(table) = state.table.as_mut() {
+                    table.in_head = true;
+                }
+            }
+            Event::End(TagEnd::TableHead) => {
+                if let Some(table) = state.table.as_mut() {
+                    table.finish_row();
+                    table.in_head = false;
+                }
+            }
+            Event::Start(Tag::TableRow) => {
+                if let Some(table) = state.table.as_mut() {
+                    table.current_row.clear();
+                    table.current_cell.clear();
+                }
+            }
+            Event::End(TagEnd::TableRow) => {
+                if let Some(table) = state.table.as_mut() {
+                    table.finish_row();
+                }
+            }
+            Event::Start(Tag::TableCell) => {
+                if let Some(table) = state.table.as_mut() {
+                    table.current_cell.clear();
+                }
+            }
+            Event::End(TagEnd::TableCell) => {
+                if let Some(table) = state.table.as_mut() {
+                    table.push_cell();
+                }
+            }
+            Event::Start(Tag::Paragraph | Tag::MetadataBlock(..) | _)
+            | Event::End(TagEnd::Link | TagEnd::Image | TagEnd::MetadataBlock(..) | _) => {}
         }
     }
 
@@ -296,9 +382,19 @@ impl TerminalRenderer {
         let _ = write!(output, "{}", "│ ".with(self.color_theme.quote));
     }
 
-    fn start_item(state: &RenderState, output: &mut String) {
-        output.push_str(&"  ".repeat(state.list.saturating_sub(1)));
-        output.push_str("• ");
+    fn start_item(state: &mut RenderState, output: &mut String) {
+        let depth = state.list_stack.len().saturating_sub(1);
+        output.push_str(&"  ".repeat(depth));
+
+        let marker = match state.list_stack.last_mut() {
+            Some(ListKind::Ordered { next_index }) => {
+                let value = *next_index;
+                *next_index += 1;
+                format!("{value}. ")
+            }
+            _ => "• ".to_string(),
+        };
+        output.push_str(&marker);
     }
 
     fn start_code_block(&self, code_language: &str, output: &mut String) {
@@ -322,7 +418,7 @@ impl TerminalRenderer {
     fn push_text(
         &self,
         text: &str,
-        state: &RenderState,
+        state: &mut RenderState,
         output: &mut String,
         code_buffer: &mut String,
         in_code_block: bool,
@@ -330,8 +426,80 @@ impl TerminalRenderer {
         if in_code_block {
             code_buffer.push_str(text);
         } else {
-            output.push_str(&state.style_text(text, &self.color_theme));
+            let rendered = state.style_text(text, &self.color_theme);
+            state.capture_target_mut(output).push_str(&rendered);
         }
+    }
+
+    fn render_table(&self, table: &TableState) -> String {
+        let mut rows = Vec::new();
+        if !table.headers.is_empty() {
+            rows.push(table.headers.clone());
+        }
+        rows.extend(table.rows.iter().cloned());
+
+        if rows.is_empty() {
+            return String::new();
+        }
+
+        let column_count = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let widths = (0..column_count)
+            .map(|column| {
+                rows.iter()
+                    .filter_map(|row| row.get(column))
+                    .map(|cell| visible_width(cell))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect::<Vec<_>>();
+
+        let border = format!("{}", "│".with(self.color_theme.table_border));
+        let separator = widths
+            .iter()
+            .map(|width| "─".repeat(*width + 2))
+            .collect::<Vec<_>>()
+            .join(&format!("{}", "┼".with(self.color_theme.table_border)));
+        let separator = format!("{border}{separator}{border}");
+
+        let mut output = String::new();
+        if !table.headers.is_empty() {
+            output.push_str(&self.render_table_row(&table.headers, &widths, true));
+            output.push('\n');
+            output.push_str(&separator);
+            if !table.rows.is_empty() {
+                output.push('\n');
+            }
+        }
+
+        for (index, row) in table.rows.iter().enumerate() {
+            output.push_str(&self.render_table_row(row, &widths, false));
+            if index + 1 < table.rows.len() {
+                output.push('\n');
+            }
+        }
+
+        output
+    }
+
+    fn render_table_row(&self, row: &[String], widths: &[usize], is_header: bool) -> String {
+        let border = format!("{}", "│".with(self.color_theme.table_border));
+        let mut line = String::new();
+        line.push_str(&border);
+
+        for (index, width) in widths.iter().enumerate() {
+            let cell = row.get(index).map_or("", String::as_str);
+            line.push(' ');
+            if is_header {
+                let _ = write!(line, "{}", cell.bold().with(self.color_theme.heading));
+            } else {
+                line.push_str(cell);
+            }
+            let padding = width.saturating_sub(visible_width(cell));
+            line.push_str(&" ".repeat(padding + 1));
+            line.push_str(&border);
+        }
+
+        line
     }
 
     #[must_use]
@@ -366,31 +534,35 @@ impl TerminalRenderer {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{Spinner, TerminalRenderer};
+fn visible_width(input: &str) -> usize {
+    strip_ansi(input).chars().count()
+}
 
-    fn strip_ansi(input: &str) -> String {
-        let mut output = String::new();
-        let mut chars = input.chars().peekable();
+fn strip_ansi(input: &str) -> String {
+    let mut output = String::new();
+    let mut chars = input.chars().peekable();
 
-        while let Some(ch) = chars.next() {
-            if ch == '\u{1b}' {
-                if chars.peek() == Some(&'[') {
-                    chars.next();
-                    for next in chars.by_ref() {
-                        if next.is_ascii_alphabetic() {
-                            break;
-                        }
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() {
+                        break;
                     }
                 }
-            } else {
-                output.push(ch);
             }
+        } else {
+            output.push(ch);
         }
-
-        output
     }
+
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{strip_ansi, Spinner, TerminalRenderer};
 
     #[test]
     fn renders_markdown_with_styling_and_lists() {
@@ -413,6 +585,34 @@ mod tests {
 
         assert!(plain_text.contains("╭─ rust"));
         assert!(plain_text.contains("fn hi"));
+        assert!(markdown_output.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn renders_ordered_and_nested_lists() {
+        let terminal_renderer = TerminalRenderer::new();
+        let markdown_output =
+            terminal_renderer.render_markdown("1. first\n2. second\n   - nested\n   - child");
+        let plain_text = strip_ansi(&markdown_output);
+
+        assert!(plain_text.contains("1. first"));
+        assert!(plain_text.contains("2. second"));
+        assert!(plain_text.contains("  • nested"));
+        assert!(plain_text.contains("  • child"));
+    }
+
+    #[test]
+    fn renders_tables_with_alignment() {
+        let terminal_renderer = TerminalRenderer::new();
+        let markdown_output = terminal_renderer
+            .render_markdown("| Name | Value |\n| ---- | ----- |\n| alpha | 1 |\n| beta | 22 |");
+        let plain_text = strip_ansi(&markdown_output);
+        let lines = plain_text.lines().collect::<Vec<_>>();
+
+        assert_eq!(lines[0], "│ Name  │ Value │");
+        assert_eq!(lines[1], "│───────┼───────│");
+        assert_eq!(lines[2], "│ alpha │ 1     │");
+        assert_eq!(lines[3], "│ beta  │ 22    │");
         assert!(markdown_output.contains('\u{1b}'));
     }
 

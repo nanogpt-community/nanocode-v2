@@ -91,6 +91,7 @@ fn image_content_blocks_serialize_with_base64_source() {
         system: None,
         tools: None,
         tool_choice: None,
+        thinking: None,
         stream: false,
     };
 
@@ -336,6 +337,7 @@ async fn provider_override_forces_paygo_headers() {
             system: None,
             tools: None,
             tool_choice: None,
+            thinking: None,
             stream: false,
         })
         .await
@@ -415,6 +417,7 @@ async fn live_stream_smoke_test() {
             system: None,
             tools: None,
             tool_choice: None,
+            thinking: None,
             stream: false,
         })
         .await
@@ -595,6 +598,7 @@ fn sample_request(stream: bool) -> MessageRequest {
             }),
         }]),
         tool_choice: Some(ToolChoice::Auto),
+        thinking: None,
         stream,
     }
 }

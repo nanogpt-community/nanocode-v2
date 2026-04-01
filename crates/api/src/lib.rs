@@ -14,6 +14,6 @@ pub use types::{
     ContentBlockStartEvent, ContentBlockStopEvent, ImageSource, InputContentBlock, InputMessage,
     MessageDelta, MessageDeltaEvent, MessageRequest, MessageResponse, MessageStartEvent,
     MessageStopEvent, ModelCapabilities, ModelInfo, ModelPricing, ModelProvider, ModelsResponse,
-    OutputContentBlock, ProviderPrice, ProviderSelectionResponse, StreamEvent, ToolChoice,
-    ToolDefinition, ToolResultContentBlock, Usage,
+    OutputContentBlock, ProviderPrice, ProviderSelectionResponse, StreamEvent, ThinkingConfig,
+    ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };

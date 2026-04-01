@@ -300,6 +300,7 @@ mod tests {
                     cache_read_input_tokens: 0,
                 }),
             }],
+            metadata: None,
         };
 
         let tracker = UsageTracker::from_session(&session);

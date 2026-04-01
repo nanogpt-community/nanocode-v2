@@ -12,6 +12,7 @@ mod oauth;
 mod permissions;
 mod prompt;
 mod remote;
+mod sandbox;
 mod session;
 mod usage;
 
@@ -71,7 +72,15 @@ pub use remote::{
     RemoteSessionContext, UpstreamProxyBootstrap, UpstreamProxyState, DEFAULT_REMOTE_BASE_URL,
     DEFAULT_SESSION_TOKEN_PATH, DEFAULT_SYSTEM_CA_BUNDLE, NO_PROXY_HOSTS, UPSTREAM_PROXY_ENV_KEYS,
 };
-pub use session::{ContentBlock, ConversationMessage, MessageRole, Session, SessionError};
+pub use sandbox::{
+    build_linux_sandbox_command, detect_container_environment, detect_container_environment_from,
+    resolve_sandbox_status, resolve_sandbox_status_for_request, ContainerEnvironment,
+    FilesystemIsolationMode, LinuxSandboxCommand, SandboxConfig, SandboxDetectionInputs,
+    SandboxRequest, SandboxStatus,
+};
+pub use session::{
+    ContentBlock, ConversationMessage, MessageRole, Session, SessionError, SessionMetadata,
+};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
 };

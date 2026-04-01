@@ -1,4 +1,5 @@
 mod app;
+mod init;
 mod input;
 mod models;
 mod proxy;

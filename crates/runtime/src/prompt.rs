@@ -570,6 +570,7 @@ mod tests {
 
     #[test]
     fn discovers_project_memory_files_from_ancestor_chain() {
+        let _guard = test_env_lock();
         let root = temp_dir();
         let nested = root.join("apps").join("api");
         fs::create_dir_all(root.join(".nanocode").join("memory")).expect("root memory dir");

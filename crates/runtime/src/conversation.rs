@@ -17,6 +17,8 @@ pub struct ApiRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantEvent {
     TextDelta(String),
+    ThinkingDelta(String),
+    ThinkingSignature(String),
     ToolUse {
         id: String,
         name: String,
@@ -247,15 +249,29 @@ fn build_assistant_message(
     events: Vec<AssistantEvent>,
 ) -> Result<(ConversationMessage, Option<TokenUsage>), RuntimeError> {
     let mut text = String::new();
+    let mut thinking = String::new();
+    let mut thinking_signature: Option<String> = None;
     let mut blocks = Vec::new();
     let mut finished = false;
     let mut usage = None;
 
     for event in events {
         match event {
-            AssistantEvent::TextDelta(delta) => text.push_str(&delta),
+            AssistantEvent::TextDelta(delta) => {
+                flush_thinking_block(&mut thinking, &mut thinking_signature, &mut blocks);
+                text.push_str(&delta);
+            }
+            AssistantEvent::ThinkingDelta(delta) => {
+                flush_text_block(&mut text, &mut blocks);
+                thinking.push_str(&delta);
+            }
+            AssistantEvent::ThinkingSignature(signature) => {
+                flush_text_block(&mut text, &mut blocks);
+                thinking_signature = Some(signature);
+            }
             AssistantEvent::ToolUse { id, name, input } => {
                 flush_text_block(&mut text, &mut blocks);
+                flush_thinking_block(&mut thinking, &mut thinking_signature, &mut blocks);
                 blocks.push(ContentBlock::ToolUse { id, name, input });
             }
             AssistantEvent::Usage(value) => usage = Some(value),
@@ -266,6 +282,7 @@ fn build_assistant_message(
     }
 
     flush_text_block(&mut text, &mut blocks);
+    flush_thinking_block(&mut thinking, &mut thinking_signature, &mut blocks);
 
     if !finished {
         return Err(RuntimeError::new(
@@ -288,6 +305,20 @@ fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
             text: std::mem::take(text),
         });
     }
+}
+
+fn flush_thinking_block(
+    text: &mut String,
+    signature: &mut Option<String>,
+    blocks: &mut Vec<ContentBlock>,
+) {
+    if text.is_empty() && signature.is_none() {
+        return;
+    }
+    blocks.push(ContentBlock::Thinking {
+        text: std::mem::take(text),
+        signature: signature.take(),
+    });
 }
 
 type ToolHandler = Box<dyn FnMut(&str) -> Result<String, ToolError>>;

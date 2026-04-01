@@ -336,6 +336,7 @@ fn render_proxy_message_content(message: &ConversationMessage) -> Result<String,
     for block in &message.blocks {
         match block {
             ContentBlock::Text { text } => chunks.push(text.clone()),
+            ContentBlock::Thinking { .. } => {}
             ContentBlock::ToolUse { id, name, input } => {
                 chunks.push(render_tool_call_xml(id, name, input)?);
             }

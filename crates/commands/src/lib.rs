@@ -58,6 +58,12 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "thinking",
+        summary: "Show or toggle extended thinking",
+        argument_hint: Some("[on|off]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "model",
         summary: "Show or switch the active model",
         argument_hint: Some("[model]"),
@@ -135,6 +141,12 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         argument_hint: Some("[list|switch <session-id>]"),
         resume_supported: false,
     },
+    SlashCommandSpec {
+        name: "sessions",
+        summary: "List recent managed local sessions",
+        argument_hint: None,
+        resume_supported: false,
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +154,9 @@ pub enum SlashCommand {
     Help,
     Status,
     Compact,
+    Thinking {
+        enabled: Option<bool>,
+    },
     Model {
         model: Option<String>,
     },
@@ -172,6 +187,7 @@ pub enum SlashCommand {
         action: Option<String>,
         target: Option<String>,
     },
+    Sessions,
     Unknown(String),
 }
 
@@ -189,6 +205,13 @@ impl SlashCommand {
             "help" => Self::Help,
             "status" => Self::Status,
             "compact" => Self::Compact,
+            "thinking" => Self::Thinking {
+                enabled: match parts.next() {
+                    Some("on") => Some(true),
+                    Some("off") => Some(false),
+                    Some(_) | None => None,
+                },
+            },
             "model" => Self::Model {
                 model: parts.next().map(ToOwned::to_owned),
             },
@@ -219,6 +242,7 @@ impl SlashCommand {
                 action: parts.next().map(ToOwned::to_owned),
                 target: parts.next().map(ToOwned::to_owned),
             },
+            "sessions" => Self::Sessions,
             other => Self::Unknown(other.to_string()),
         })
     }
@@ -291,6 +315,7 @@ pub fn handle_slash_command(
             session: session.clone(),
         }),
         SlashCommand::Status
+        | SlashCommand::Thinking { .. }
         | SlashCommand::Model { .. }
         | SlashCommand::Mcp { .. }
         | SlashCommand::Permissions { .. }
@@ -304,6 +329,7 @@ pub fn handle_slash_command(
         | SlashCommand::Version
         | SlashCommand::Export { .. }
         | SlashCommand::Session { .. }
+        | SlashCommand::Sessions
         | SlashCommand::Unknown(_) => None,
     }
 }
@@ -387,6 +413,7 @@ mod tests {
         assert!(help.contains("/help"));
         assert!(help.contains("/status"));
         assert!(help.contains("/compact"));
+        assert!(help.contains("/thinking [on|off]"));
         assert!(help.contains("/model [model]"));
         assert!(help.contains("/mcp [status|tools|reload]"));
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
@@ -400,7 +427,8 @@ mod tests {
         assert!(help.contains("/version"));
         assert!(help.contains("/export [file]"));
         assert!(help.contains("/session [list|switch <session-id>]"));
-        assert_eq!(slash_command_specs().len(), 16);
+        assert!(help.contains("/sessions"));
+        assert_eq!(slash_command_specs().len(), 18);
         assert_eq!(resume_supported_slash_commands().len(), 11);
     }
 
@@ -429,6 +457,7 @@ mod tests {
                     text: "recent".to_string(),
                 }]),
             ],
+            metadata: None,
         };
 
         let result = handle_slash_command(
