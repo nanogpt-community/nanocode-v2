@@ -2548,7 +2548,10 @@ fn should_render_proxy_text_segment(text: &str, has_tool_use: bool) -> bool {
             "writing",
             "saving",
         ];
-        if boilerplate.iter().any(|prefix| normalized.starts_with(prefix)) {
+        if boilerplate
+            .iter()
+            .any(|prefix| normalized.starts_with(prefix))
+        {
             return false;
         }
     }
@@ -3117,10 +3120,10 @@ mod tests {
     use super::{
         append_proxy_text_events, available_runtime_tool_specs, extract_first_json_object,
         filter_runtime_tool_specs, parse_args, parse_auth_command, parse_mcp_command,
-        parse_model_command, parse_provider_command, parse_proxy_command,
-        parse_tool_input_value, proxy_chat_completion_response_to_events,
-        proxy_response_to_events, render_tool_result_markdown, should_retry_proxy_tool_prompt,
-        AssistantEvent, CliAction, McpCatalog, McpCommand, RuntimeToolSpec, DEFAULT_MODEL,
+        parse_model_command, parse_provider_command, parse_proxy_command, parse_tool_input_value,
+        proxy_chat_completion_response_to_events, proxy_response_to_events,
+        render_tool_result_markdown, should_retry_proxy_tool_prompt, AssistantEvent, CliAction,
+        McpCatalog, McpCommand, RuntimeToolSpec, DEFAULT_MODEL,
     };
     use crate::proxy::ProxyCommand;
     use api::{

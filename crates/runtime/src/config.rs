@@ -14,6 +14,13 @@ pub enum ConfigSource {
     Local,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedPermissionMode {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigEntry {
     pub source: ConfigSource,
@@ -31,6 +38,8 @@ pub struct RuntimeConfig {
 pub struct RuntimeFeatureConfig {
     mcp: McpConfigCollection,
     oauth: Option<OAuthConfig>,
+    model: Option<String>,
+    permission_mode: Option<ResolvedPermissionMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -203,14 +212,14 @@ impl ConfigLoader {
             loaded_entries.push(entry);
         }
 
+        let merged_value = JsonValue::Object(merged.clone());
         let feature_config = RuntimeFeatureConfig {
             mcp: McpConfigCollection {
                 servers: mcp_servers,
             },
-            oauth: parse_optional_oauth_config(
-                &JsonValue::Object(merged.clone()),
-                "merged settings.oauth",
-            )?,
+            oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
+            model: parse_optional_model(&merged_value),
+            permission_mode: parse_optional_permission_mode(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -265,6 +274,16 @@ impl RuntimeConfig {
     pub fn oauth(&self) -> Option<&OAuthConfig> {
         self.feature_config.oauth.as_ref()
     }
+
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.feature_config.model.as_deref()
+    }
+
+    #[must_use]
+    pub fn permission_mode(&self) -> Option<ResolvedPermissionMode> {
+        self.feature_config.permission_mode
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -276,6 +295,16 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn oauth(&self) -> Option<&OAuthConfig> {
         self.oauth.as_ref()
+    }
+
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    #[must_use]
+    pub fn permission_mode(&self) -> Option<ResolvedPermissionMode> {
+        self.permission_mode
     }
 }
 
@@ -325,14 +354,18 @@ fn read_optional_json_object(
         return Ok(Some(BTreeMap::new()));
     }
 
-    let parsed = JsonValue::parse(&contents)
-        .map_err(|error| ConfigError::Parse(format!("{}: {error}", path.display())))?;
-    let object = parsed.as_object().ok_or_else(|| {
-        ConfigError::Parse(format!(
+    let parsed = match JsonValue::parse(&contents) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return Err(ConfigError::Parse(format!("{}: {error}", path.display())));
+        }
+    };
+    let Some(object) = parsed.as_object() else {
+        return Err(ConfigError::Parse(format!(
             "{}: top-level settings value must be a JSON object",
             path.display()
-        ))
-    })?;
+        )));
+    };
     Ok(Some(object.clone()))
 }
 
@@ -386,6 +419,44 @@ fn parse_optional_oauth_config(
         manual_redirect_url,
         scopes,
     }))
+}
+
+fn parse_optional_model(root: &JsonValue) -> Option<String> {
+    root.as_object()
+        .and_then(|object| object.get("model"))
+        .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn parse_optional_permission_mode(
+    root: &JsonValue,
+) -> Result<Option<ResolvedPermissionMode>, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(None);
+    };
+    let Some(raw_label) = object.get("permissionMode") else {
+        return Ok(None);
+    };
+    let Some(label) = raw_label.as_str() else {
+        return Err(ConfigError::Parse(
+            "merged settings.permissionMode: field permissionMode must be a string".to_string(),
+        ));
+    };
+    let Some(mode) = parse_permission_mode_label(label) else {
+        return Err(ConfigError::Parse(format!(
+            "merged settings.permissionMode: unsupported permissionMode {label}"
+        )));
+    };
+    Ok(Some(mode))
+}
+
+fn parse_permission_mode_label(label: &str) -> Option<ResolvedPermissionMode> {
+    match label {
+        "default" | "plan" | "read-only" => Some(ResolvedPermissionMode::ReadOnly),
+        "acceptEdits" | "auto" | "workspace-write" => Some(ResolvedPermissionMode::WorkspaceWrite),
+        "dontAsk" | "danger-full-access" => Some(ResolvedPermissionMode::DangerFullAccess),
+        _ => None,
+    }
 }
 
 fn parse_mcp_server_config(
@@ -616,7 +687,8 @@ fn deep_merge_objects(
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigLoader, ConfigSource, McpServerConfig, McpTransport, NANOCODE_SETTINGS_SCHEMA_NAME,
+        ConfigLoader, ConfigSource, McpServerConfig, McpTransport, ResolvedPermissionMode,
+        NANOCODE_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use std::fs;
@@ -684,6 +756,11 @@ mod tests {
             loaded.get("model"),
             Some(&JsonValue::String("opus".to_string()))
         );
+        assert_eq!(loaded.model(), Some("opus"));
+        assert_eq!(
+            loaded.permission_mode(),
+            Some(ResolvedPermissionMode::WorkspaceWrite)
+        );
         assert_eq!(
             loaded
                 .get("env")
@@ -697,6 +774,11 @@ mod tests {
             .and_then(JsonValue::as_object)
             .expect("hooks object")
             .contains_key("PreToolUse"));
+        assert!(loaded
+            .get("hooks")
+            .and_then(JsonValue::as_object)
+            .expect("hooks object")
+            .contains_key("PostToolUse"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -796,7 +878,7 @@ mod tests {
     fn rejects_invalid_mcp_server_shapes() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".claude");
+        let home = root.join("home").join(".nanocode");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(

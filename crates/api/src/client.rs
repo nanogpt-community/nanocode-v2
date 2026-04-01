@@ -20,12 +20,14 @@ const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_RETRIES: u32 = 2;
 
 fn nanogpt_client_debug_enabled() -> bool {
-    std::env::var("NANOGPT_CLIENT_DEBUG").ok().is_some_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on" | "debug"
-        )
-    })
+    std::env::var("NANOGPT_CLIENT_DEBUG")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on" | "debug"
+            )
+        })
 }
 
 #[derive(Debug, Clone)]

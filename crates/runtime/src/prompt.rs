@@ -201,6 +201,8 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
             dir.join("NANOCODE.md"),
             dir.join("NANOCODE.local.md"),
             dir.join(".nanocode").join("NANOCODE.md"),
+            dir.join("CLAUDE.md"),
+            dir.join("CLAUDE.local.md"),
         ] {
             push_context_file(&mut files, candidate)?;
         }
@@ -455,7 +457,7 @@ mod tests {
         render_instruction_content, render_instruction_files, truncate_instruction_content,
         ContextFile, ProjectContext, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
-    use crate::config::ConfigLoader;
+    use crate::{test_env_lock, ConfigLoader};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -479,6 +481,8 @@ mod tests {
         fs::create_dir_all(root.join("apps")).expect("apps dir");
         fs::write(root.join("apps").join("NANOCODE.md"), "apps instructions")
             .expect("write apps instructions");
+        fs::write(root.join("apps").join("CLAUDE.md"), "compat instructions")
+            .expect("write compat instructions");
         fs::write(nested.join(".nanocode").join("NANOCODE.md"), "nested rules")
             .expect("write nested rules");
 
@@ -495,6 +499,7 @@ mod tests {
                 "root instructions",
                 "local instructions",
                 "apps instructions",
+                "compat instructions",
                 "nested rules"
             ]
         );
@@ -565,17 +570,32 @@ mod tests {
 
     #[test]
     fn load_system_prompt_reads_nanocode_files_and_config() {
+        let _guard = test_env_lock();
         let root = temp_dir();
         fs::create_dir_all(root.join(".nanocode")).expect("nanocode dir");
+        let home = root.join("home");
+        let nanocode_home = home.join(".nanocode");
+        fs::create_dir_all(&nanocode_home).expect("nanocode home");
         fs::write(root.join("NANOCODE.md"), "Project rules").expect("write instructions");
+        fs::write(root.join("CLAUDE.md"), "Compat instructions")
+            .expect("write compat instructions");
         fs::write(
             root.join(".nanocode").join("settings.json"),
             r#"{"permissionMode":"acceptEdits"}"#,
         )
         .expect("write settings");
+        fs::write(
+            nanocode_home.join("settings.json"),
+            r#"{"model":"zai-org/glm-5.1"}"#,
+        )
+        .expect("write home settings");
 
         let previous = std::env::current_dir().expect("cwd");
+        let previous_home = std::env::var_os("HOME");
+        let previous_nanocode_home = std::env::var_os("NANOCODE_CONFIG_HOME");
         std::env::set_current_dir(&root).expect("change cwd");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("NANOCODE_CONFIG_HOME");
         let prompt = super::load_system_prompt(&root, "2026-03-31", "linux", "6.8")
             .expect("system prompt should load")
             .join(
@@ -584,9 +604,21 @@ mod tests {
 ",
             );
         std::env::set_current_dir(previous).expect("restore cwd");
+        if let Some(value) = previous_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = previous_nanocode_home {
+            std::env::set_var("NANOCODE_CONFIG_HOME", value);
+        } else {
+            std::env::remove_var("NANOCODE_CONFIG_HOME");
+        }
 
         assert!(prompt.contains("Project rules"));
+        assert!(prompt.contains("Compat instructions"));
         assert!(prompt.contains("permissionMode"));
+        assert!(prompt.contains("zai-org/glm-5.1"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
@@ -640,5 +672,28 @@ mod tests {
         assert!(rendered.contains("# NanoCode instructions"));
         assert!(rendered.contains("scope: /tmp/project"));
         assert!(rendered.contains("Project rules"));
+    }
+
+    #[test]
+    fn discovers_claude_instruction_compat_files() {
+        let root = temp_dir();
+        let nested = root.join("apps").join("api");
+        fs::create_dir_all(&nested).expect("nested dir");
+        fs::write(root.join("CLAUDE.md"), "root compat rules").expect("write compat root");
+        fs::write(nested.join("CLAUDE.local.md"), "nested compat instructions")
+            .expect("write nested compat instructions");
+
+        let context = ProjectContext::discover(&nested, "2026-03-31").expect("context should load");
+        let contents = context
+            .instruction_files
+            .iter()
+            .map(|file| file.content.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            contents,
+            vec!["root compat rules", "nested compat instructions"]
+        );
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 }

@@ -566,7 +566,10 @@ mod tests {
         input.move_left();
         input.move_left();
         let rendered = render_buffer("› ", "> ", &input, 80);
-        assert_eq!(rendered.lines(), &["› hello".to_string(), "> world".to_string()]);
+        assert_eq!(
+            rendered.lines(),
+            &["› hello".to_string(), "> world".to_string()]
+        );
         assert_eq!(rendered.cursor_position(), (1, 5));
     }
 
