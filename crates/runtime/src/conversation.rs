@@ -416,6 +416,7 @@ mod tests {
                 current_date: "2026-03-31".to_string(),
                 git_status: None,
                 instruction_files: Vec::new(),
+                memory_files: Vec::new(),
             })
             .with_os("linux", "6.8")
             .build();
@@ -548,6 +549,18 @@ mod tests {
 
     #[test]
     fn compacts_session_after_turns() {
+        let _guard = crate::test_env_lock();
+        let temp = std::env::temp_dir().join(format!(
+            "runtime-conversation-compact-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp).expect("temp dir");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&temp).expect("set cwd");
+
         struct SimpleApi;
         impl ApiClient for SimpleApi {
             fn stream(
@@ -581,5 +594,8 @@ mod tests {
             result.compacted_session.messages[0].role,
             MessageRole::System
         );
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 }

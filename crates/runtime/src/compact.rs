@@ -1,3 +1,6 @@
+use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +93,7 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
     let preserved = session.messages[keep_from..].to_vec();
     let summary = summarize_messages(removed);
     let formatted_summary = format_compact_summary(&summary);
+    persist_compact_summary(&formatted_summary);
     let continuation = get_compact_continuation_message(&summary, true, !preserved.is_empty());
 
     let mut compacted_messages = vec![ConversationMessage {
@@ -108,6 +112,35 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         },
         removed_message_count: removed.len(),
     }
+}
+
+fn persist_compact_summary(formatted_summary: &str) {
+    if formatted_summary.trim().is_empty() {
+        return;
+    }
+
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let memory_dir = cwd.join(".nanocode").join("memory");
+    if fs::create_dir_all(&memory_dir).is_err() {
+        return;
+    }
+
+    let path = memory_dir.join(compact_summary_filename());
+    let _ = fs::write(path, render_memory_file(formatted_summary));
+}
+
+fn compact_summary_filename() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("summary-{timestamp}.md")
+}
+
+fn render_memory_file(formatted_summary: &str) -> String {
+    format!("# Project memory\n\n{}\n", formatted_summary.trim())
 }
 
 fn summarize_messages(messages: &[ConversationMessage]) -> String {
@@ -378,14 +411,20 @@ fn collapse_blank_lines(content: &str) -> String {
 mod tests {
     use super::{
         collect_key_files, compact_session, estimate_session_tokens, format_compact_summary,
-        infer_pending_work, should_compact, CompactionConfig,
+        infer_pending_work, render_memory_file, should_compact, CompactionConfig,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn formats_compact_summary_like_upstream() {
         let summary = "<analysis>scratch</analysis>\n<summary>Kept work</summary>";
         assert_eq!(format_compact_summary(summary), "Summary:\nKept work");
+        assert_eq!(
+            render_memory_file("Summary:\nKept work"),
+            "# Project memory\n\nSummary:\nKept work\n"
+        );
     }
 
     #[test]
@@ -403,7 +442,76 @@ mod tests {
     }
 
     #[test]
+    fn persists_compacted_summaries_under_dot_nanocode_memory() {
+        let _guard = crate::test_env_lock();
+        let temp = std::env::temp_dir().join(format!(
+            "runtime-compact-memory-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("temp dir");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&temp).expect("set cwd");
+
+        let session = Session {
+            version: 1,
+            messages: vec![
+                ConversationMessage::user_text("one ".repeat(200)),
+                ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "two ".repeat(200),
+                }]),
+                ConversationMessage::tool_result("1", "bash", "ok ".repeat(200), false),
+                ConversationMessage {
+                    role: MessageRole::Assistant,
+                    blocks: vec![ContentBlock::Text {
+                        text: "recent".to_string(),
+                    }],
+                    usage: None,
+                },
+            ],
+        };
+
+        let result = compact_session(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 1,
+            },
+        );
+        let memory_dir = temp.join(".nanocode").join("memory");
+        let files = fs::read_dir(&memory_dir)
+            .expect("memory dir exists")
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+
+        assert_eq!(result.removed_message_count, 2);
+        assert_eq!(files.len(), 1);
+        let persisted = fs::read_to_string(&files[0]).expect("memory file readable");
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        fs::remove_dir_all(temp).expect("cleanup temp dir");
+
+        assert!(persisted.contains("# Project memory"));
+        assert!(persisted.contains("Summary:"));
+    }
+
+    #[test]
     fn compacts_older_messages_into_a_system_summary() {
+        let _guard = crate::test_env_lock();
+        let temp = std::env::temp_dir().join(format!(
+            "runtime-compact-session-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("temp dir");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&temp).expect("set cwd");
+
         let session = Session {
             version: 1,
             messages: vec![
@@ -451,6 +559,9 @@ mod tests {
         assert!(
             estimate_session_tokens(&result.compacted_session) < estimate_session_tokens(&session)
         );
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
     #[test]

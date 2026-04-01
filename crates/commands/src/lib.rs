@@ -95,19 +95,19 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "config",
-        summary: "Inspect Claude config files or merged sections",
+        summary: "Inspect NanoCode config files or merged sections",
         argument_hint: Some("[env|hooks|model]"),
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "memory",
-        summary: "Inspect loaded Claude instruction memory files",
+        summary: "Inspect loaded NanoCode instruction memory files",
         argument_hint: None,
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "init",
-        summary: "Create a starter CLAUDE.md for this repo",
+        summary: "Create a starter NANOCODE.md for this repo",
         argument_hint: None,
         resume_supported: true,
     },
@@ -406,6 +406,17 @@ mod tests {
 
     #[test]
     fn compacts_sessions_via_slash_command() {
+        let root = std::env::temp_dir().join(format!(
+            "commands-compact-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp dir");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
         let session = Session {
             version: 1,
             messages: vec![
@@ -429,6 +440,9 @@ mod tests {
             },
         )
         .expect("slash command should be handled");
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(root);
 
         assert!(result.message.contains("Compacted 2 messages"));
         assert_eq!(result.session.messages[0].role, MessageRole::System);

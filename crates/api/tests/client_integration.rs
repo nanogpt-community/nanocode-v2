@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api::{
-    ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, InputContentBlock,
-    InputMessage, MessageDeltaEvent, MessageRequest, NanoGptClient, OutputContentBlock,
-    StreamEvent, ToolChoice, ToolDefinition,
+    ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ImageSource,
+    InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest, NanoGptClient,
+    OutputContentBlock, StreamEvent, ToolChoice, ToolDefinition,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -71,6 +71,39 @@ async fn send_message_posts_json_and_parses_response() {
     assert!(body.get("stream").is_none());
     assert_eq!(body["tools"][0]["name"], json!("get_weather"));
     assert_eq!(body["tool_choice"]["type"], json!("auto"));
+}
+
+#[test]
+fn image_content_blocks_serialize_with_base64_source() {
+    let request = MessageRequest {
+        model: "openai/gpt-5.2".to_string(),
+        max_tokens: 64,
+        messages: vec![InputMessage {
+            role: "user".to_string(),
+            content: vec![InputContentBlock::Image {
+                source: ImageSource {
+                    kind: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "AQID".to_string(),
+                },
+            }],
+        }],
+        system: None,
+        tools: None,
+        tool_choice: None,
+        stream: false,
+    };
+
+    let json = serde_json::to_value(request).expect("request should serialize");
+    assert_eq!(json["messages"][0]["content"][0]["type"], json!("image"));
+    assert_eq!(
+        json["messages"][0]["content"][0]["source"],
+        json!({
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "AQID"
+        })
+    );
 }
 
 #[tokio::test]

@@ -51,6 +51,7 @@ pub struct ProjectContext {
     pub current_date: String,
     pub git_status: Option<String>,
     pub instruction_files: Vec<ContextFile>,
+    pub memory_files: Vec<ContextFile>,
 }
 
 impl ProjectContext {
@@ -60,11 +61,13 @@ impl ProjectContext {
     ) -> std::io::Result<Self> {
         let cwd = cwd.into();
         let instruction_files = discover_instruction_files(&cwd)?;
+        let memory_files = discover_memory_files(&cwd)?;
         Ok(Self {
             cwd,
             current_date: current_date.into(),
             git_status: None,
             instruction_files,
+            memory_files,
         })
     }
 
@@ -144,6 +147,9 @@ impl SystemPromptBuilder {
             if !project_context.instruction_files.is_empty() {
                 sections.push(render_instruction_files(&project_context.instruction_files));
             }
+            if !project_context.memory_files.is_empty() {
+                sections.push(render_memory_files(&project_context.memory_files));
+            }
         }
         if let Some(config) = &self.config {
             sections.push(render_config_section(config));
@@ -186,7 +192,7 @@ pub fn prepend_bullets(items: Vec<String>) -> Vec<String> {
     items.into_iter().map(|item| format!(" - {item}")).collect()
 }
 
-fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
+fn discover_context_directories(cwd: &Path) -> Vec<PathBuf> {
     let mut directories = Vec::new();
     let mut cursor = Some(cwd);
     while let Some(dir) = cursor {
@@ -194,7 +200,11 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
         cursor = dir.parent();
     }
     directories.reverse();
+    directories
+}
 
+fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
+    let directories = discover_context_directories(cwd);
     let mut files = Vec::new();
     for dir in directories {
         for candidate in [
@@ -205,6 +215,26 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
             dir.join("CLAUDE.local.md"),
         ] {
             push_context_file(&mut files, candidate)?;
+        }
+    }
+    Ok(dedupe_instruction_files(files))
+}
+
+fn discover_memory_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
+    let mut files = Vec::new();
+    for dir in discover_context_directories(cwd) {
+        let memory_dir = dir.join(".nanocode").join("memory");
+        let Ok(entries) = fs::read_dir(&memory_dir) else {
+            continue;
+        };
+        let mut paths = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect::<Vec<_>>();
+        paths.sort();
+        for path in paths {
+            push_context_file(&mut files, path)?;
         }
     }
     Ok(dedupe_instruction_files(files))
@@ -252,6 +282,12 @@ fn render_project_context(project_context: &ProjectContext) -> String {
             project_context.instruction_files.len()
         ));
     }
+    if !project_context.memory_files.is_empty() {
+        bullets.push(format!(
+            "Project memory files discovered: {}.",
+            project_context.memory_files.len()
+        ));
+    }
     lines.extend(prepend_bullets(bullets));
     if let Some(status) = &project_context.git_status {
         lines.push(String::new());
@@ -262,7 +298,15 @@ fn render_project_context(project_context: &ProjectContext) -> String {
 }
 
 fn render_instruction_files(files: &[ContextFile]) -> String {
-    let mut sections = vec!["# NanoCode instructions".to_string()];
+    render_context_file_section("# NanoCode instructions", files)
+}
+
+fn render_memory_files(files: &[ContextFile]) -> String {
+    render_context_file_section("# Project memory", files)
+}
+
+fn render_context_file_section(title: &str, files: &[ContextFile]) -> String {
+    let mut sections = vec![title.to_string()];
     let mut remaining_chars = MAX_TOTAL_INSTRUCTION_CHARS;
     for file in files {
         if remaining_chars == 0 {
@@ -454,8 +498,9 @@ fn get_actions_section() -> String {
 mod tests {
     use super::{
         collapse_blank_lines, display_context_path, normalize_instruction_content,
-        render_instruction_content, render_instruction_files, truncate_instruction_content,
-        ContextFile, ProjectContext, SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        render_instruction_content, render_instruction_files, render_memory_files,
+        truncate_instruction_content, ContextFile, ProjectContext, SystemPromptBuilder,
+        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::{test_env_lock, ConfigLoader};
     use std::fs;
@@ -520,6 +565,38 @@ mod tests {
             normalize_instruction_content(&context.instruction_files[0].content),
             "same rules"
         );
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn discovers_project_memory_files_from_ancestor_chain() {
+        let root = temp_dir();
+        let nested = root.join("apps").join("api");
+        fs::create_dir_all(root.join(".nanocode").join("memory")).expect("root memory dir");
+        fs::create_dir_all(nested.join(".nanocode").join("memory")).expect("nested memory dir");
+        fs::write(
+            root.join(".nanocode").join("memory").join("2026-03-30.md"),
+            "root memory",
+        )
+        .expect("write root memory");
+        fs::write(
+            nested
+                .join(".nanocode")
+                .join("memory")
+                .join("2026-03-31.md"),
+            "nested memory",
+        )
+        .expect("write nested memory");
+
+        let context = ProjectContext::discover(&nested, "2026-03-31").expect("context should load");
+        let contents = context
+            .memory_files
+            .iter()
+            .map(|file| file.content.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(contents, vec!["root memory", "nested memory"]);
+        assert!(render_memory_files(&context.memory_files).contains("# Project memory"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 

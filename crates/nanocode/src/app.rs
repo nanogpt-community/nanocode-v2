@@ -2,15 +2,17 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use api::{
     resolve_api_key as resolve_nanogpt_api_key, ApiError, ChatCompletionAssistantMessage,
     ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse, ChatCompletionTool,
-    ChatCompletionToolChoice, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, NanoGptClient, OutputContentBlock, StreamEvent as ApiStreamEvent, ToolChoice,
-    ToolDefinition, ToolResultContentBlock,
+    ChatCompletionToolChoice, ContentBlockDelta, ImageSource, InputContentBlock, InputMessage,
+    MessageRequest, MessageResponse, NanoGptClient, OutputContentBlock,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -49,6 +51,7 @@ const MAX_TOOL_PREVIEW_CHARS: usize = 4_000;
 const MAX_TOOL_PREVIEW_LINES: usize = 48;
 const MCP_DISCOVERY_TIMEOUT_SECS: u64 = 30;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const IMAGE_REF_PREFIX: &str = "@";
 
 type AllowedToolSet = BTreeSet<String>;
 
@@ -62,6 +65,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Provider { provider } => handle_provider_action(provider)?,
         CliAction::Proxy { mode } => handle_proxy_action(mode)?,
         CliAction::Mcp { action } => handle_mcp_action(action)?,
+        CliAction::Doctor => run_doctor()?,
         CliAction::ResumeSession {
             session_path,
             command,
@@ -104,6 +108,7 @@ enum CliAction {
     Mcp {
         action: McpCommand,
     },
+    Doctor,
     ResumeSession {
         session_path: PathBuf,
         command: Option<String>,
@@ -240,6 +245,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "provider" | "providers" => parse_provider_args(&rest[1..]),
         "proxy" => parse_proxy_args(&rest[1..]),
         "mcp" => parse_mcp_args(&rest[1..]),
+        "doctor" => Ok(CliAction::Doctor),
         "prompt" => {
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
@@ -1988,7 +1994,7 @@ impl ApiClient for NanoCodeRuntimeClient {
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: self.max_output_tokens,
-            messages: convert_messages(&request.messages),
+            messages: convert_messages(&request.messages)?,
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: self.enable_tools.then(|| {
                 self.tool_specs
@@ -2906,7 +2912,10 @@ fn permission_policy(mode: PermissionMode, tool_specs: &[RuntimeToolSpec]) -> Pe
         })
 }
 
-fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
+fn convert_messages(messages: &[ConversationMessage]) -> Result<Vec<InputMessage>, RuntimeError> {
+    let cwd = env::current_dir().map_err(|error| {
+        RuntimeError::new(format!("failed to resolve current directory: {error}"))
+    })?;
     messages
         .iter()
         .filter_map(|message| {
@@ -2917,34 +2926,221 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: serde_json::from_str(input)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        output,
-                        is_error,
-                        ..
-                    } => InputContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
-                        is_error: *is_error,
-                    },
-                })
-                .collect::<Vec<_>>();
-            (!content.is_empty()).then(|| InputMessage {
-                role: role.to_string(),
-                content,
-            })
+                .try_fold(Vec::new(), |mut acc, block| {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            if message.role == MessageRole::User {
+                                acc.extend(
+                                    prompt_to_content_blocks(text, &cwd)
+                                        .map_err(RuntimeError::new)?,
+                                );
+                            } else {
+                                acc.push(InputContentBlock::Text { text: text.clone() });
+                            }
+                        }
+                        ContentBlock::ToolUse { id, name, input } => {
+                            acc.push(InputContentBlock::ToolUse {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: serde_json::from_str(input)
+                                    .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+                            })
+                        }
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            output,
+                            is_error,
+                            ..
+                        } => acc.push(InputContentBlock::ToolResult {
+                            tool_use_id: tool_use_id.clone(),
+                            content: vec![ToolResultContentBlock::Text {
+                                text: output.clone(),
+                            }],
+                            is_error: *is_error,
+                        }),
+                    }
+                    Ok::<_, RuntimeError>(acc)
+                });
+            match content {
+                Ok(content) if !content.is_empty() => Some(Ok(InputMessage {
+                    role: role.to_string(),
+                    content,
+                })),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            }
         })
         .collect()
+}
+
+fn prompt_to_content_blocks(input: &str, cwd: &Path) -> Result<Vec<InputContentBlock>, String> {
+    let mut blocks = Vec::new();
+    let mut text_buffer = String::new();
+    let mut chars = input.char_indices().peekable();
+
+    while let Some((index, ch)) = chars.next() {
+        if ch == '!' && input[index..].starts_with("![") {
+            if let Some((_, path_start, path_end)) = parse_markdown_image_ref(input, index) {
+                flush_text_block(&mut blocks, &mut text_buffer);
+                let path = &input[path_start..path_end];
+                blocks.push(load_image_block(path, cwd)?);
+                while let Some((next_index, _)) = chars.peek() {
+                    if *next_index < path_end + 1 {
+                        let _ = chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+
+        if ch == '@' && is_ref_boundary(input[..index].chars().next_back()) {
+            let path_end = find_path_end(input, index + 1);
+            if path_end > index + 1 {
+                let candidate = &input[index + 1..path_end];
+                if looks_like_image_ref(candidate, cwd) {
+                    flush_text_block(&mut blocks, &mut text_buffer);
+                    blocks.push(load_image_block(candidate, cwd)?);
+                    while let Some((next_index, _)) = chars.peek() {
+                        if *next_index < path_end {
+                            let _ = chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+
+        text_buffer.push(ch);
+    }
+
+    flush_text_block(&mut blocks, &mut text_buffer);
+    if blocks.is_empty() {
+        blocks.push(InputContentBlock::Text {
+            text: input.to_string(),
+        });
+    }
+    Ok(blocks)
+}
+
+fn parse_markdown_image_ref(input: &str, start: usize) -> Option<(usize, usize, usize)> {
+    let after_bang = input.get(start + 2..)?;
+    let alt_end_offset = after_bang.find("](")?;
+    let path_start = start + 2 + alt_end_offset + 2;
+    let remainder = input.get(path_start..)?;
+    let path_end_offset = remainder.find(')')?;
+    let path_end = path_start + path_end_offset;
+    Some((start + 2 + alt_end_offset, path_start, path_end))
+}
+
+fn is_ref_boundary(ch: Option<char>) -> bool {
+    ch.is_none_or(char::is_whitespace)
+}
+
+fn find_path_end(input: &str, start: usize) -> usize {
+    input[start..]
+        .char_indices()
+        .find_map(|(offset, ch)| ch.is_whitespace().then_some(start + offset))
+        .unwrap_or(input.len())
+}
+
+fn looks_like_image_ref(candidate: &str, cwd: &Path) -> bool {
+    let resolved = resolve_prompt_path(candidate, cwd);
+    media_type_for_path(Path::new(candidate)).is_some()
+        || resolved.is_file()
+        || candidate.contains(std::path::MAIN_SEPARATOR)
+        || candidate.starts_with("./")
+        || candidate.starts_with("../")
+}
+
+fn flush_text_block(blocks: &mut Vec<InputContentBlock>, text_buffer: &mut String) {
+    if text_buffer.is_empty() {
+        return;
+    }
+    blocks.push(InputContentBlock::Text {
+        text: std::mem::take(text_buffer),
+    });
+}
+
+fn load_image_block(path_ref: &str, cwd: &Path) -> Result<InputContentBlock, String> {
+    let resolved = resolve_prompt_path(path_ref, cwd);
+    let media_type = media_type_for_path(&resolved).ok_or_else(|| {
+        format!(
+            "unsupported image format for reference {IMAGE_REF_PREFIX}{path_ref}; supported: png, jpg, jpeg, gif, webp"
+        )
+    })?;
+    let bytes = fs::read(&resolved).map_err(|error| {
+        format!(
+            "failed to read image reference {}: {error}",
+            resolved.display()
+        )
+    })?;
+    Ok(InputContentBlock::Image {
+        source: ImageSource {
+            kind: "base64".to_string(),
+            media_type: media_type.to_string(),
+            data: encode_base64(&bytes),
+        },
+    })
+}
+
+fn resolve_prompt_path(path_ref: &str, cwd: &Path) -> PathBuf {
+    let path = Path::new(path_ref);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn media_type_for_path(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::new();
+    let mut index = 0;
+    while index + 3 <= bytes.len() {
+        let block = (u32::from(bytes[index]) << 16)
+            | (u32::from(bytes[index + 1]) << 8)
+            | u32::from(bytes[index + 2]);
+        output.push(TABLE[((block >> 18) & 0x3F) as usize] as char);
+        output.push(TABLE[((block >> 12) & 0x3F) as usize] as char);
+        output.push(TABLE[((block >> 6) & 0x3F) as usize] as char);
+        output.push(TABLE[(block & 0x3F) as usize] as char);
+        index += 3;
+    }
+
+    match bytes.len().saturating_sub(index) {
+        1 => {
+            let block = u32::from(bytes[index]) << 16;
+            output.push(TABLE[((block >> 18) & 0x3F) as usize] as char);
+            output.push(TABLE[((block >> 12) & 0x3F) as usize] as char);
+            output.push('=');
+            output.push('=');
+        }
+        2 => {
+            let block = (u32::from(bytes[index]) << 16) | (u32::from(bytes[index + 1]) << 8);
+            output.push(TABLE[((block >> 18) & 0x3F) as usize] as char);
+            output.push(TABLE[((block >> 12) & 0x3F) as usize] as char);
+            output.push(TABLE[((block >> 6) & 0x3F) as usize] as char);
+            output.push('=');
+        }
+        _ => {}
+    }
+
+    output
 }
 
 fn convert_proxy_messages_to_input_messages(messages: Vec<ProxyMessage>) -> Vec<InputMessage> {
@@ -3097,6 +3293,7 @@ fn print_help() {
     println!(
         "  nanocode mcp [status|tools|reload]          Inspect configured MCP servers and tools"
     );
+    println!("  nanocode doctor                             Run local environment diagnostics");
     println!(
         "  nanocode [--model MODEL] [--permission-mode MODE] [--allowedTools TOOL[,TOOL...]] prompt TEXT"
     );
@@ -3115,25 +3312,453 @@ fn print_version() {
     println!("{VERSION}");
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticLevel {
+    Ok,
+    Warn,
+    Fail,
+}
+
+impl DiagnosticLevel {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "OK",
+            Self::Warn => "WARN",
+            Self::Fail => "FAIL",
+        }
+    }
+
+    const fn is_failure(self) -> bool {
+        matches!(self, Self::Fail)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiagnosticCheck {
+    name: &'static str,
+    level: DiagnosticLevel,
+    summary: String,
+    details: Vec<String>,
+}
+
+impl DiagnosticCheck {
+    fn new(name: &'static str, level: DiagnosticLevel, summary: impl Into<String>) -> Self {
+        Self {
+            name,
+            level,
+            summary: summary.into(),
+            details: Vec::new(),
+        }
+    }
+
+    fn with_details(mut self, details: Vec<String>) -> Self {
+        self.details = details;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigFileCheck {
+    path: PathBuf,
+    exists: bool,
+    valid: bool,
+    note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorReport {
+    checks: Vec<DiagnosticCheck>,
+}
+
+impl DoctorReport {
+    fn has_failures(&self) -> bool {
+        self.checks.iter().any(|check| check.level.is_failure())
+    }
+
+    fn render(&self) -> String {
+        let mut lines = vec!["Doctor diagnostics".to_string()];
+        let ok_count = self
+            .checks
+            .iter()
+            .filter(|check| check.level == DiagnosticLevel::Ok)
+            .count();
+        let warn_count = self
+            .checks
+            .iter()
+            .filter(|check| check.level == DiagnosticLevel::Warn)
+            .count();
+        let fail_count = self
+            .checks
+            .iter()
+            .filter(|check| check.level == DiagnosticLevel::Fail)
+            .count();
+        lines.push(format!(
+            "Summary\n  OK               {ok_count}\n  Warnings         {warn_count}\n  Failures         {fail_count}"
+        ));
+        lines.extend(self.checks.iter().map(render_diagnostic_check));
+        lines.join("\n\n")
+    }
+}
+
+fn render_diagnostic_check(check: &DiagnosticCheck) -> String {
+    let mut section = vec![format!(
+        "{}\n  Status           {}\n  Summary          {}",
+        check.name,
+        check.level.label(),
+        check.summary
+    )];
+    if !check.details.is_empty() {
+        section.push("  Details".to_string());
+        section.extend(check.details.iter().map(|detail| format!("    - {detail}")));
+    }
+    section.join("\n")
+}
+
+fn run_doctor() -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let config_loader = ConfigLoader::default_for(&cwd);
+    let config = config_loader.load();
+    let report = DoctorReport {
+        checks: vec![
+            check_api_key_validity(),
+            check_config_files(&config_loader, config.as_ref()),
+            check_git_availability(&cwd),
+            check_mcp_server_health(&cwd),
+            check_network_connectivity(),
+            check_system_info(&cwd, config.as_ref().ok()),
+        ],
+    };
+    println!("{}", report.render());
+    if report.has_failures() {
+        return Err("doctor found failing checks".into());
+    }
+    Ok(())
+}
+
+fn check_api_key_validity() -> DiagnosticCheck {
+    let api_key = match resolve_nanogpt_api_key() {
+        Ok(value) => value,
+        Err(ApiError::MissingApiKey) => {
+            return DiagnosticCheck::new(
+                "API key validity",
+                DiagnosticLevel::Warn,
+                "no NanoGPT API key is configured",
+            );
+        }
+        Err(error) => {
+            return DiagnosticCheck::new(
+                "API key validity",
+                DiagnosticLevel::Fail,
+                format!("failed to resolve NanoGPT API key: {error}"),
+            );
+        }
+    };
+
+    let request = MessageRequest {
+        model: default_model_or(DEFAULT_MODEL),
+        max_tokens: 1,
+        messages: vec![InputMessage::user_text("Reply with OK.")],
+        system: None,
+        tools: None,
+        tool_choice: None,
+        stream: false,
+    };
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return DiagnosticCheck::new(
+                "API key validity",
+                DiagnosticLevel::Fail,
+                format!("failed to create async runtime: {error}"),
+            );
+        }
+    };
+
+    match runtime.block_on(NanoGptClient::new(api_key).send_message(&request)) {
+        Ok(response) => DiagnosticCheck::new(
+            "API key validity",
+            DiagnosticLevel::Ok,
+            "NanoGPT API accepted the configured API key",
+        )
+        .with_details(vec![format!(
+            "request_id={} input_tokens={} output_tokens={}",
+            response.request_id.unwrap_or_else(|| "<none>".to_string()),
+            response.usage.input_tokens,
+            response.usage.output_tokens
+        )]),
+        Err(ApiError::Api { status, .. }) if status == 401 || status == 403 => {
+            DiagnosticCheck::new(
+                "API key validity",
+                DiagnosticLevel::Fail,
+                format!("NanoGPT API rejected the API key with HTTP {status}"),
+            )
+        }
+        Err(error) => DiagnosticCheck::new(
+            "API key validity",
+            DiagnosticLevel::Warn,
+            format!("unable to conclusively validate the API key: {error}"),
+        ),
+    }
+}
+
+fn validate_config_file(path: &Path) -> ConfigFileCheck {
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            if contents.trim().is_empty() {
+                return ConfigFileCheck {
+                    path: path.to_path_buf(),
+                    exists: true,
+                    valid: true,
+                    note: "exists but is empty".to_string(),
+                };
+            }
+            match serde_json::from_str::<serde_json::Value>(&contents) {
+                Ok(serde_json::Value::Object(_)) => ConfigFileCheck {
+                    path: path.to_path_buf(),
+                    exists: true,
+                    valid: true,
+                    note: "valid JSON object".to_string(),
+                },
+                Ok(_) => ConfigFileCheck {
+                    path: path.to_path_buf(),
+                    exists: true,
+                    valid: false,
+                    note: "top-level JSON value is not an object".to_string(),
+                },
+                Err(error) => ConfigFileCheck {
+                    path: path.to_path_buf(),
+                    exists: true,
+                    valid: false,
+                    note: format!("invalid JSON: {error}"),
+                },
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => ConfigFileCheck {
+            path: path.to_path_buf(),
+            exists: false,
+            valid: true,
+            note: "not present".to_string(),
+        },
+        Err(error) => ConfigFileCheck {
+            path: path.to_path_buf(),
+            exists: true,
+            valid: false,
+            note: format!("unreadable: {error}"),
+        },
+    }
+}
+
+fn check_config_files(
+    config_loader: &ConfigLoader,
+    config: Result<&runtime::RuntimeConfig, &runtime::ConfigError>,
+) -> DiagnosticCheck {
+    let file_checks = config_loader
+        .discover()
+        .into_iter()
+        .map(|entry| validate_config_file(&entry.path))
+        .collect::<Vec<_>>();
+    let existing_count = file_checks.iter().filter(|check| check.exists).count();
+    let invalid_count = file_checks
+        .iter()
+        .filter(|check| check.exists && !check.valid)
+        .count();
+    let mut details = file_checks
+        .iter()
+        .map(|check| format!("{} => {}", check.path.display(), check.note))
+        .collect::<Vec<_>>();
+    match config {
+        Ok(runtime_config) => details.push(format!(
+            "merged load succeeded with {} loaded file(s)",
+            runtime_config.loaded_entries().len()
+        )),
+        Err(error) => details.push(format!("merged load failed: {error}")),
+    }
+    DiagnosticCheck::new(
+        "Config files",
+        if invalid_count > 0 || config.is_err() {
+            DiagnosticLevel::Fail
+        } else if existing_count == 0 {
+            DiagnosticLevel::Warn
+        } else {
+            DiagnosticLevel::Ok
+        },
+        format!(
+            "discovered {} candidate file(s), {} existing, {} invalid",
+            file_checks.len(),
+            existing_count,
+            invalid_count
+        ),
+    )
+    .with_details(details)
+}
+
+fn check_git_availability(cwd: &Path) -> DiagnosticCheck {
+    match Command::new("git").arg("--version").output() {
+        Ok(version_output) if version_output.status.success() => {
+            let version = String::from_utf8_lossy(&version_output.stdout)
+                .trim()
+                .to_string();
+            match Command::new("git")
+                .args(["rev-parse", "--show-toplevel"])
+                .current_dir(cwd)
+                .output()
+            {
+                Ok(root_output) if root_output.status.success() => DiagnosticCheck::new(
+                    "Git availability",
+                    DiagnosticLevel::Ok,
+                    "git is installed and the current directory is inside a repository",
+                )
+                .with_details(vec![
+                    version,
+                    format!(
+                        "repo_root={}",
+                        String::from_utf8_lossy(&root_output.stdout).trim()
+                    ),
+                ]),
+                Ok(_) => DiagnosticCheck::new(
+                    "Git availability",
+                    DiagnosticLevel::Warn,
+                    "git is installed but the current directory is not a repository",
+                )
+                .with_details(vec![version]),
+                Err(error) => DiagnosticCheck::new(
+                    "Git availability",
+                    DiagnosticLevel::Warn,
+                    format!("git is installed but repo detection failed: {error}"),
+                )
+                .with_details(vec![version]),
+            }
+        }
+        Ok(output) => DiagnosticCheck::new(
+            "Git availability",
+            DiagnosticLevel::Fail,
+            format!("git --version exited with status {}", output.status),
+        ),
+        Err(error) => DiagnosticCheck::new(
+            "Git availability",
+            DiagnosticLevel::Fail,
+            format!("failed to execute git: {error}"),
+        ),
+    }
+}
+
+fn check_mcp_server_health(cwd: &Path) -> DiagnosticCheck {
+    match load_mcp_catalog(cwd) {
+        Ok(catalog) if catalog.servers.is_empty() => DiagnosticCheck::new(
+            "MCP server health",
+            DiagnosticLevel::Warn,
+            "no MCP servers are configured",
+        ),
+        Ok(catalog) => {
+            let level = if catalog.servers.iter().any(|server| !server.loaded) {
+                DiagnosticLevel::Warn
+            } else {
+                DiagnosticLevel::Ok
+            };
+            DiagnosticCheck::new(
+                "MCP server health",
+                level,
+                format!("checked {} configured MCP server(s)", catalog.servers.len()),
+            )
+            .with_details(
+                catalog
+                    .servers
+                    .iter()
+                    .map(|server| {
+                        format!(
+                            "{} [{:?}] {} tool(s): {}",
+                            server.server_name, server.transport, server.tool_count, server.note
+                        )
+                    })
+                    .collect(),
+            )
+        }
+        Err(error) => DiagnosticCheck::new(
+            "MCP server health",
+            DiagnosticLevel::Fail,
+            format!("failed to inspect MCP servers: {error}"),
+        ),
+    }
+}
+
+fn check_network_connectivity() -> DiagnosticCheck {
+    let address = match ("nano-gpt.com", 443).to_socket_addrs() {
+        Ok(mut addrs) => match addrs.next() {
+            Some(addr) => addr,
+            None => {
+                return DiagnosticCheck::new(
+                    "Network connectivity",
+                    DiagnosticLevel::Fail,
+                    "DNS resolution returned no addresses for nano-gpt.com",
+                );
+            }
+        },
+        Err(error) => {
+            return DiagnosticCheck::new(
+                "Network connectivity",
+                DiagnosticLevel::Fail,
+                format!("failed to resolve nano-gpt.com: {error}"),
+            );
+        }
+    };
+    match TcpStream::connect_timeout(&address, Duration::from_secs(5)) {
+        Ok(stream) => {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            DiagnosticCheck::new(
+                "Network connectivity",
+                DiagnosticLevel::Ok,
+                format!("connected to {address}"),
+            )
+        }
+        Err(error) => DiagnosticCheck::new(
+            "Network connectivity",
+            DiagnosticLevel::Fail,
+            format!("failed to connect to {address}: {error}"),
+        ),
+    }
+}
+
+fn check_system_info(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
+    let mut details = vec![
+        format!("os={} arch={}", env::consts::OS, env::consts::ARCH),
+        format!("cwd={}", cwd.display()),
+        format!("cli_version={VERSION}"),
+    ];
+    if let Some(config) = config {
+        details.push(format!(
+            "resolved_model={} loaded_config_files={}",
+            config.model().unwrap_or(DEFAULT_MODEL),
+            config.loaded_entries().len()
+        ));
+    }
+    DiagnosticCheck::new(
+        "System info",
+        DiagnosticLevel::Ok,
+        "captured local runtime and build metadata",
+    )
+    .with_details(details)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         append_proxy_text_events, available_runtime_tool_specs, extract_first_json_object,
         filter_runtime_tool_specs, parse_args, parse_auth_command, parse_mcp_command,
         parse_model_command, parse_provider_command, parse_proxy_command, parse_tool_input_value,
-        proxy_chat_completion_response_to_events, proxy_response_to_events,
-        render_tool_result_markdown, should_retry_proxy_tool_prompt, AssistantEvent, CliAction,
-        McpCatalog, McpCommand, RuntimeToolSpec, DEFAULT_MODEL,
+        prompt_to_content_blocks, proxy_chat_completion_response_to_events,
+        proxy_response_to_events, render_tool_result_markdown, should_retry_proxy_tool_prompt,
+        AssistantEvent, CliAction, McpCatalog, McpCommand, RuntimeToolSpec, DEFAULT_MODEL,
     };
     use crate::proxy::ProxyCommand;
     use api::{
         ChatCompletionAssistantMessage, ChatCompletionChoice, ChatCompletionFunctionCall,
-        ChatCompletionResponse, ChatCompletionToolCall, ChatCompletionUsage, MessageResponse,
-        OutputContentBlock, Usage,
+        ChatCompletionResponse, ChatCompletionToolCall, ChatCompletionUsage, InputContentBlock,
+        MessageResponse, OutputContentBlock, Usage,
     };
     use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode};
     use serde_json::json;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3478,10 +4103,109 @@ mod tests {
             },
         ];
 
-        let converted = super::convert_messages(&messages);
+        let converted = super::convert_messages(&messages).expect("messages should convert");
         assert_eq!(converted.len(), 3);
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
+    }
+
+    #[test]
+    fn prompt_to_content_blocks_keeps_text_only_prompt() {
+        let blocks = prompt_to_content_blocks("hello world", Path::new("."))
+            .expect("text prompt should parse");
+        assert_eq!(
+            blocks,
+            vec![InputContentBlock::Text {
+                text: "hello world".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn prompt_to_content_blocks_embeds_at_image_refs() {
+        let temp = temp_fixture_dir("at-image-ref");
+        let image_path = temp.join("sample.png");
+        std::fs::write(&image_path, [1_u8, 2, 3]).expect("fixture write");
+        let prompt = format!("describe @{} please", image_path.display());
+
+        let blocks =
+            prompt_to_content_blocks(&prompt, Path::new(".")).expect("image ref should parse");
+
+        assert!(matches!(
+            &blocks[0],
+            InputContentBlock::Text { text } if text == "describe "
+        ));
+        assert!(matches!(
+            &blocks[1],
+            InputContentBlock::Image { source }
+                if source.kind == "base64"
+                    && source.media_type == "image/png"
+                    && source.data == "AQID"
+        ));
+        assert!(matches!(
+            &blocks[2],
+            InputContentBlock::Text { text } if text == " please"
+        ));
+    }
+
+    #[test]
+    fn prompt_to_content_blocks_embeds_markdown_image_refs() {
+        let temp = temp_fixture_dir("markdown-image-ref");
+        let image_path = temp.join("sample.webp");
+        std::fs::write(&image_path, [255_u8]).expect("fixture write");
+        let prompt = format!("see ![asset]({}) now", image_path.display());
+
+        let blocks = prompt_to_content_blocks(&prompt, Path::new("."))
+            .expect("markdown image ref should parse");
+
+        assert!(matches!(
+            &blocks[1],
+            InputContentBlock::Image { source }
+                if source.media_type == "image/webp" && source.data == "/w=="
+        ));
+    }
+
+    #[test]
+    fn prompt_to_content_blocks_rejects_unsupported_formats() {
+        let temp = temp_fixture_dir("unsupported-image-ref");
+        let image_path = temp.join("sample.bmp");
+        std::fs::write(&image_path, [1_u8]).expect("fixture write");
+        let prompt = format!("describe @{}", image_path.display());
+
+        let error = prompt_to_content_blocks(&prompt, Path::new("."))
+            .expect_err("unsupported image ref should fail");
+
+        assert!(error.contains("unsupported image format"));
+    }
+
+    #[test]
+    fn convert_messages_expands_user_text_image_refs() {
+        let temp = temp_fixture_dir("convert-message-image-ref");
+        let image_path = temp.join("sample.gif");
+        std::fs::write(&image_path, [71_u8, 73, 70]).expect("fixture write");
+        let messages = vec![ConversationMessage::user_text(format!(
+            "inspect @{}",
+            image_path.display()
+        ))];
+
+        let converted = super::convert_messages(&messages).expect("messages should convert");
+
+        assert_eq!(converted.len(), 1);
+        assert!(matches!(
+            &converted[0].content[1],
+            InputContentBlock::Image { source }
+                if source.media_type == "image/gif" && source.data == "R0lG"
+        ));
+    }
+
+    fn temp_fixture_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should advance")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("nanocode-{label}-{unique}"));
+        std::fs::create_dir_all(&path).expect("temp dir should exist");
+        path
     }
 
     #[test]
