@@ -16,7 +16,6 @@ NanoCode v2 is a rust based agentic coding harness for the nanogpt API
 ## Build
 
 ```bash
-cd rust
 cargo build --release -p nanocode
 ```
 
@@ -42,21 +41,18 @@ The CLI reads:
 ### Show help
 
 ```bash
-cd rust
 cargo run -p nanocode -- --help
 ```
 
 ### Print version
 
 ```bash
-cd rust
 cargo run -p nanocode -- --version
 ```
 
 ### Restrict enabled tools
 
 ```bash
-cd rust
 cargo run -p nanocode -- --allowedTools read,glob prompt "Summarize Cargo.toml"
 ```
 
