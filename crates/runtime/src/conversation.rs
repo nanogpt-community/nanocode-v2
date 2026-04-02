@@ -404,14 +404,12 @@ where
 
                         ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
                     }
-                    PermissionOutcome::Deny { reason } => {
-                        ConversationMessage::tool_result(
-                            tool_use_id,
-                            tool_name,
-                            merge_hook_feedback(pre_hook_result.messages(), reason, true),
-                            true,
-                        )
-                    }
+                    PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
+                        tool_use_id,
+                        tool_name,
+                        merge_hook_feedback(pre_hook_result.messages(), reason, true),
+                        true,
+                    ),
                 };
                 self.session.messages.push(result_message.clone());
                 tool_results.push(result_message);
@@ -989,9 +987,8 @@ mod tests {
         let mut runtime = ConversationRuntime::new_with_features(
             Session::new(),
             TwoCallApiClient { calls: 0 },
-            StaticToolExecutor::new().register("explode", |_input| {
-                Err(super::ToolError::new("kaboom"))
-            }),
+            StaticToolExecutor::new()
+                .register("explode", |_input| Err(super::ToolError::new("kaboom"))),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
             RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(

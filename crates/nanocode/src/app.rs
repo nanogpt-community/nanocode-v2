@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -9,12 +9,14 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use api::{
-    resolve_api_key as resolve_nanogpt_api_key, ApiError, ContentBlockDelta, ImageSource,
-    InputContentBlock, InputMessage, MessageRequest, MessageResponse, NanoGptClient,
-    OutputContentBlock, StreamEvent as ApiStreamEvent, ThinkingConfig, ToolChoice,
-    ToolDefinition, ToolResultContentBlock,
+    resolve_api_key as resolve_nanogpt_api_key, resolve_api_key_for, resolve_base_url_for,
+    ApiError, ApiService, ContentBlockDelta, ImageSource, InputContentBlock, InputMessage,
+    MessageRequest, MessageResponse, NanoGptClient, OutputContentBlock,
+    StreamEvent as ApiStreamEvent, ThinkingConfig, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::style::{Color, Stylize};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use plugins::{PluginError, PluginManager, PluginSummary};
 use reqwest::blocking::Client as BlockingClient;
@@ -26,16 +28,20 @@ use sha2::{Digest, Sha256};
 use crate::init::initialize_repo;
 use crate::input;
 use crate::models::{
-    default_model_or, max_output_tokens_for_model_or, open_model_picker, open_provider_picker,
-    persist_current_model, persist_provider_for_model, persist_proxy_tool_calls,
-    provider_for_model, proxy_tool_calls_enabled, validate_provider_for_model,
+    current_service_or_default, default_model_or, infer_service_for_model,
+    max_output_tokens_for_model_or, open_model_picker, open_provider_picker, persist_current_model,
+    persist_provider_for_model, persist_proxy_tool_calls, provider_for_model,
+    proxy_tool_calls_enabled, validate_provider_for_model,
 };
 use crate::proxy::{
     build_proxy_system_prompt, convert_messages_for_proxy, parse_proxy_response, parse_proxy_value,
     ProxyCommand, ProxyMessage, ProxySegment, RuntimeToolSpec,
 };
 use crate::render::{MarkdownStreamState, Spinner, TerminalRenderer};
-use commands::{render_slash_command_help, slash_command_specs, SlashCommand};
+use commands::{
+    handle_agents_slash_command, handle_branch_slash_command, handle_skills_slash_command,
+    handle_worktree_slash_command, render_slash_command_help, slash_command_specs, SlashCommand,
+};
 use compat_harness::{extract_manifest, UpstreamPaths};
 use runtime::{
     format_usd, load_system_prompt, mcp_tool_name, pricing_for_model, resolve_sandbox_status,
@@ -48,7 +54,9 @@ use runtime::{
     RuntimeError, ScopedMcpServerConfig, Session, SessionMetadata, TokenUsage, ToolError,
     ToolExecutor, UsageTracker,
 };
-use tools::{build_plugin_manager, current_tool_registry, GlobalToolRegistry};
+use tools::{
+    build_plugin_manager, current_tool_registry, set_active_backend_service, GlobalToolRegistry,
+};
 
 const DEFAULT_MODEL: &str = "zai-org/glm-5.1";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
@@ -93,13 +101,42 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 handle_plugins_command(action.as_deref(), target.as_deref())?
             )
         }
+        CliAction::Branch { action, target } => println!(
+            "{}",
+            handle_branch_slash_command(
+                action.as_deref(),
+                target.as_deref(),
+                &env::current_dir()?
+            )?
+        ),
+        CliAction::Worktree {
+            action,
+            path,
+            branch,
+        } => println!(
+            "{}",
+            handle_worktree_slash_command(
+                action.as_deref(),
+                path.as_deref(),
+                branch.as_deref(),
+                &env::current_dir()?,
+            )?
+        ),
+        CliAction::Agents { args } => println!(
+            "{}",
+            handle_agents_slash_command(args.as_deref(), &env::current_dir()?)?
+        ),
+        CliAction::Skills { args } => println!(
+            "{}",
+            handle_skills_slash_command(args.as_deref(), &env::current_dir()?)?
+        ),
         CliAction::Init => run_init()?,
         CliAction::Doctor => run_doctor()?,
         CliAction::SelfUpdate => run_self_update()?,
         CliAction::ResumeSession {
             session_path,
             commands,
-        } => resume_session(&session_path, &commands),
+        } => resume_session_cli(session_path.as_deref(), &commands)?,
         CliAction::Prompt {
             prompt,
             model,
@@ -131,7 +168,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             max_cost_usd,
             thinking,
         )?,
-        CliAction::Login { api_key } => login(api_key)?,
+        CliAction::Login { service, api_key } => login(service, api_key)?,
         CliAction::Help => print_help(),
         CliAction::Version => print_version(),
     }
@@ -162,11 +199,26 @@ enum CliAction {
         action: Option<String>,
         target: Option<String>,
     },
+    Branch {
+        action: Option<String>,
+        target: Option<String>,
+    },
+    Worktree {
+        action: Option<String>,
+        path: Option<String>,
+        branch: Option<String>,
+    },
+    Agents {
+        args: Option<String>,
+    },
+    Skills {
+        args: Option<String>,
+    },
     Init,
     Doctor,
     SelfUpdate,
     ResumeSession {
-        session_path: PathBuf,
+        session_path: Option<PathBuf>,
         commands: Vec<String>,
     },
     Prompt {
@@ -179,6 +231,7 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Login {
+        service: ApiService,
         api_key: Option<String>,
     },
     Repl {
@@ -391,12 +444,28 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "provider" | "providers" => parse_provider_args(&rest[1..]),
         "proxy" => parse_proxy_args(&rest[1..]),
         "mcp" => parse_mcp_args(&rest[1..]),
+        "resume" => parse_resume_args(&rest[1..]),
         "plugins" | "plugin" | "marketplace" => Ok(CliAction::Plugins {
             action: rest.get(1).cloned(),
             target: {
                 let remainder = rest.iter().skip(2).cloned().collect::<Vec<_>>().join(" ");
                 (!remainder.is_empty()).then_some(remainder)
             },
+        }),
+        "branch" => Ok(CliAction::Branch {
+            action: rest.get(1).cloned(),
+            target: rest.get(2).cloned(),
+        }),
+        "worktree" => Ok(CliAction::Worktree {
+            action: rest.get(1).cloned(),
+            path: rest.get(2).cloned(),
+            branch: rest.get(3).cloned(),
+        }),
+        "agents" => Ok(CliAction::Agents {
+            args: join_optional_args(&rest[1..]),
+        }),
+        "skills" => Ok(CliAction::Skills {
+            args: join_optional_args(&rest[1..]),
         }),
         "init" => Ok(CliAction::Init),
         "doctor" => Ok(CliAction::Doctor),
@@ -416,6 +485,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 output_format,
             })
         }
+        other if other.starts_with('/') => parse_direct_slash_cli_action(&rest),
         other if !other.starts_with('/') => Ok(CliAction::Prompt {
             prompt: rest.join(" "),
             model,
@@ -437,6 +507,29 @@ fn resolve_model_alias(model: &str) -> &str {
         "glm5" | "glm-5" | "glm_5" | "zai-org/glm-5" => "zai-org/glm-5",
         _ => model,
     }
+}
+
+fn parse_direct_slash_cli_action(rest: &[String]) -> Result<CliAction, String> {
+    let raw = rest.join(" ");
+    match SlashCommand::parse(&raw) {
+        Some(SlashCommand::Help) => Ok(CliAction::Help),
+        Some(SlashCommand::Agents { args }) => Ok(CliAction::Agents { args }),
+        Some(SlashCommand::Skills { args }) => Ok(CliAction::Skills { args }),
+        Some(command) => Err(format!(
+            "unsupported direct slash command outside the REPL: {command_name}",
+            command_name = match command {
+                SlashCommand::Unknown(name) => format!("/{name}"),
+                _ => rest[0].clone(),
+            }
+        )),
+        None => Err(format!("unknown subcommand: {}", rest[0])),
+    }
+}
+
+fn join_optional_args(args: &[String]) -> Option<String> {
+    let joined = args.join(" ");
+    let trimmed = joined.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
@@ -490,20 +583,49 @@ fn parse_provider_args(args: &[String]) -> Result<CliAction, String> {
 }
 
 fn parse_login_args(args: &[String]) -> Result<CliAction, String> {
+    let parsed = parse_login_tokens(args.iter().map(String::as_str).collect())?;
+    Ok(CliAction::Login {
+        service: parsed.service,
+        api_key: parsed.api_key,
+    })
+}
+
+fn parse_login_tokens(tokens: Vec<&str>) -> Result<LoginCommand, String> {
+    let mut service = ApiService::NanoGpt;
     let mut api_key = None;
     let mut index = 0;
 
-    while index < args.len() {
-        match args[index].as_str() {
+    while index < tokens.len() {
+        match tokens[index] {
+            "--service" => {
+                let value = tokens
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --service".to_string())?;
+                service = parse_login_service(value)?;
+                index += 2;
+            }
+            flag if flag.starts_with("--service=") => {
+                service = parse_login_service(&flag[10..])?;
+                index += 1;
+            }
             "--api-key" => {
-                let value = args
+                let value = tokens
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --api-key".to_string())?;
-                api_key = Some(value.clone());
+                api_key = Some((*value).to_string());
                 index += 2;
             }
             flag if flag.starts_with("--api-key=") => {
                 api_key = Some(flag[10..].to_string());
+                index += 1;
+            }
+            value
+                if matches!(
+                    value,
+                    "nanogpt" | "nano-gpt" | "nano" | "synthetic" | "synthetic.new"
+                ) && api_key.is_none() =>
+            {
+                service = parse_login_service(value)?;
                 index += 1;
             }
             value if api_key.is_none() => {
@@ -514,7 +636,17 @@ fn parse_login_args(args: &[String]) -> Result<CliAction, String> {
         }
     }
 
-    Ok(CliAction::Login { api_key })
+    Ok(LoginCommand { service, api_key })
+}
+
+fn parse_login_service(value: &str) -> Result<ApiService, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "nanogpt" | "nano-gpt" | "nano" => Ok(ApiService::NanoGpt),
+        "synthetic" | "synthetic.new" => Ok(ApiService::Synthetic),
+        other => Err(format!(
+            "unsupported login service `{other}`; expected nanogpt or synthetic"
+        )),
+    }
 }
 
 fn parse_proxy_args(args: &[String]) -> Result<CliAction, String> {
@@ -544,11 +676,13 @@ fn parse_mcp_args(args: &[String]) -> Result<CliAction, String> {
 }
 
 fn parse_resume_args(args: &[String]) -> Result<CliAction, String> {
-    let session_path = args
-        .first()
-        .ok_or_else(|| "missing session id or path for --resume".to_string())
-        .map(PathBuf::from)?;
-    let commands = args[1..].to_vec();
+    let (session_path, commands) = match args.first() {
+        None => (None, Vec::new()),
+        Some(first) if first.trim_start().starts_with('/') => {
+            return Err("resume without a session id/path opens the session picker and does not accept trailing commands".to_string());
+        }
+        Some(first) => (Some(PathBuf::from(first)), args[1..].to_vec()),
+    };
     if commands
         .iter()
         .any(|command| !command.trim_start().starts_with('/'))
@@ -593,13 +727,16 @@ fn print_system_prompt(cwd: PathBuf, date: String) {
     }
 }
 
-fn resume_session(session_path: &Path, commands: &[String]) {
-    let handle = match resolve_session_reference(&session_path.display().to_string()) {
-        Ok(handle) => handle,
-        Err(error) => {
-            eprintln!("failed to resolve session: {error}");
-            std::process::exit(1);
-        }
+fn resume_session_cli(
+    session_path: Option<&Path>,
+    commands: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let handle = match session_path {
+        Some(session_path) => resolve_session_reference(&session_path.display().to_string())?,
+        None => match prompt_for_session_selection(None)? {
+            Some(handle) => handle,
+            None => return Ok(()),
+        },
     };
     let session = match Session::load_from_path(&handle.path) {
         Ok(session) => session,
@@ -610,12 +747,7 @@ fn resume_session(session_path: &Path, commands: &[String]) {
     };
 
     if commands.is_empty() {
-        println!(
-            "Restored session from {} ({} messages).",
-            handle.path.display(),
-            session.messages.len()
-        );
-        return;
+        return run_repl_from_session(handle, session);
     }
 
     let mut session = session;
@@ -644,13 +776,121 @@ fn resume_session(session_path: &Path, commands: &[String]) {
             }
         }
     }
+    Ok(())
 }
 
-fn login(api_key: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let api_key = resolve_api_key(api_key)?;
-    let credentials_path = save_credentials(&api_key)?;
+fn prompt_for_session_selection(
+    active_session_id: Option<&str>,
+) -> Result<Option<SessionHandle>, Box<dyn std::error::Error>> {
+    let sessions = list_managed_sessions()?;
+    if sessions.is_empty() {
+        println!("No managed sessions saved yet.");
+        return Ok(None);
+    }
+
+    print!("Filter sessions (optional, press Enter for all): ");
+    io::stdout().flush()?;
+    let mut filter = String::new();
+    io::stdin().read_line(&mut filter)?;
+    let filter = filter.trim().to_ascii_lowercase();
+    let sessions = if filter.is_empty() {
+        sessions
+    } else {
+        sessions
+            .into_iter()
+            .filter(|session| {
+                fuzzy_session_match(&session.id, &filter)
+                    || session
+                        .model
+                        .as_deref()
+                        .is_some_and(|model| fuzzy_session_match(model, &filter))
+                    || session
+                        .last_prompt
+                        .as_deref()
+                        .is_some_and(|prompt| fuzzy_session_match(prompt, &filter))
+            })
+            .collect::<Vec<_>>()
+    };
+    if sessions.is_empty() {
+        println!("No sessions matched that filter.");
+        return Ok(None);
+    }
+
+    println!("Recent sessions");
+    for (index, session) in sessions.iter().enumerate() {
+        let marker = if active_session_id == Some(session.id.as_str()) {
+            "current"
+        } else {
+            "saved"
+        };
+        let model = session.model.as_deref().unwrap_or("unknown");
+        let last_prompt = session.last_prompt.as_deref().map_or_else(
+            || "-".to_string(),
+            |prompt| truncate_for_summary(prompt, 48),
+        );
+        println!(
+            "  {idx:>2}. {id:<22} {marker:<7} model={model:<24} msgs={msgs:<4} last={last}",
+            idx = index + 1,
+            id = session.id,
+            marker = marker,
+            model = model,
+            msgs = session.message_count,
+            last = last_prompt,
+        );
+    }
+    println!();
+    print!(
+        "Select a session to resume [1-{}] or press Enter to cancel: ",
+        sessions.len()
+    );
+    io::stdout().flush()?;
+    let mut buffer = String::new();
+    io::stdin().read_line(&mut buffer)?;
+    let selection = buffer.trim();
+    if selection.is_empty() {
+        return Ok(None);
+    }
+    let index = selection
+        .parse::<usize>()
+        .map_err(|_| format!("invalid selection: {selection}"))?;
+    let Some(session) = sessions.get(index.saturating_sub(1)) else {
+        return Err(format!("selection out of range: {selection}").into());
+    };
+    Ok(Some(SessionHandle {
+        id: session.id.clone(),
+        path: session.path.clone(),
+    }))
+}
+
+fn fuzzy_session_match(haystack: &str, query: &str) -> bool {
+    let haystack = haystack.to_ascii_lowercase();
+    if haystack.contains(query) {
+        return true;
+    }
+
+    let mut query_chars = query.chars();
+    let mut current = match query_chars.next() {
+        Some(ch) => ch,
+        None => return true,
+    };
+
+    for hay in haystack.chars() {
+        if hay == current {
+            match query_chars.next() {
+                Some(next) => current = next,
+                None => return true,
+            }
+        }
+    }
+    false
+}
+
+fn login(service: ApiService, api_key: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let api_key = resolve_api_key(service, api_key)?;
+    let credentials_path = save_credentials(service, &api_key)?;
     println!(
-        "Saved NanoGPT credentials to {}",
+        "Saved {} credentials to {}",
+        service.display_name(),
         credentials_path.display()
     );
     Ok(())
@@ -673,6 +913,14 @@ fn handle_model_action(model: Option<String>) -> Result<(), Box<dyn std::error::
 
 fn handle_provider_action(provider: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let model = default_model_or(DEFAULT_MODEL);
+    if infer_service_for_model(&model) != ApiService::NanoGpt {
+        return Err(format!(
+            "provider overrides are only available for NanoGPT models; current model {} is on {}",
+            model,
+            infer_service_for_model(&model).display_name()
+        )
+        .into());
+    }
     match provider {
         Some(provider) if is_clear_provider_arg(&provider) => {
             persist_provider_for_model(&model, None)?;
@@ -735,30 +983,45 @@ fn handle_mcp_action(action: McpCommand) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-fn resolve_api_key(api_key: Option<String>) -> Result<String, Box<dyn std::error::Error>> {
+fn resolve_api_key(
+    service: ApiService,
+    api_key: Option<String>,
+) -> Result<String, Box<dyn std::error::Error>> {
     match api_key {
         Some(api_key) if !api_key.trim().is_empty() => Ok(api_key),
-        Some(_) => Err("NanoGPT API key cannot be empty".into()),
+        Some(_) => Err(format!("{} API key cannot be empty", service.display_name()).into()),
         None => {
-            let api_key = read_secret("NanoGPT API key: ")?;
+            let api_key = read_secret(&format!("{} API key: ", service.display_name()))?;
             if api_key.trim().is_empty() {
-                return Err("NanoGPT API key cannot be empty".into());
+                return Err(format!("{} API key cannot be empty", service.display_name()).into());
             }
             Ok(api_key)
         }
     }
 }
 
-fn save_credentials(api_key: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn save_credentials(
+    service: ApiService,
+    api_key: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let config_home = nanocode_config_home()?;
     fs::create_dir_all(&config_home)?;
     let credentials_path = config_home.join("credentials.json");
-    fs::write(
-        &credentials_path,
-        serde_json::to_string_pretty(&serde_json::json!({
-            "nanogpt_api_key": api_key
-        }))?,
-    )?;
+    let mut parsed = match fs::read_to_string(&credentials_path) {
+        Ok(contents) => serde_json::from_str::<serde_json::Value>(&contents)
+            .unwrap_or_else(|_| serde_json::json!({})),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => return Err(Box::new(error)),
+    };
+    if !parsed.is_object() {
+        parsed = serde_json::json!({});
+    }
+    let key_name = match service {
+        ApiService::NanoGpt => "nanogpt_api_key",
+        ApiService::Synthetic => "synthetic_api_key",
+    };
+    parsed[key_name] = serde_json::Value::String(api_key.to_string());
+    fs::write(&credentials_path, serde_json::to_string_pretty(&parsed)?)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -777,19 +1040,19 @@ fn nanocode_config_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
     }
 }
 
-fn parse_auth_command(input: &str) -> Option<Option<String>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoginCommand {
+    service: ApiService,
+    api_key: Option<String>,
+}
+
+fn parse_auth_command(input: &str) -> Option<LoginCommand> {
     let mut parts = input.split_whitespace();
     let command = parts.next()?;
     if command != "/login" && command != "/auth" {
         return None;
     }
-
-    let remainder = parts.collect::<Vec<_>>().join(" ");
-    if remainder.is_empty() {
-        Some(None)
-    } else {
-        Some(Some(remainder))
-    }
+    parse_login_tokens(parts.collect::<Vec<_>>()).ok()
 }
 
 fn parse_model_command(input: &str) -> Option<Option<String>> {
@@ -1004,15 +1267,33 @@ fn base_runtime_tool_specs(tool_registry: &GlobalToolRegistry) -> Vec<RuntimeToo
         .iter()
         .map(|entry| RuntimeToolSpec {
             name: entry.definition.name.clone(),
-            description: entry
-                .definition
-                .description
-                .clone()
-                .unwrap_or_else(|| entry.definition.name.clone()),
+            description: tuned_tool_description(
+                &entry.definition.name,
+                &entry
+                    .definition
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| entry.definition.name.clone()),
+            ),
             input_schema: entry.definition.input_schema.clone(),
             required_permission: entry.required_permission,
         })
         .collect()
+}
+
+fn tuned_tool_description(name: &str, base: &str) -> String {
+    match name {
+        "WebSearch" => format!(
+            "{base} Prefer this for current information, release notes, changelogs, news, and finding relevant pages before reading them."
+        ),
+        "WebScrape" => format!(
+            "{base} Prefer this when you already know the docs/article URLs and need readable page content or markdown to inspect."
+        ),
+        "WebFetch" => format!(
+            "{base} Prefer this for a single known URL when you only need a quick fetch/summary; use WebScrape for richer doc/article reading."
+        ),
+        _ => base.to_string(),
+    }
 }
 
 fn available_runtime_tool_specs(
@@ -1611,25 +1892,38 @@ fn format_mcp_call_result(
 
 fn print_mcp_status(catalog: &McpCatalog) {
     if catalog.servers.is_empty() {
-        println!("MCP: no servers configured.");
-        println!("Add `mcpServers` to `.nanocode/settings.json` to expose MCP tools.");
+        println!("{}", report_title("MCP"));
+        println!("  {} {}", report_label("servers:"), 0);
+        println!("  {} {}", report_label("tools:"), 0);
+        println!(
+            "  {} add `mcpServers` to `.nanocode/settings.json` to expose MCP tools",
+            report_label("hint:")
+        );
         return;
     }
 
-    println!(
-        "MCP: {} configured server(s), {} exposed MCP tool(s).",
-        catalog.servers.len(),
-        catalog.tools.len()
-    );
+    println!("{}", report_title("MCP"));
+    println!("  {} {}", report_label("servers:"), catalog.servers.len());
+    println!("  {} {}", report_label("tools:"), catalog.tools.len());
+    println!();
     for server in &catalog.servers {
+        println!("  {}", format!("{}", server.server_name.as_str().bold()));
         println!(
-            " - {} [{} {:?}] {} tool(s): {}",
-            server.server_name,
+            "    {} {}  {} {:?}  {} {}  {} {}",
+            report_label("scope"),
             config_source_label(server.scope),
+            report_label("transport"),
             server.transport,
+            report_label("tools"),
             server.tool_count,
-            server.note
+            report_label("status"),
+            if server.loaded {
+                "ready"
+            } else {
+                "unavailable"
+            }
         );
+        println!("    {} {}", report_label("note"), server.note);
     }
 }
 
@@ -1639,11 +1933,19 @@ fn print_mcp_tools(catalog: &McpCatalog) {
         return;
     }
 
-    println!("MCP tools:");
+    println!("{}", report_title("MCP Tools"));
+    println!("  {} {}", report_label("count:"), catalog.tools.len());
+    println!();
     for tool in &catalog.tools {
+        println!("  {}", format!("{}", tool.exposed_name.as_str().bold()));
         println!(
-            " - {} -> {}::{}",
-            tool.exposed_name, tool.server_name, tool.upstream_name
+            "    {} {}\n    {} {}\n    {} {}",
+            report_label("upstream"),
+            tool.upstream_name,
+            report_label("server"),
+            tool.server_name,
+            report_label("description"),
+            tool.description
         );
     }
 }
@@ -1667,6 +1969,7 @@ struct StatusContext {
     project_root: Option<PathBuf>,
     git_branch: Option<String>,
     sandbox_summary: String,
+    web_tools_summary: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1705,6 +2008,7 @@ fn status_context(
         project_root,
         git_branch,
         sandbox_summary: format_sandbox_status(&sandbox_status),
+        web_tools_summary: format_web_tools_status(),
     })
 }
 
@@ -1730,7 +2034,24 @@ fn parse_git_status_metadata(status: Option<&str>) -> (Option<PathBuf>, Option<S
     (project_root, branch)
 }
 
+fn report_title(text: &str) -> String {
+    format!("{}", text.bold().with(Color::Yellow))
+}
+
+fn report_section(text: &str) -> String {
+    format!("{}", text.bold().with(Color::Cyan))
+}
+
+fn report_label(text: &str) -> String {
+    format!("{}", text.with(Color::DarkGrey))
+}
+
+fn report_value(text: impl std::fmt::Display) -> String {
+    text.to_string()
+}
+
 fn format_status_report(
+    service: ApiService,
     model: &str,
     usage: StatusUsage,
     permission_mode: &str,
@@ -1743,44 +2064,125 @@ fn format_status_report(
 ) -> String {
     [
         format!(
-            "Status\n  Model            {model}\n  Provider         {provider}\n  Permission mode  {permission_mode}\n  Proxy tools      {}\n  Thinking         {}\n  Messages         {}\n  Turns            {}\n  Estimated tokens {}",
+            "{}\n  {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}",
+            report_title("NanoCode Status"),
+            report_section("Session"),
+            report_label("service"),
+            report_value(service.display_name()),
+            report_label("model"),
+            report_value(model),
+            report_label("provider"),
+            report_value(provider),
+            report_label("permission_mode"),
+            report_value(permission_mode),
+            report_label("proxy_tools"),
             if proxy_tool_calls { "enabled" } else { "disabled" },
+            report_label("thinking"),
             if thinking_enabled { "enabled" } else { "disabled" },
+            report_label("messages"),
             usage.message_count,
+            report_label("turns"),
             usage.turns,
+            report_label("estimated_tokens"),
             usage.estimated_tokens,
         ),
         format!(
-            "Usage\n  Latest total     {}\n  Cumulative input {}\n  Cumulative output {}\n  Cumulative total {}\n  Estimated cost   {}\n  Budget           {}",
+            "  {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}",
+            report_section("Usage"),
+            report_label("latest_total"),
             usage.latest.total_tokens(),
+            report_label("cumulative_input"),
             usage.cumulative.input_tokens,
+            report_label("cumulative_output"),
             usage.cumulative.output_tokens,
+            report_label("cumulative_total"),
             usage.cumulative.total_tokens(),
+            report_label("estimated_cost"),
             format_usd(usage_cost_total(model, usage.cumulative)),
+            report_label("budget"),
             format_budget_line(usage_cost_total(model, usage.cumulative), max_cost_usd),
         ),
         format!(
-            "Workspace\n  Cwd              {}\n  Project root     {}\n  Git branch       {}\n  Session          {}\n  Config files     loaded {}/{}\n  Instruction files {}\n  Memory files     {}\n  MCP              servers={} tools={}",
+            "  {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} loaded {}/{}\n    {} {}\n    {} {}\n    {} servers={} tools={}",
+            report_section("Workspace"),
+            report_label("cwd"),
             context.cwd.display(),
+            report_label("project_root"),
             context
                 .project_root
                 .as_ref()
                 .map_or_else(|| "unknown".to_string(), |path| path.display().to_string()),
+            report_label("git_branch"),
             context.git_branch.as_deref().unwrap_or("unknown"),
+            report_label("session"),
             context.session_path.as_ref().map_or_else(
                 || "live-repl".to_string(),
                 |path| path.display().to_string()
             ),
+            report_label("config_files"),
             context.loaded_config_files,
             context.discovered_config_files,
+            report_label("instruction_files"),
             context.instruction_file_count,
+            report_label("memory_files"),
             context.memory_file_count,
+            report_label("mcp"),
             mcp_catalog.servers.len(),
             mcp_catalog.tools.len(),
         ),
-        format!("Sandbox\n  {}", context.sandbox_summary),
+        format!(
+            "  {}\n    {}",
+            report_section("Sandbox"),
+            context.sandbox_summary.replace('\n', "\n    ")
+        ),
+        format!(
+            "  {}\n    {}",
+            report_section("Web Tools"),
+            context.web_tools_summary.replace('\n', "\n    ")
+        ),
     ]
     .join("\n\n")
+}
+
+fn format_web_tools_status() -> String {
+    let service = current_service_or_default();
+    let api_key_configured = resolve_api_key_for(service).is_ok();
+    let base_url = resolve_base_url_for(service);
+    let (web_search_available, web_scrape_available) = current_tool_registry()
+        .map(|registry| {
+            let mut has_search = false;
+            let mut has_scrape = false;
+            for entry in registry.entries() {
+                if entry.definition.name == "WebSearch" {
+                    has_search = true;
+                }
+                if entry.definition.name == "WebScrape" {
+                    has_scrape = true;
+                }
+            }
+            (has_search, has_scrape)
+        })
+        .unwrap_or((false, false));
+
+    format!(
+        "service={}\nbase_url={base_url}\napi_key={}\nweb_search={}\nweb_scrape={}",
+        service.display_name(),
+        if api_key_configured {
+            "configured"
+        } else {
+            "missing"
+        },
+        if web_search_available {
+            "available"
+        } else {
+            "missing"
+        },
+        if web_scrape_available {
+            "available"
+        } else {
+            "missing"
+        },
+    )
 }
 
 fn format_resume_report(session_path: &str, message_count: usize, turns: u32) -> String {
@@ -2111,18 +2513,33 @@ fn current_plugin_manager() -> Result<PluginManager, Box<dyn std::error::Error>>
 }
 
 fn render_plugins_report(plugins: &[PluginSummary]) -> String {
-    let mut lines = vec!["Plugins".to_string()];
+    let mut lines = vec![
+        report_title("Plugins"),
+        format!("  {} {}", report_label("count:"), plugins.len()),
+    ];
     if plugins.is_empty() {
-        lines.push("  No plugins discovered.".to_string());
+        lines.push(format!(
+            "  {} no plugins discovered",
+            report_label("state:")
+        ));
         return lines.join("\n");
     }
 
     for plugin in plugins {
+        lines.push(String::new());
         lines.push(format!(
-            "  {} [{}] {} {}",
+            "  {}",
+            format!("{}", plugin.metadata.name.as_str().bold())
+        ));
+        lines.push(format!(
+            "    {} {}  {} {}  {} {}  {} {}",
+            report_label("id"),
             plugin.metadata.id,
+            report_label("kind"),
             plugin.metadata.kind,
+            report_label("version"),
             plugin.metadata.version,
+            report_label("state"),
             if plugin.enabled {
                 "enabled"
             } else {
@@ -2131,7 +2548,7 @@ fn render_plugins_report(plugins: &[PluginSummary]) -> String {
         ));
         lines.push(format!("    {}", plugin.metadata.description));
         if let Some(root) = &plugin.metadata.root {
-            lines.push(format!("    root={}", root.display()));
+            lines.push(format!("    {} {}", report_label("root"), root.display()));
         }
     }
 
@@ -2149,6 +2566,29 @@ fn resolve_plugin_summary(
         .ok_or_else(|| PluginError::NotFound(format!("plugin `{target}` was not found")))
 }
 
+fn render_plugin_action_result(
+    action: &str,
+    plugin_id: &str,
+    name: &str,
+    version_line: &str,
+    state: &str,
+) -> String {
+    format!(
+        "{}\n  {} {}\n  {} {}\n  {} {}\n  {} {}\n  {} {}",
+        report_title("Plugins"),
+        report_label("action:"),
+        action,
+        report_label("plugin:"),
+        name,
+        report_label("id:"),
+        plugin_id,
+        report_label("version:"),
+        version_line,
+        report_label("state:"),
+        state
+    )
+}
+
 fn handle_plugins_command(
     action: Option<&str>,
     target: Option<&str>,
@@ -2158,85 +2598,75 @@ fn handle_plugins_command(
         None | Some("list") => Ok(render_plugins_report(&manager.list_installed_plugins()?)),
         Some("install") => {
             let Some(target) = target else {
-                return Ok(
-                    "Plugins\n  Missing target for install. Usage: /plugins install <path>"
-                        .to_string(),
-                );
+                return Ok("Plugins\n  error: missing install target\n  usage: /plugins install <path>".to_string());
             };
             let install = manager.install(target)?;
             let plugin = resolve_plugin_summary(&manager, &install.plugin_id).ok();
-            Ok(format!(
-                "Plugins\n  Result           installed {}\n  Name             {}\n  Version          {}\n  Status           {}",
-                install.plugin_id,
+            Ok(render_plugin_action_result(
+                "installed",
+                &install.plugin_id,
                 plugin
                     .as_ref()
                     .map(|plugin| plugin.metadata.name.as_str())
                     .unwrap_or(install.plugin_id.as_str()),
-                install.version,
+                &install.version,
                 if plugin.as_ref().is_some_and(|plugin| plugin.enabled) {
                     "enabled"
                 } else {
                     "disabled"
-                }
+                },
             ))
         }
         Some("enable") => {
             let Some(target) = target else {
-                return Ok(
-                    "Plugins\n  Missing target for enable. Usage: /plugins enable <id>"
-                        .to_string(),
-                );
+                return Ok("Plugins\n  error: missing enable target\n  usage: /plugins enable <id>".to_string());
             };
             let plugin = resolve_plugin_summary(&manager, target)?;
             manager.enable(&plugin.metadata.id)?;
-            Ok(format!(
-                "Plugins\n  Result           enabled {}\n  Name             {}\n  Version          {}\n  Status           enabled",
-                plugin.metadata.id, plugin.metadata.name, plugin.metadata.version
+            Ok(render_plugin_action_result(
+                "enabled",
+                &plugin.metadata.id,
+                &plugin.metadata.name,
+                &plugin.metadata.version,
+                "enabled",
             ))
         }
         Some("disable") => {
             let Some(target) = target else {
-                return Ok(
-                    "Plugins\n  Missing target for disable. Usage: /plugins disable <id>"
-                        .to_string(),
-                );
+                return Ok("Plugins\n  error: missing disable target\n  usage: /plugins disable <id>".to_string());
             };
             let plugin = resolve_plugin_summary(&manager, target)?;
             manager.disable(&plugin.metadata.id)?;
-            Ok(format!(
-                "Plugins\n  Result           disabled {}\n  Name             {}\n  Version          {}\n  Status           disabled",
-                plugin.metadata.id, plugin.metadata.name, plugin.metadata.version
+            Ok(render_plugin_action_result(
+                "disabled",
+                &plugin.metadata.id,
+                &plugin.metadata.name,
+                &plugin.metadata.version,
+                "disabled",
             ))
         }
         Some("uninstall") => {
             let Some(target) = target else {
-                return Ok(
-                    "Plugins\n  Missing target for uninstall. Usage: /plugins uninstall <id>"
-                        .to_string(),
-                );
+                return Ok("Plugins\n  error: missing uninstall target\n  usage: /plugins uninstall <id>".to_string());
             };
             let plugin = resolve_plugin_summary(&manager, target)?;
             manager.uninstall(&plugin.metadata.id)?;
             Ok(format!(
-                "Plugins\n  Result           uninstalled {}",
-                plugin.metadata.id
+                "Plugins\n  action:  uninstalled\n  plugin:  {}\n  id:      {}",
+                plugin.metadata.name, plugin.metadata.id
             ))
         }
         Some("update") => {
             let Some(target) = target else {
-                return Ok(
-                    "Plugins\n  Missing target for update. Usage: /plugins update <id>"
-                        .to_string(),
-                );
+                return Ok("Plugins\n  error: missing update target\n  usage: /plugins update <id>".to_string());
             };
             let plugin = resolve_plugin_summary(&manager, target)?;
             let update = manager.update(&plugin.metadata.id)?;
-            Ok(format!(
-                "Plugins\n  Result           updated {}\n  Name             {}\n  Old version      {}\n  New version      {}\n  Status           {}",
-                update.plugin_id,
-                plugin.metadata.name,
-                update.old_version,
-                update.new_version,
+            Ok(render_plugin_action_result(
+                "updated",
+                &update.plugin_id,
+                &plugin.metadata.name,
+                &format!("{} -> {}", update.old_version, update.new_version),
                 if resolve_plugin_summary(&manager, &update.plugin_id)
                     .ok()
                     .is_some_and(|summary| summary.enabled)
@@ -2244,11 +2674,11 @@ fn handle_plugins_command(
                     "enabled"
                 } else {
                     "disabled"
-                }
+                },
             ))
         }
         Some(other) => Ok(format!(
-            "Plugins\n  Unsupported action `{other}`. Use list, install, enable, disable, uninstall, or update."
+            "Plugins\n  error: unsupported action `{other}`\n  usage: /plugins [list|install|enable|disable|uninstall|update]"
         )),
     }
 }
@@ -2461,14 +2891,47 @@ fn resolve_export_path(
 }
 
 fn render_repl_help() -> String {
-    let mut lines = vec![render_slash_command_help()];
-    lines.push("Additional NanoCode commands".to_string());
-    lines.push("  /login               Save a NanoGPT API key".to_string());
-    lines.push("  /auth                Alias for /login".to_string());
-    lines.push("  /provider [provider] Set provider override for current model".to_string());
-    lines.push("  /proxy [on|off|status] Toggle XML proxy tool calling".to_string());
-    lines.push("  /exit                Quit the REPL".to_string());
-    lines.push("  /quit                Quit the REPL".to_string());
+    let mut lines = vec![
+        "NanoCode REPL".to_string(),
+        "  Core".to_string(),
+        "    /help                Show command help".to_string(),
+        "    /status              Show session, workspace, and usage state".to_string(),
+        "    /model [model]       Show or switch the active model".to_string(),
+        "    /provider [provider] Set provider override for current model".to_string(),
+        "    /thinking [on|off]   Toggle extended thinking".to_string(),
+        "    /cost                Show cumulative token and cost usage".to_string(),
+        "    /permissions [mode]  Switch permission mode".to_string(),
+        "    /proxy [on|off|status] Toggle XML proxy tool calling".to_string(),
+        "    /mcp [status|tools|reload] Inspect MCP state".to_string(),
+        String::new(),
+        "  Session".to_string(),
+        "    /compact             Compact the current conversation".to_string(),
+        "    /clear [--confirm]   Start a fresh session".to_string(),
+        "    /resume [session]    Load a saved session or open the picker".to_string(),
+        "    /session ...         Manage saved sessions".to_string(),
+        "    /sessions            List recent sessions".to_string(),
+        "    /export [file]       Export the current transcript".to_string(),
+        String::new(),
+        "  Workspace".to_string(),
+        "    /diff                Show git diff".to_string(),
+        "    /branch ...          List, create, or switch branches".to_string(),
+        "    /worktree ...        Manage git worktrees".to_string(),
+        "    /agents              List configured NanoCode agents".to_string(),
+        "    /skills              List available NanoCode skills".to_string(),
+        "    /plugins ...         Manage NanoCode plugins".to_string(),
+        "    /memory              Inspect loaded memory files".to_string(),
+        "    /config [section]    Inspect merged config".to_string(),
+        "    /init                Create starter project files".to_string(),
+        String::new(),
+        "  REPL".to_string(),
+        "    /login [service]     Save a NanoGPT or Synthetic API key".to_string(),
+        "    /auth [service]      Alias for /login".to_string(),
+        "    /vim                 Toggle vi keybindings for this REPL".to_string(),
+        "    /exit                Quit".to_string(),
+        "    /quit                Quit".to_string(),
+    ];
+    lines.push(String::new());
+    lines.push(render_slash_command_help());
     lines.join("\n")
 }
 
@@ -2509,6 +2972,32 @@ fn run_repl(
         thinking_enabled,
         true,
     )?;
+    run_repl_loop(&mut cli)
+}
+
+fn run_repl_from_session(
+    handle: SessionHandle,
+    session: Session,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let model = session
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.model.clone())
+        .unwrap_or_else(|| default_model_or(DEFAULT_MODEL));
+    let mut cli = LiveCli::from_session(
+        handle,
+        session,
+        model,
+        None,
+        default_permission_mode(),
+        None,
+        false,
+        true,
+    )?;
+    run_repl_loop(&mut cli)
+}
+
+fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
     let completions = slash_command_specs()
         .iter()
         .map(|spec| format!("/{}", spec.name))
@@ -2517,11 +3006,36 @@ fn run_repl(
                 .iter()
                 .flat_map(|spec| spec.aliases.iter().map(|alias| format!("/{alias}"))),
         )
-        .chain(["/login", "/auth", "/provider", "/proxy", "/exit", "/quit"].map(str::to_string))
+        .chain(
+            [
+                "/login",
+                "/auth",
+                "/provider",
+                "/proxy",
+                "/vim",
+                "/exit",
+                "/quit",
+            ]
+            .map(str::to_string),
+        )
         .collect();
     let mut editor = input::LineEditor::new("> ", completions);
-    println!("NanoCode interactive mode");
-    println!("Type /help for commands. Shift+Enter or Ctrl+J inserts a newline.");
+    println!("NanoCode");
+    println!("  service: {}", cli.service.display_name());
+    println!("  model: {}", cli.model);
+    println!(
+        "  provider: {}",
+        if cli.service == ApiService::NanoGpt {
+            provider_for_model(&cli.model).unwrap_or_else(|| "<platform default>".to_string())
+        } else {
+            "<not applicable on Synthetic>".to_string()
+        }
+    );
+    println!(
+        "  prompt: {}",
+        "Shift+Enter/Ctrl+J newline, /vim toggles vi mode, /help for commands"
+    );
+    println!();
 
     loop {
         let input = match editor.read_line()? {
@@ -2534,8 +3048,8 @@ fn run_repl(
             continue;
         }
         editor.push_history(trimmed.to_string());
-        if let Some(api_key) = parse_auth_command(trimmed) {
-            login(api_key)?;
+        if let Some(login_command) = parse_auth_command(trimmed) {
+            login(login_command.service, login_command.api_key)?;
             continue;
         }
         if let Some(model) = parse_model_command(trimmed) {
@@ -2561,7 +3075,7 @@ fn run_repl(
             continue;
         }
         if let Some(mode) = parse_proxy_command(trimmed) {
-            handle_proxy_runtime_command(&mut cli, mode?)?;
+            handle_proxy_runtime_command(cli, mode?)?;
             continue;
         }
         if let Some(enabled) = parse_thinking_command(trimmed) {
@@ -2569,7 +3083,7 @@ fn run_repl(
             continue;
         }
         if let Some(command) = parse_mcp_command(trimmed) {
-            handle_mcp_runtime_command(&mut cli, command?)?;
+            handle_mcp_runtime_command(cli, command?)?;
             continue;
         }
         if let Some(mode) = parse_permissions_command(trimmed) {
@@ -2600,6 +3114,27 @@ fn run_repl(
                     SlashCommand::Init => run_init()?,
                     SlashCommand::Diff => println!("{}", render_diff_report()?),
                     SlashCommand::Version => print_version(),
+                    SlashCommand::Branch { action, target } => println!(
+                        "{}",
+                        handle_branch_slash_command(
+                            action.as_deref(),
+                            target.as_deref(),
+                            &env::current_dir()?,
+                        )?
+                    ),
+                    SlashCommand::Worktree {
+                        action,
+                        path,
+                        branch,
+                    } => println!(
+                        "{}",
+                        handle_worktree_slash_command(
+                            action.as_deref(),
+                            path.as_deref(),
+                            branch.as_deref(),
+                            &env::current_dir()?,
+                        )?
+                    ),
                     SlashCommand::Export { path } => cli.export_session(path.as_deref())?,
                     SlashCommand::Session { action, target } => {
                         cli.handle_session_command(action.as_deref(), target.as_deref())?
@@ -2608,6 +3143,14 @@ fn run_repl(
                     SlashCommand::Plugins { action, target } => {
                         cli.handle_plugins_command(action.as_deref(), target.as_deref())?
                     }
+                    SlashCommand::Agents { args } => println!(
+                        "{}",
+                        handle_agents_slash_command(args.as_deref(), &env::current_dir()?)?
+                    ),
+                    SlashCommand::Skills { args } => println!(
+                        "{}",
+                        handle_skills_slash_command(args.as_deref(), &env::current_dir()?)?
+                    ),
                     SlashCommand::Unknown(name) => eprintln!("unknown slash command: /{name}"),
                     SlashCommand::Model { .. } | SlashCommand::Mcp { .. } => {
                         unreachable!("handled before shared slash command dispatch")
@@ -2622,6 +3165,7 @@ fn run_repl(
 }
 
 struct LiveCli {
+    service: ApiService,
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
@@ -2645,6 +3189,7 @@ impl LiveCli {
         thinking_enabled: bool,
         render_model_output: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let service = infer_service_for_model(&model);
         let system_prompt = build_system_prompt()?;
         let proxy_tool_calls = proxy_tool_calls_enabled();
         let mcp_catalog = load_mcp_catalog(&env::current_dir()?)?;
@@ -2652,6 +3197,7 @@ impl LiveCli {
         auto_compact_inactive_sessions(&session.id)?;
         let runtime = build_runtime(
             Session::new(),
+            service,
             model.clone(),
             system_prompt.clone(),
             enable_tools,
@@ -2663,6 +3209,7 @@ impl LiveCli {
             render_model_output,
         )?;
         let cli = Self {
+            service,
             model,
             allowed_tools,
             permission_mode,
@@ -2677,6 +3224,49 @@ impl LiveCli {
         };
         cli.persist_session()?;
         Ok(cli)
+    }
+
+    fn from_session(
+        session_handle: SessionHandle,
+        session: Session,
+        model: String,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+        max_cost_usd: Option<f64>,
+        thinking_enabled: bool,
+        render_model_output: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let service = infer_service_for_model(&model);
+        let system_prompt = build_system_prompt()?;
+        let proxy_tool_calls = proxy_tool_calls_enabled();
+        let mcp_catalog = load_mcp_catalog(&env::current_dir()?)?;
+        let runtime = build_runtime(
+            session,
+            service,
+            model.clone(),
+            system_prompt.clone(),
+            true,
+            proxy_tool_calls,
+            mcp_catalog.clone(),
+            allowed_tools.clone(),
+            permission_mode,
+            thinking_enabled,
+            render_model_output,
+        )?;
+        Ok(Self {
+            service,
+            model,
+            allowed_tools,
+            permission_mode,
+            max_cost_usd,
+            thinking_enabled,
+            system_prompt,
+            proxy_tool_calls,
+            mcp_catalog,
+            runtime,
+            session: session_handle,
+            render_model_output,
+        })
     }
 
     fn run_turn_with_output(
@@ -2769,6 +3359,7 @@ impl LiveCli {
         println!(
             "{}",
             format_status_report(
+                self.service,
                 &self.model,
                 StatusUsage {
                     message_count: self.runtime.session().messages.len(),
@@ -2787,9 +3378,13 @@ impl LiveCli {
             )
         );
         if self.model == DEFAULT_MODEL {
-            println!("status: active model is the default fallback model.");
+            println!();
+            println!("  Defaults");
+            println!("    fallback_model   active");
         } else {
-            println!("status: default fallback model={DEFAULT_MODEL}");
+            println!();
+            println!("  Defaults");
+            println!("    fallback_model   {DEFAULT_MODEL}");
         }
     }
 
@@ -2798,6 +3393,7 @@ impl LiveCli {
         let removed = result.removed_message_count;
         self.runtime = build_runtime(
             result.compacted_session,
+            self.service,
             self.model.clone(),
             self.system_prompt.clone(),
             true,
@@ -2815,10 +3411,12 @@ impl LiveCli {
 
     fn set_model(&mut self, model: String) -> Result<(), Box<dyn std::error::Error>> {
         let model = resolve_model_alias(&model).to_string();
+        let service = infer_service_for_model(&model);
         let session = self.runtime.session().clone();
         persist_current_model(model.clone())?;
         self.runtime = build_runtime(
             session,
+            service,
             model.clone(),
             self.system_prompt.clone(),
             true,
@@ -2829,16 +3427,29 @@ impl LiveCli {
             self.thinking_enabled,
             self.render_model_output,
         )?;
+        self.service = service;
         self.model = model.clone();
         self.persist_session()?;
-        let provider =
-            provider_for_model(&self.model).unwrap_or_else(|| "<platform default>".to_string());
+        let provider = if self.service == ApiService::NanoGpt {
+            provider_for_model(&self.model).unwrap_or_else(|| "<platform default>".to_string())
+        } else {
+            "<not applicable on Synthetic>".to_string()
+        };
+        println!("Switched to service: {}", self.service.display_name());
         println!("Switched to model: {model}");
         println!("Provider override for current model: {provider}");
         Ok(())
     }
 
     fn set_provider(&mut self, provider: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+        if self.service != ApiService::NanoGpt {
+            return Err(format!(
+                "provider overrides are only supported for NanoGPT models; current model {} is on {}",
+                self.model,
+                self.service.display_name()
+            )
+            .into());
+        }
         let session = self.runtime.session().clone();
         if let Some(provider) = provider.as_deref() {
             validate_provider_for_model(&self.model, provider)?;
@@ -2849,6 +3460,7 @@ impl LiveCli {
         persist_provider_for_model(&self.model, provider)?;
         self.runtime = build_runtime(
             session,
+            self.service,
             self.model.clone(),
             self.system_prompt.clone(),
             true,
@@ -2879,6 +3491,7 @@ impl LiveCli {
         persist_proxy_tool_calls(enabled)?;
         self.runtime = build_runtime(
             session,
+            self.service,
             self.model.clone(),
             self.system_prompt.clone(),
             true,
@@ -2908,6 +3521,7 @@ impl LiveCli {
         let catalog = load_mcp_catalog(&env::current_dir()?)?;
         self.runtime = build_runtime(
             session,
+            self.service,
             self.model.clone(),
             self.system_prompt.clone(),
             true,
@@ -2950,6 +3564,7 @@ impl LiveCli {
         self.permission_mode = mode;
         self.runtime = build_runtime(
             session,
+            self.service,
             self.model.clone(),
             self.system_prompt.clone(),
             true,
@@ -2979,6 +3594,7 @@ impl LiveCli {
         self.thinking_enabled = enabled;
         self.runtime = build_runtime(
             session,
+            self.service,
             self.model.clone(),
             self.system_prompt.clone(),
             true,
@@ -3004,6 +3620,7 @@ impl LiveCli {
             let session = self.runtime.session().clone();
             self.runtime = build_runtime(
                 session,
+                self.service,
                 self.model.clone(),
                 self.system_prompt.clone(),
                 true,
@@ -3063,6 +3680,7 @@ impl LiveCli {
         self.session = create_managed_session_handle()?;
         self.runtime = build_runtime(
             Session::new(),
+            self.service,
             self.model.clone(),
             self.system_prompt.clone(),
             true,
@@ -3087,11 +3705,20 @@ impl LiveCli {
         &mut self,
         session_path: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(session_ref) = session_path else {
-            println!("Usage: /resume <session-id-or-path>");
-            return Ok(());
+        let session_ref = match session_path {
+            Some(session_ref) => session_ref,
+            None => match prompt_for_session_selection(Some(&self.session.id))? {
+                Some(handle) => {
+                    return self.resume_handle(handle);
+                }
+                None => return Ok(()),
+            },
         };
         let handle = resolve_session_reference(&session_ref)?;
+        self.resume_handle(handle)
+    }
+
+    fn resume_handle(&mut self, handle: SessionHandle) -> Result<(), Box<dyn std::error::Error>> {
         let session = Session::load_from_path(&handle.path)?;
         let message_count = session.messages.len();
         if let Some(model) = session
@@ -3100,9 +3727,11 @@ impl LiveCli {
             .map(|metadata| metadata.model.clone())
         {
             self.model = model;
+            self.service = infer_service_for_model(&self.model);
         }
         self.runtime = build_runtime(
             session,
+            self.service,
             self.model.clone(),
             self.system_prompt.clone(),
             true,
@@ -3161,9 +3790,11 @@ impl LiveCli {
                     .map(|metadata| metadata.model.clone())
                 {
                     self.model = model;
+                    self.service = infer_service_for_model(&self.model);
                 }
                 self.runtime = build_runtime(
                     session,
+                    self.service,
                     self.model.clone(),
                     self.system_prompt.clone(),
                     true,
@@ -3282,12 +3913,23 @@ impl PermissionPrompter for CliPermissionPrompter {
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    Ok(load_system_prompt(
+    let mut prompt = load_system_prompt(
         env::current_dir()?,
         DEFAULT_DATE,
         env::consts::OS,
         "unknown",
-    )?)
+    )?;
+    prompt.push(
+        [
+            "# Web Research Guidance",
+            " - Use WebSearch when you need current or web-sourced information, such as docs discovery, release notes, changelogs, product details, or anything that may have changed recently.",
+            " - Use WebScrape when you already know the URL and need to read the page contents closely, especially documentation pages, blog posts, articles, and reference material.",
+            " - Use WebFetch only for a quick single-page fetch/summary when you do not need richer scraping output.",
+            " - For documentation work, the preferred sequence is usually: WebSearch to find the right page, then WebScrape to read it carefully.",
+        ]
+        .join("\n"),
+    );
+    Ok(prompt)
 }
 
 fn build_runtime_feature_config(
@@ -3323,6 +3965,7 @@ fn build_runtime_feature_config(
 
 fn build_runtime(
     session: Session,
+    service: ApiService,
     model: String,
     system_prompt: Vec<String>,
     enable_tools: bool,
@@ -3355,6 +3998,7 @@ fn build_runtime(
     Ok(ConversationRuntime::new_with_features(
         session,
         NanoCodeRuntimeClient::new(
+            service,
             model.clone(),
             provider_for_model(&model),
             enable_tools,
@@ -3364,6 +4008,7 @@ fn build_runtime(
             render_model_output,
         )?,
         CliToolExecutor::new(
+            service,
             tool_registry,
             mcp_catalog,
             tool_specs,
@@ -3390,6 +4035,7 @@ struct NanoCodeRuntimeClient {
 
 impl NanoCodeRuntimeClient {
     fn new(
+        service: ApiService,
         model: String,
         provider: Option<String>,
         enable_tools: bool,
@@ -3398,9 +4044,15 @@ impl NanoCodeRuntimeClient {
         thinking_enabled: bool,
         render_output: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut client = NanoGptClient::new(resolve_api_key_for(service)?)
+            .with_service(service)
+            .with_base_url(resolve_base_url_for(service));
+        if service == ApiService::NanoGpt {
+            client = client.with_provider(provider.clone());
+        }
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: NanoGptClient::from_env()?.with_provider(provider.clone()),
+            client,
             max_output_tokens: max_output_tokens_for_model_or(&model, DEFAULT_MAX_TOKENS),
             model,
             enable_tools,
@@ -3981,6 +4633,7 @@ fn contains_proxy_markup(text: &str) -> bool {
 }
 
 struct CliToolExecutor {
+    service: ApiService,
     renderer: TerminalRenderer,
     tool_registry: GlobalToolRegistry,
     mcp_catalog: McpCatalog,
@@ -3991,6 +4644,7 @@ struct CliToolExecutor {
 
 impl CliToolExecutor {
     fn new(
+        service: ApiService,
         tool_registry: GlobalToolRegistry,
         mcp_catalog: McpCatalog,
         tool_specs: Vec<RuntimeToolSpec>,
@@ -3998,6 +4652,7 @@ impl CliToolExecutor {
         emit_output: bool,
     ) -> Self {
         Self {
+            service,
             renderer: TerminalRenderer::new(),
             tool_registry,
             mcp_catalog,
@@ -4020,6 +4675,7 @@ impl ToolExecutor for CliToolExecutor {
             )));
         }
         let value = parse_tool_input_value(tool_name, input, &self.tool_specs)?;
+        let _service_guard = set_active_backend_service(self.service);
         let output = if let Some(tool) = self.mcp_catalog.find_tool(tool_name) {
             call_mcp_tool(tool, &value).map_err(|error| ToolError::new(error.to_string()))
         } else {
@@ -4044,10 +4700,10 @@ fn render_tool_result_markdown(tool_name: &str, output: &str) -> String {
 
     let preview = truncate_tool_text(output, MAX_TOOL_PREVIEW_LINES, MAX_TOOL_PREVIEW_CHARS);
     if preview == output {
-        format!("### Tool `{tool_name}`\n\n```json\n{output}\n```\n")
+        format!("#### {tool_name}\n\n_Result preview_\n\n```json\n{output}\n```\n")
     } else {
         format!(
-            "### Tool `{tool_name}`\n\n_Output truncated in TUI; full result kept in conversation context._\n\n```json\n{preview}\n```\n"
+            "#### {tool_name}\n\n_Result preview truncated in the TUI; full output is still kept in conversation context._\n\n```json\n{preview}\n```\n"
         )
     }
 }
@@ -4074,11 +4730,11 @@ fn render_read_file_preview(value: &serde_json::Value) -> Option<String> {
         _ => start_line,
     };
     Some(format!(
-        "### Tool `read_file`\n\nRead lines {}-{} of {}.\nPath: `{}`\n_File contents hidden in the TUI; full content kept in conversation context._\n",
+        "#### read_file\n\n- Path: `{}`\n- Range: lines {}-{} of {}\n- Preview: file contents hidden in the TUI; full content stays in conversation context.\n",
+        path,
         start_line.unwrap_or(1),
         end_line.unwrap_or(start_line.unwrap_or(1)),
-        total_lines.unwrap_or(num_lines.unwrap_or(0)),
-        path
+        total_lines.unwrap_or(num_lines.unwrap_or(0))
     ))
 }
 
@@ -4094,10 +4750,10 @@ fn render_glob_search_preview(value: &serde_json::Value) -> Option<String> {
     let truncated = filenames.len() > 20
         || value.get("truncated").and_then(serde_json::Value::as_bool) == Some(true);
     Some(format!(
-        "### Tool `glob_search`\n\nMatched {} files.\n{}\n```text\n{}\n```\n",
+        "#### glob_search\n\n- Matched: {} files\n{}\n```text\n{}\n```\n",
         num_files,
         if truncated {
-            "_Preview truncated in TUI; full result kept in conversation context._\n"
+            "- Preview: truncated in the TUI; full result kept in conversation context.\n"
         } else {
             ""
         },
@@ -4114,15 +4770,15 @@ fn render_grep_search_preview(value: &serde_json::Value) -> Option<String> {
         .unwrap_or("");
     let preview = truncate_tool_text(content, MAX_TOOL_PREVIEW_LINES, MAX_TOOL_PREVIEW_CHARS);
     Some(format!(
-        "### Tool `grep_search`\n\nMatched {} files{}.\n{}\n```text\n{}\n```\n",
+        "#### grep_search\n\n- Matched: {} files{}{}\n```text\n{}\n```\n",
         num_files,
         num_matches
             .map(|count| format!(", {} matches", count))
             .unwrap_or_default(),
         if preview == content {
-            ""
+            "\n"
         } else {
-            "_Preview truncated in TUI; full result kept in conversation context._\n"
+            "\n- Preview: truncated in the TUI; full result kept in conversation context.\n"
         },
         preview
     ))
@@ -4140,10 +4796,11 @@ fn render_bash_preview(value: &serde_json::Value) -> Option<String> {
     let mut sections = Vec::new();
     if !stdout.trim().is_empty() {
         let preview = truncate_tool_text(stdout, MAX_TOOL_PREVIEW_LINES, MAX_TOOL_PREVIEW_CHARS);
-        sections.push(format!("**stdout**\n```text\n{}\n```", preview));
+        sections.push(format!("stdout\n```text\n{}\n```", preview));
         if preview != stdout {
             sections.push(
-                "_stdout truncated in TUI; full result kept in conversation context._".to_string(),
+                "Preview truncated in the TUI; full stdout is still kept in conversation context."
+                    .to_string(),
             );
         }
     }
@@ -4153,12 +4810,12 @@ fn render_bash_preview(value: &serde_json::Value) -> Option<String> {
             MAX_TOOL_PREVIEW_LINES / 2,
             MAX_TOOL_PREVIEW_CHARS / 2,
         );
-        sections.push(format!("**stderr**\n```text\n{}\n```", preview));
+        sections.push(format!("stderr\n```text\n{}\n```", preview));
     }
     if sections.is_empty() {
         return None;
     }
-    Some(format!("### Tool `bash`\n\n{}\n", sections.join("\n\n")))
+    Some(format!("#### bash\n\n{}\n", sections.join("\n\n")))
 }
 
 fn truncate_tool_text(input: &str, max_lines: usize, max_chars: usize) -> String {
@@ -4312,7 +4969,7 @@ fn convert_messages(messages: &[ConversationMessage]) -> Result<Vec<InputMessage
     let cwd = env::current_dir().map_err(|error| {
         RuntimeError::new(format!("failed to resolve current directory: {error}"))
     })?;
-    messages
+    sanitize_messages_for_api(messages)
         .iter()
         .filter_map(|message| {
             let role = match message.role {
@@ -4366,6 +5023,55 @@ fn convert_messages(messages: &[ConversationMessage]) -> Result<Vec<InputMessage
                 Ok(_) => None,
                 Err(error) => Some(Err(error)),
             }
+        })
+        .collect()
+}
+
+fn sanitize_messages_for_api(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
+    let tool_use_ids = messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let tool_result_ids = messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let balanced_tool_ids = tool_use_ids
+        .intersection(&tool_result_ids)
+        .cloned()
+        .collect::<HashSet<_>>();
+
+    messages
+        .iter()
+        .filter_map(|message| {
+            let blocks = message
+                .blocks
+                .iter()
+                .filter(|block| match block {
+                    ContentBlock::ToolUse { id, .. } => balanced_tool_ids.contains(id),
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        balanced_tool_ids.contains(tool_use_id)
+                    }
+                    _ => true,
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if blocks.is_empty() {
+                return None;
+            }
+            Some(ConversationMessage {
+                role: message.role,
+                blocks,
+                usage: message.usage,
+            })
         })
         .collect()
 }
@@ -4735,6 +5441,11 @@ fn run_resume_command(
                     session
                         .metadata
                         .as_ref()
+                        .map(|metadata| infer_service_for_model(&metadata.model))
+                        .unwrap_or(ApiService::NanoGpt),
+                    session
+                        .metadata
+                        .as_ref()
                         .map(|metadata| metadata.model.as_str())
                         .unwrap_or("restored-session"),
                     StatusUsage {
@@ -4808,20 +5519,24 @@ fn run_resume_command(
         | SlashCommand::Thinking { .. }
         | SlashCommand::Session { .. }
         | SlashCommand::Sessions
+        | SlashCommand::Branch { .. }
+        | SlashCommand::Worktree { .. }
         | SlashCommand::Plugins { .. }
+        | SlashCommand::Agents { .. }
+        | SlashCommand::Skills { .. }
         | SlashCommand::Unknown(_) => Err("unsupported resumed slash command".into()),
     }
 }
 
 fn print_help() {
-    println!("nanocode");
+    println!("NanoCode");
     println!();
-    println!("Usage:");
+    println!("Usage");
     println!(
         "  nanocode [--model MODEL] [--permission-mode MODE] [--max-cost USD] [--thinking] [--allowedTools TOOL[,TOOL...]]"
     );
     println!("                                               Start interactive REPL");
-    println!("  nanocode login [--api-key KEY]              Save a NanoGPT API key");
+    println!("  nanocode login [SERVICE] [--api-key KEY]    Save a NanoGPT or Synthetic API key");
     println!("  nanocode model [MODEL_ID]                   Choose or persist a default model");
     println!(
         "  nanocode provider [PROVIDER_ID|default]     Choose a provider for the active model"
@@ -4831,11 +5546,17 @@ fn print_help() {
         "  nanocode mcp [status|tools|reload]          Inspect configured MCP servers and tools"
     );
     println!("  nanocode plugins [list|install|enable|disable|uninstall|update] [TARGET]");
+    println!("  nanocode branch [list|create|switch] [ARG]  Inspect or change git branches");
+    println!("  nanocode worktree [list|add|remove|prune]   Inspect or manage git worktrees");
+    println!("  nanocode agents [list|help]                 List configured NanoCode agents");
+    println!("  nanocode skills [list|help]                 List available NanoCode skills");
     println!("  nanocode init                               Create starter NanoCode project files");
     println!("  nanocode doctor                             Run local environment diagnostics");
     println!("  nanocode self-update                        Update from GitHub releases");
-    println!("  nanocode --resume SESSION_ID_OR_PATH [/status] [/compact] [...]");
-    println!("                                               Resume a saved session and run slash commands");
+    println!("  nanocode resume [SESSION_ID_OR_PATH]");
+    println!("                                               Resume a saved session, or pick one and enter the REPL");
+    println!("  nanocode --resume [SESSION_ID_OR_PATH] [/status] [/compact] [...]");
+    println!("                                               Resume a saved session and optionally run slash commands");
     println!(
         "  nanocode prompt [--model MODEL] [--permission-mode MODE] [--max-cost USD] [--thinking] [--output-format text|json] TEXT"
     );
@@ -4864,6 +5585,10 @@ fn print_help() {
     println!(
         "  --output-format FORMAT                     Non-interactive output format: text or json"
     );
+    println!();
+    println!("REPL");
+    println!("  /help                                      Show the interactive command guide");
+    println!("  /vim                                       Toggle vi keybindings for this REPL");
 }
 
 fn print_version() {
@@ -5354,6 +6079,7 @@ fn run_doctor() -> Result<(), Box<dyn std::error::Error>> {
     let report = DoctorReport {
         checks: vec![
             check_api_key_validity(),
+            check_web_tools_health(),
             check_config_files(&config_loader, config.as_ref()),
             check_git_availability(&cwd),
             check_mcp_server_health(&cwd),
@@ -5653,6 +6379,68 @@ fn check_network_connectivity() -> DiagnosticCheck {
     }
 }
 
+fn check_web_tools_health() -> DiagnosticCheck {
+    let service = current_service_or_default();
+    let base_url = resolve_base_url_for(service);
+    let api_key_configured = resolve_api_key_for(service).is_ok();
+    match current_tool_registry() {
+        Ok(registry) => {
+            let mut has_search = false;
+            let mut has_scrape = false;
+            for entry in registry.entries() {
+                if entry.definition.name == "WebSearch" {
+                    has_search = true;
+                }
+                if entry.definition.name == "WebScrape" {
+                    has_scrape = true;
+                }
+            }
+            let level = if has_search && has_scrape && api_key_configured {
+                DiagnosticLevel::Ok
+            } else if has_search || has_scrape {
+                DiagnosticLevel::Warn
+            } else {
+                DiagnosticLevel::Fail
+            };
+            DiagnosticCheck::new(
+                "Web tools",
+                level,
+                if has_search && has_scrape {
+                    "web tools are registered"
+                } else {
+                    "one or more web tools are unavailable"
+                },
+            )
+            .with_details(vec![
+                format!("service={}", service.display_name()),
+                format!("base_url={base_url}"),
+                format!(
+                    "api_key={}",
+                    if api_key_configured {
+                        "configured"
+                    } else {
+                        "missing"
+                    }
+                ),
+                format!(
+                    "WebSearch={}",
+                    if has_search { "available" } else { "missing" }
+                ),
+                format!(
+                    "WebScrape={}",
+                    if has_scrape { "available" } else { "missing" }
+                ),
+            ])
+        }
+        Err(error) => DiagnosticCheck::new(
+            "Web tools",
+            DiagnosticLevel::Fail,
+            format!("failed to load tool registry: {error}"),
+        )
+        .with_details(vec![format!("base_url={base_url}")]),
+    }
+}
+
 fn check_system_info(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
     let mut details = vec![
         format!("os={} arch={}", env::consts::OS, env::consts::ARCH),
@@ -5695,21 +6483,20 @@ fn check_system_info(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> Dia
 #[cfg(test)]
 mod tests {
     use super::{
-        append_proxy_text_events, available_runtime_tool_specs, extract_first_json_object,
-        filter_runtime_tool_specs, parse_args, parse_auth_command, parse_checksum_for_asset,
+        append_proxy_text_events, available_runtime_tool_specs, build_system_prompt,
+        extract_first_json_object, filter_runtime_tool_specs, format_status_report,
+        format_web_tools_status, parse_args, parse_auth_command, parse_checksum_for_asset,
         parse_mcp_command, parse_model_command, parse_provider_command, parse_proxy_command,
         parse_tool_input_value, prompt_to_content_blocks, proxy_response_to_events,
         push_output_block, render_streamed_tool_call_start, render_tool_result_markdown,
         render_update_report, resolve_model_alias, response_to_events,
-        should_retry_proxy_tool_prompt, AssistantEvent, CliAction, CliOutputFormat,
-        GitHubRelease, GitHubReleaseAsset, McpCatalog, McpCommand, RuntimeToolSpec,
-        DEFAULT_MODEL,
+        should_retry_proxy_tool_prompt, tuned_tool_description, AssistantEvent, CliAction,
+        CliOutputFormat, GitHubRelease, GitHubReleaseAsset, LoginCommand, McpCatalog, McpCommand,
+        RuntimeToolSpec, StatusContext, StatusUsage, DEFAULT_MODEL,
     };
     use crate::proxy::ProxyCommand;
-    use api::{
-        InputContentBlock, MessageResponse, OutputContentBlock, Usage,
-    };
-    use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode};
+    use api::{ApiService, InputContentBlock, MessageResponse, OutputContentBlock, Usage};
+    use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode, TokenUsage};
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
@@ -5761,6 +6548,79 @@ mod tests {
                 }
             );
         });
+    }
+
+    #[test]
+    fn tuned_web_tool_descriptions_push_search_and_scrape_workflow() {
+        let search = tuned_tool_description("WebSearch", "Search the web.");
+        let scrape = tuned_tool_description("WebScrape", "Scrape pages.");
+        let fetch = tuned_tool_description("WebFetch", "Fetch a URL.");
+
+        assert!(search.contains("current information"));
+        assert!(scrape.contains("readable page content"));
+        assert!(fetch.contains("WebScrape"));
+    }
+
+    #[test]
+    fn system_prompt_includes_web_research_guidance() {
+        let prompt = build_system_prompt()
+            .expect("system prompt should build")
+            .join("\n\n");
+        assert!(prompt.contains("# Web Research Guidance"));
+        assert!(prompt.contains("WebSearch"));
+        assert!(prompt.contains("WebScrape"));
+    }
+
+    #[test]
+    fn web_tools_status_mentions_auth_and_tool_availability() {
+        let summary = format_web_tools_status();
+        assert!(summary.contains("api_key="));
+        assert!(summary.contains("web_search="));
+        assert!(summary.contains("web_scrape="));
+    }
+
+    #[test]
+    fn status_report_includes_web_tools_section() {
+        let report = format_status_report(
+            ApiService::NanoGpt,
+            DEFAULT_MODEL,
+            StatusUsage {
+                message_count: 0,
+                turns: 0,
+                latest: TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                cumulative: TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+                estimated_tokens: 0,
+            },
+            "workspace-write",
+            "<platform default>",
+            false,
+            false,
+            None,
+            &McpCatalog::default(),
+            &StatusContext {
+                cwd: PathBuf::from("."),
+                session_path: None,
+                loaded_config_files: 0,
+                discovered_config_files: 0,
+                instruction_file_count: 0,
+                memory_file_count: 0,
+                project_root: None,
+                git_branch: None,
+                sandbox_summary: "sandbox".to_string(),
+                web_tools_summary: "web".to_string(),
+            },
+        );
+        assert!(report.contains("Web Tools"));
     }
 
     #[test]
@@ -5916,6 +6776,7 @@ mod tests {
             assert_eq!(
                 parse_args(&args).expect("args should parse"),
                 CliAction::Login {
+                    service: ApiService::NanoGpt,
                     api_key: Some("nano-key".to_string()),
                 }
             );
@@ -6005,7 +6866,7 @@ mod tests {
             assert_eq!(
                 parse_args(&args).expect("args should parse"),
                 CliAction::ResumeSession {
-                    session_path: PathBuf::from("session.json"),
+                    session_path: Some(PathBuf::from("session.json")),
                     commands: vec!["/compact".to_string()],
                 }
             );
@@ -6024,8 +6885,22 @@ mod tests {
             assert_eq!(
                 parse_args(&args).expect("args should parse"),
                 CliAction::ResumeSession {
-                    session_path: PathBuf::from("session.json"),
+                    session_path: Some(PathBuf::from("session.json")),
                     commands: vec!["/status".to_string(), "/export".to_string()],
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn parses_resume_without_path_as_picker_action() {
+        with_isolated_config_home(|| {
+            let args = vec!["resume".to_string()];
+            assert_eq!(
+                parse_args(&args).expect("args should parse"),
+                CliAction::ResumeSession {
+                    session_path: None,
+                    commands: Vec::new(),
                 }
             );
         });
@@ -6118,10 +6993,26 @@ mod tests {
 
     #[test]
     fn parses_auth_slash_command() {
-        assert_eq!(parse_auth_command("/login"), Some(None));
+        assert_eq!(
+            parse_auth_command("/login"),
+            Some(LoginCommand {
+                service: ApiService::NanoGpt,
+                api_key: None,
+            })
+        );
         assert_eq!(
             parse_auth_command("/auth nano-key"),
-            Some(Some("nano-key".to_string()))
+            Some(LoginCommand {
+                service: ApiService::NanoGpt,
+                api_key: Some("nano-key".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_auth_command("/login synthetic"),
+            Some(LoginCommand {
+                service: ApiService::Synthetic,
+                api_key: None,
+            })
         );
         assert_eq!(parse_auth_command("/status"), None);
     }
@@ -6229,6 +7120,46 @@ mod tests {
         assert_eq!(converted.len(), 3);
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
+    }
+
+    #[test]
+    fn convert_messages_drops_dangling_tool_use_blocks() {
+        let messages = vec![
+            ConversationMessage::user_text("hello"),
+            ConversationMessage::assistant(vec![ContentBlock::ToolUse {
+                id: "tool-1".to_string(),
+                name: "bash".to_string(),
+                input: "{\"command\":\"pwd\"}".to_string(),
+            }]),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "I can still answer normally.".to_string(),
+            }]),
+        ];
+
+        let converted = super::convert_messages(&messages).expect("messages should convert");
+        assert_eq!(converted.len(), 2);
+        assert_eq!(converted[0].role, "user");
+        assert_eq!(converted[1].role, "assistant");
+        assert!(matches!(
+            &converted[1].content[0],
+            InputContentBlock::Text { text } if text == "I can still answer normally."
+        ));
+    }
+
+    #[test]
+    fn convert_messages_drops_orphan_tool_results() {
+        let messages = vec![
+            ConversationMessage::user_text("hello"),
+            ConversationMessage::tool_result("tool-missing", "bash", "ok", false),
+        ];
+
+        let converted = super::convert_messages(&messages).expect("messages should convert");
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "user");
+        assert!(matches!(
+            &converted[0].content[0],
+            InputContentBlock::Text { text } if text == "hello"
+        ));
     }
 
     #[test]
@@ -6421,9 +7352,9 @@ mod tests {
 
         let markdown = render_tool_result_markdown("read_file", &output);
 
-        assert!(markdown.contains("### Tool `read_file`"));
+        assert!(markdown.contains("#### read_file"));
         assert!(markdown.contains("Path: `/tmp/demo.rs`"));
-        assert!(markdown.contains("File contents hidden in the TUI"));
+        assert!(markdown.contains("file contents hidden in the TUI"));
         assert!(!markdown.contains("line 1"));
         assert!(!markdown.contains("line 80"));
     }
@@ -6459,8 +7390,8 @@ mod tests {
 
         let markdown = render_tool_result_markdown("bash", &output);
 
-        assert!(markdown.contains("### Tool `bash`"));
-        assert!(markdown.contains("stdout truncated in TUI"));
+        assert!(markdown.contains("#### bash"));
+        assert!(markdown.contains("Preview truncated in the TUI"));
         assert!(!markdown.contains("output 100"));
     }
 

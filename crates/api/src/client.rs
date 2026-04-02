@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde::Serialize;
 
 use crate::error::ApiError;
 use crate::sse::SseParser;
@@ -13,6 +14,7 @@ use crate::types::{
 };
 
 const DEFAULT_BASE_URL: &str = "https://nano-gpt.com/api";
+const DEFAULT_SYNTHETIC_MESSAGES_BASE_URL: &str = "https://api.synthetic.new/anthropic/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
@@ -35,6 +37,7 @@ pub struct NanoGptClient {
     http: reqwest::Client,
     api_key: String,
     base_url: String,
+    service: ApiService,
     provider: Option<String>,
     force_paygo: bool,
     max_retries: u32,
@@ -49,6 +52,7 @@ impl NanoGptClient {
             http: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
+            service: ApiService::NanoGpt,
             provider: None,
             force_paygo: false,
             max_retries: DEFAULT_MAX_RETRIES,
@@ -58,12 +62,24 @@ impl NanoGptClient {
     }
 
     pub fn from_env() -> Result<Self, ApiError> {
-        Ok(Self::new(read_api_key()?).with_base_url(read_base_url()))
+        Self::from_service_env(ApiService::NanoGpt)
+    }
+
+    pub fn from_service_env(service: ApiService) -> Result<Self, ApiError> {
+        Ok(Self::new(resolve_api_key_for(service)?)
+            .with_service(service)
+            .with_base_url(resolve_base_url_for(service)))
     }
 
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_service(mut self, service: ApiService) -> Self {
+        self.service = service;
         self
     }
 
@@ -112,8 +128,9 @@ impl NanoGptClient {
         request: &ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, ApiError> {
         let request_url = format!(
-            "{}/v1/chat/completions",
-            self.base_url.trim_end_matches('/')
+            "{}{}",
+            self.base_url.trim_end_matches('/'),
+            self.chat_completions_path()
         );
         if nanogpt_client_debug_enabled() {
             let resolved_base_url = self.base_url.trim_end_matches('/');
@@ -228,7 +245,11 @@ impl NanoGptClient {
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
-        let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let request_url = format!(
+            "{}{}",
+            self.base_url.trim_end_matches('/'),
+            self.messages_path()
+        );
         if nanogpt_client_debug_enabled() {
             let resolved_base_url = self.base_url.trim_end_matches('/');
             eprintln!("[nanogpt-client] resolved_base_url={resolved_base_url}");
@@ -279,13 +300,21 @@ impl NanoGptClient {
             request_builder
         } else {
             if debug {
-                eprintln!(
-                    "[nanogpt-client] headers x-api-key=[REDACTED] authorization=Bearer [REDACTED]"
-                );
+                match self.service {
+                    ApiService::NanoGpt => eprintln!(
+                        "[nanogpt-client] headers x-api-key=[REDACTED] authorization=Bearer [REDACTED]"
+                    ),
+                    ApiService::Synthetic => eprintln!(
+                        "[nanogpt-client] headers authorization=Bearer [REDACTED]"
+                    ),
+                }
             }
-            request_builder
-                .bearer_auth(&self.api_key)
-                .header("x-api-key", &self.api_key)
+            match self.service {
+                ApiService::NanoGpt => request_builder
+                    .bearer_auth(&self.api_key)
+                    .header("x-api-key", &self.api_key),
+                ApiService::Synthetic => request_builder.bearer_auth(&self.api_key),
+            }
         };
 
         if include_provider {
@@ -318,14 +347,57 @@ impl NanoGptClient {
             .checked_mul(multiplier)
             .map_or(self.max_backoff, |delay| delay.min(self.max_backoff)))
     }
+
+    fn messages_path(&self) -> &'static str {
+        match self.service {
+            ApiService::NanoGpt => "/v1/messages",
+            ApiService::Synthetic => "/messages",
+        }
+    }
+
+    fn chat_completions_path(&self) -> &'static str {
+        match self.service {
+            ApiService::NanoGpt => "/v1/chat/completions",
+            ApiService::Synthetic => "/chat/completions",
+        }
+    }
 }
 
 fn read_api_key() -> Result<String, ApiError> {
-    match std::env::var("NANOGPT_API_KEY") {
+    resolve_api_key_for(ApiService::NanoGpt)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiService {
+    NanoGpt,
+    Synthetic,
+}
+
+impl ApiService {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NanoGpt => "nanogpt",
+            Self::Synthetic => "synthetic",
+        }
+    }
+
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::NanoGpt => "NanoGPT",
+            Self::Synthetic => "Synthetic",
+        }
+    }
+}
+
+pub fn resolve_api_key_for(service: ApiService) -> Result<String, ApiError> {
+    match std::env::var(service_api_key_env(service)) {
         Ok(api_key) if !api_key.is_empty() => Ok(api_key),
         Ok(_) => Err(ApiError::MissingApiKey),
         Err(std::env::VarError::NotPresent) => {
-            read_api_key_from_credentials_file().ok_or(ApiError::MissingApiKey)
+            read_api_key_from_credentials_file(service).ok_or(ApiError::MissingApiKey)
         }
         Err(error) => Err(ApiError::from(error)),
     }
@@ -335,20 +407,62 @@ pub fn resolve_api_key() -> Result<String, ApiError> {
     read_api_key()
 }
 
-fn read_base_url() -> String {
-    std::env::var("NANOGPT_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
+pub fn resolve_base_url_for(service: ApiService) -> String {
+    match service {
+        ApiService::NanoGpt => {
+            std::env::var("NANOGPT_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
+        }
+        ApiService::Synthetic => std::env::var("SYNTHETIC_BASE_URL")
+            .unwrap_or_else(|_| DEFAULT_SYNTHETIC_MESSAGES_BASE_URL.to_string()),
+    }
 }
 
-fn read_api_key_from_credentials_file() -> Option<String> {
+pub fn resolve_root_url_for(service: ApiService) -> String {
+    match service {
+        ApiService::NanoGpt => {
+            let base = resolve_base_url_for(service);
+            let trimmed = base.trim_end_matches('/');
+            trimmed.strip_suffix("/api").unwrap_or(trimmed).to_string()
+        }
+        ApiService::Synthetic => {
+            if let Ok(root) = std::env::var("SYNTHETIC_ROOT_URL") {
+                return root;
+            }
+            let base = resolve_base_url_for(service);
+            let trimmed = base.trim_end_matches('/');
+            trimmed
+                .strip_suffix("/anthropic/v1")
+                .unwrap_or(trimmed)
+                .to_string()
+        }
+    }
+}
+
+fn read_api_key_from_credentials_file(service: ApiService) -> Option<String> {
     let path = credentials_path()?;
     let contents = fs::read_to_string(path).ok()?;
     let parsed = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
+    let service_key = match service {
+        ApiService::NanoGpt => "nanogpt_api_key",
+        ApiService::Synthetic => "synthetic_api_key",
+    };
     parsed
-        .get("nanogpt_api_key")
+        .get(service_key)
         .and_then(serde_json::Value::as_str)
-        .or_else(|| parsed.get("apiKey").and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            (service == ApiService::NanoGpt)
+                .then(|| parsed.get("apiKey").and_then(serde_json::Value::as_str))
+                .flatten()
+        })
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn service_api_key_env(service: ApiService) -> &'static str {
+    match service {
+        ApiService::NanoGpt => "NANOGPT_API_KEY",
+        ApiService::Synthetic => "SYNTHETIC_API_KEY",
+    }
 }
 
 fn credentials_path() -> Option<PathBuf> {
@@ -538,7 +652,10 @@ mod tests {
     fn read_base_url_defaults_to_nanogpt_messages_api_root() {
         let _guard = env_lock();
         std::env::remove_var("NANOGPT_BASE_URL");
-        assert_eq!(super::read_base_url(), "https://nano-gpt.com/api");
+        assert_eq!(
+            super::resolve_base_url_for(super::ApiService::NanoGpt),
+            "https://nano-gpt.com/api"
+        );
     }
 
     #[test]

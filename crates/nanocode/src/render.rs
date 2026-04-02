@@ -12,13 +12,16 @@ use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColorTheme {
-    heading: Color,
+    heading_primary: Color,
+    heading_secondary: Color,
     emphasis: Color,
     strong: Color,
     inline_code: Color,
     link: Color,
     quote: Color,
     table_border: Color,
+    code_block_border: Color,
+    rule: Color,
     spinner_active: Color,
     spinner_done: Color,
     spinner_failed: Color,
@@ -27,14 +30,17 @@ pub struct ColorTheme {
 impl Default for ColorTheme {
     fn default() -> Self {
         Self {
-            heading: Color::Cyan,
+            heading_primary: Color::Yellow,
+            heading_secondary: Color::Cyan,
             emphasis: Color::Magenta,
-            strong: Color::Yellow,
-            inline_code: Color::Green,
+            strong: Color::Green,
+            inline_code: Color::DarkYellow,
             link: Color::Blue,
             quote: Color::DarkGrey,
-            table_border: Color::DarkCyan,
-            spinner_active: Color::Blue,
+            table_border: Color::DarkBlue,
+            code_block_border: Color::DarkGrey,
+            rule: Color::DarkGrey,
+            spinner_active: Color::Cyan,
             spinner_done: Color::Green,
             spinner_failed: Color::Red,
         }
@@ -146,6 +152,7 @@ struct RenderState {
     emphasis: usize,
     strong: usize,
     quote: usize,
+    heading_level: Option<u8>,
     list_stack: Vec<ListKind>,
     table: Option<TableState>,
 }
@@ -153,6 +160,14 @@ struct RenderState {
 impl RenderState {
     fn style_text(&self, text: &str, theme: &ColorTheme) -> String {
         let mut styled = text.to_string();
+        if let Some(level) = self.heading_level {
+            let color = if level <= 2 {
+                theme.heading_primary
+            } else {
+                theme.heading_secondary
+            };
+            styled = format!("{}", styled.bold().with(color));
+        }
         if self.strong > 0 {
             styled = format!("{}", styled.bold().with(theme.strong));
         }
@@ -244,8 +259,14 @@ impl TerminalRenderer {
         in_code_block: &mut bool,
     ) {
         match event {
-            Event::Start(Tag::Heading { level, .. }) => self.start_heading(level as u8, output),
-            Event::End(TagEnd::Heading(..) | TagEnd::Paragraph) => output.push_str("\n\n"),
+            Event::Start(Tag::Heading { level, .. }) => {
+                self.start_heading(level as u8, state, output)
+            }
+            Event::End(TagEnd::Heading(..)) => {
+                state.heading_level = None;
+                output.push_str("\n\n");
+            }
+            Event::End(TagEnd::Paragraph) => output.push_str("\n\n"),
             Event::Start(Tag::BlockQuote(..)) => self.start_quote(state, output),
             Event::End(TagEnd::BlockQuote(..)) => {
                 state.quote = state.quote.saturating_sub(1);
@@ -290,7 +311,14 @@ impl TerminalRenderer {
                     format!("{}", format!("`{code}`").with(self.color_theme.inline_code));
                 state.capture_target_mut(output).push_str(&rendered);
             }
-            Event::Rule => output.push_str("---\n"),
+            Event::Rule => {
+                let rule = format!(
+                    "{}",
+                    "────────────────────────────────────────".with(self.color_theme.rule)
+                );
+                output.push_str(&rule);
+                output.push('\n');
+            }
             Event::Text(text) => {
                 self.push_text(text.as_ref(), state, output, code_buffer, *in_code_block);
             }
@@ -368,15 +396,21 @@ impl TerminalRenderer {
         }
     }
 
-    fn start_heading(&self, level: u8, output: &mut String) {
+    fn start_heading(&self, level: u8, state: &mut RenderState, output: &mut String) {
+        state.heading_level = Some(level);
         output.push('\n');
         let prefix = match level {
-            1 => "# ",
-            2 => "## ",
-            3 => "### ",
-            _ => "#### ",
+            1 => "◆ ",
+            2 => "● ",
+            3 => "▸ ",
+            _ => "• ",
         };
-        let _ = write!(output, "{}", prefix.bold().with(self.color_theme.heading));
+        let color = if level <= 2 {
+            self.color_theme.heading_primary
+        } else {
+            self.color_theme.heading_secondary
+        };
+        let _ = write!(output, "{}", prefix.bold().with(color));
     }
 
     fn start_quote(&self, state: &mut RenderState, output: &mut String) {
@@ -404,7 +438,7 @@ impl TerminalRenderer {
             let _ = writeln!(
                 output,
                 "{}",
-                format!("╭─ {code_language}").with(self.color_theme.heading)
+                format!("╭─ {code_language}").with(self.color_theme.code_block_border)
             );
         }
     }
@@ -412,7 +446,7 @@ impl TerminalRenderer {
     fn finish_code_block(&self, code_buffer: &str, code_language: &str, output: &mut String) {
         output.push_str(&self.highlight_code(code_buffer, code_language));
         if !code_language.is_empty() {
-            let _ = write!(output, "{}", "╰─".with(self.color_theme.heading));
+            let _ = write!(output, "{}", "╰─".with(self.color_theme.code_block_border));
         }
         output.push_str("\n\n");
     }
@@ -492,7 +526,11 @@ impl TerminalRenderer {
             let cell = row.get(index).map_or("", String::as_str);
             line.push(' ');
             if is_header {
-                let _ = write!(line, "{}", cell.bold().with(self.color_theme.heading));
+                let _ = write!(
+                    line,
+                    "{}",
+                    cell.bold().with(self.color_theme.heading_secondary)
+                );
             } else {
                 line.push_str(cell);
             }

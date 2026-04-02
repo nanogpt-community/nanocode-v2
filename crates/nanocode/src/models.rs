@@ -4,9 +4,11 @@ use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use api::{
-    ModelCapabilities, ModelInfo, ModelPricing, ModelProvider, NanoGptClient, ProviderPrice,
+    resolve_api_key_for, resolve_base_url_for, resolve_root_url_for, ApiService, ModelCapabilities,
+    ModelInfo, ModelPricing, ModelProvider, NanoGptClient, ProviderPrice,
 };
 use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -14,13 +16,15 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size, Clear, ClearType};
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_BASE_URL: &str = "https://nano-gpt.com/api";
+const DEFAULT_SYNTHETIC_MODELS_URL: &str = "https://api.synthetic.new/openai/v1/models";
 const DEFAULT_VISIBLE_ROWS: usize = 14;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelState {
     #[serde(default)]
     pub current_model: Option<String>,
+    #[serde(default)]
+    pub current_service: Option<ApiService>,
     #[serde(default)]
     pub favorite_models: Vec<String>,
     #[serde(default)]
@@ -34,12 +38,19 @@ pub struct ModelState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSelection {
     pub selected_model: Option<String>,
+    pub selected_service: Option<ApiService>,
     pub favorites_changed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderSelection {
     pub selected_provider: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CatalogModel {
+    service: ApiService,
+    info: ModelInfo,
 }
 
 pub fn load_model_state() -> Result<ModelState, Box<dyn std::error::Error>> {
@@ -71,8 +82,28 @@ pub fn default_model_or(fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
+pub fn current_service_or_default() -> ApiService {
+    load_model_state()
+        .ok()
+        .and_then(|state| {
+            state
+                .current_service
+                .or_else(|| state.current_model.as_deref().map(infer_service_for_model))
+        })
+        .unwrap_or(ApiService::NanoGpt)
+}
+
+pub fn infer_service_for_model(model: &str) -> ApiService {
+    if model.trim().starts_with("hf:") {
+        ApiService::Synthetic
+    } else {
+        ApiService::NanoGpt
+    }
+}
+
 pub fn persist_current_model(model: String) -> Result<(), Box<dyn std::error::Error>> {
     let mut state = load_model_state()?;
+    state.current_service = Some(infer_service_for_model(&model));
     state.current_model = Some(model);
     save_model_state(&state)
 }
@@ -112,18 +143,19 @@ pub fn max_output_tokens_for_model_or(model: &str, fallback: u32) -> u32 {
         }
     }
 
-    let client = build_catalog_client();
-    let runtime = match tokio::runtime::Runtime::new() {
-        Ok(runtime) => runtime,
-        Err(_) => return fallback,
-    };
-    let models = match runtime.block_on(client.fetch_models(true)) {
-        Ok(response) => response.data,
+    let models = match fetch_service_models(infer_service_for_model(model)) {
+        Ok(models) => models,
         Err(_) => return fallback,
     };
 
     let mut state = load_model_state().unwrap_or_default();
-    update_output_token_cache(&mut state, &models);
+    update_output_token_cache(
+        &mut state,
+        &models
+            .iter()
+            .map(|model| model.info.clone())
+            .collect::<Vec<_>>(),
+    );
     let resolved = state
         .max_output_tokens_by_model
         .get(model)
@@ -141,23 +173,36 @@ pub fn persist_proxy_tool_calls(enabled: bool) -> Result<(), Box<dyn std::error:
 }
 
 pub fn open_model_picker() -> Result<ModelSelection, Box<dyn std::error::Error>> {
-    let client = build_catalog_client();
     let mut state = load_model_state()?;
-    let models = fetch_sorted_models(&client, &state)?;
-    update_output_token_cache(&mut state, &models);
+    let models = fetch_all_sorted_models(&state)?;
+    update_output_token_cache(
+        &mut state,
+        &models
+            .iter()
+            .map(|model| model.info.clone())
+            .collect::<Vec<_>>(),
+    );
     if models.is_empty() {
-        return Err("NanoGPT returned an empty model list".into());
+        return Err("no models were returned by NanoCode providers".into());
     }
 
     let selection = interactive_model_picker(&models, &mut state)?;
     if let Some(model) = &selection.selected_model {
         state.current_model = Some(model.clone());
+        state.current_service = selection.selected_service;
     }
     save_model_state(&state)?;
     Ok(selection)
 }
 
 pub fn open_provider_picker(model: &str) -> Result<ProviderSelection, Box<dyn std::error::Error>> {
+    if infer_service_for_model(model) != ApiService::NanoGpt {
+        return Err(format!(
+            "provider overrides are only supported for NanoGPT models; current model is on {}",
+            infer_service_for_model(model).display_name()
+        )
+        .into());
+    }
     let response = fetch_provider_selection(model)?;
     if !response.supports_provider_selection {
         return Err(format!("provider selection is not supported for {model}").into());
@@ -188,6 +233,13 @@ pub fn validate_provider_for_model(
     model: &str,
     provider: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if infer_service_for_model(model) != ApiService::NanoGpt {
+        return Err(format!(
+            "provider overrides are only supported for NanoGPT models; current model is on {}",
+            infer_service_for_model(model).display_name()
+        )
+        .into());
+    }
     let response = fetch_provider_selection(model)?;
     if !response.supports_provider_selection {
         return Err(format!("provider selection is not supported for {model}").into());
@@ -205,14 +257,10 @@ pub fn validate_provider_for_model(
 }
 
 fn build_catalog_client() -> NanoGptClient {
-    let api_key = std::env::var("NANOGPT_API_KEY")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .or_else(|| load_credentials_api_key().ok().flatten())
-        .unwrap_or_default();
-    NanoGptClient::new(api_key).with_base_url(
-        std::env::var("NANOGPT_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string()),
-    )
+    let api_key = resolve_api_key_for(ApiService::NanoGpt).unwrap_or_default();
+    NanoGptClient::new(api_key)
+        .with_service(ApiService::NanoGpt)
+        .with_base_url(resolve_base_url_for(ApiService::NanoGpt))
 }
 
 fn fetch_provider_selection(
@@ -223,14 +271,107 @@ fn fetch_provider_selection(
     Ok(runtime.block_on(client.fetch_providers(model))?)
 }
 
-fn fetch_sorted_models(
-    client: &NanoGptClient,
+fn fetch_all_sorted_models(
     state: &ModelState,
-) -> Result<Vec<ModelInfo>, Box<dyn std::error::Error>> {
-    let runtime = tokio::runtime::Runtime::new()?;
-    let mut models = runtime.block_on(client.fetch_models(true))?.data;
+) -> Result<Vec<CatalogModel>, Box<dyn std::error::Error>> {
+    let mut models = fetch_service_models(ApiService::NanoGpt)?;
+    models.extend(fetch_service_models(ApiService::Synthetic)?);
     models.sort_by(|left, right| compare_models(left, right, state));
     Ok(models)
+}
+
+fn fetch_service_models(
+    service: ApiService,
+) -> Result<Vec<CatalogModel>, Box<dyn std::error::Error>> {
+    match service {
+        ApiService::NanoGpt => {
+            let client = build_catalog_client();
+            let runtime = tokio::runtime::Runtime::new()?;
+            let response = runtime.block_on(client.fetch_models(true))?;
+            Ok(response
+                .data
+                .into_iter()
+                .map(|info| CatalogModel { service, info })
+                .collect())
+        }
+        ApiService::Synthetic => fetch_synthetic_models(),
+    }
+}
+
+fn fetch_synthetic_models() -> Result<Vec<CatalogModel>, Box<dyn std::error::Error>> {
+    #[derive(Debug, Deserialize)]
+    struct SyntheticModelsResponse {
+        data: Vec<SyntheticModel>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct SyntheticModel {
+        id: String,
+        name: Option<String>,
+        provider: Option<String>,
+        created: Option<i64>,
+        context_length: Option<u64>,
+        max_output_length: Option<u64>,
+        supported_features: Option<Vec<String>>,
+    }
+
+    let root = resolve_root_url_for(ApiService::Synthetic);
+    let models_url = if root.trim_end_matches('/') == "https://api.synthetic.new" {
+        DEFAULT_SYNTHETIC_MODELS_URL.to_string()
+    } else {
+        format!("{}/openai/v1/models", root.trim_end_matches('/'))
+    };
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let payload = runtime.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()?;
+        let mut request = client.get(&models_url);
+        if let Ok(api_key) = resolve_api_key_for(ApiService::Synthetic) {
+            request = request.bearer_auth(api_key);
+        }
+        let response = request.send().await?;
+        let response = response.error_for_status()?;
+        response.json::<SyntheticModelsResponse>().await
+    })?;
+
+    Ok(payload
+        .data
+        .into_iter()
+        .map(|model| CatalogModel {
+            service: ApiService::Synthetic,
+            info: ModelInfo {
+                id: model.id,
+                object: "model".to_string(),
+                created: model.created.unwrap_or_default(),
+                owned_by: model.provider.unwrap_or_else(|| "synthetic".to_string()),
+                name: model.name,
+                description: None,
+                context_length: model.context_length,
+                max_output_tokens: model.max_output_length,
+                pricing: None,
+                capabilities: synthetic_capabilities(model.supported_features.as_deref()),
+                category: Some("Synthetic".to_string()),
+                cost_estimate: None,
+                tags: None,
+                supports_provider_selection: Some(false),
+            },
+        })
+        .collect())
+}
+
+fn synthetic_capabilities(features: Option<&[String]>) -> Option<ModelCapabilities> {
+    let features = features?;
+    let contains = |needle: &str| features.iter().any(|item| item == needle);
+    Some(ModelCapabilities {
+        vision: Some(contains("vision")),
+        reasoning: Some(contains("reasoning")),
+        tool_calling: Some(contains("tools")),
+        parallel_tool_calls: None,
+        structured_output: Some(contains("structured_outputs") || contains("json_mode")),
+        pdf_upload: None,
+    })
 }
 
 fn update_output_token_cache(state: &mut ModelState, models: &[ModelInfo]) {
@@ -247,25 +388,32 @@ fn update_output_token_cache(state: &mut ModelState, models: &[ModelInfo]) {
     }
 }
 
-fn compare_models(left: &ModelInfo, right: &ModelInfo, state: &ModelState) -> Ordering {
-    let left_favorite = state.favorite_models.iter().any(|item| item == &left.id);
-    let right_favorite = state.favorite_models.iter().any(|item| item == &right.id);
-    let left_current = state.current_model.as_deref() == Some(left.id.as_str());
-    let right_current = state.current_model.as_deref() == Some(right.id.as_str());
+fn compare_models(left: &CatalogModel, right: &CatalogModel, state: &ModelState) -> Ordering {
+    let left_favorite = state
+        .favorite_models
+        .iter()
+        .any(|item| item == &left.info.id);
+    let right_favorite = state
+        .favorite_models
+        .iter()
+        .any(|item| item == &right.info.id);
+    let left_current = state.current_model.as_deref() == Some(left.info.id.as_str());
+    let right_current = state.current_model.as_deref() == Some(right.info.id.as_str());
 
     right_current
         .cmp(&left_current)
         .then_with(|| right_favorite.cmp(&left_favorite))
+        .then_with(|| left.service.as_str().cmp(right.service.as_str()))
         .then_with(|| {
-            display_name(left)
+            display_name(&left.info)
                 .to_ascii_lowercase()
-                .cmp(&display_name(right).to_ascii_lowercase())
+                .cmp(&display_name(&right.info).to_ascii_lowercase())
         })
-        .then_with(|| left.id.cmp(&right.id))
+        .then_with(|| left.info.id.cmp(&right.info.id))
 }
 
 fn interactive_model_picker(
-    models: &[ModelInfo],
+    models: &[CatalogModel],
     state: &mut ModelState,
 ) -> Result<ModelSelection, Box<dyn std::error::Error>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -275,11 +423,15 @@ fn interactive_model_picker(
     let current_index = state
         .current_model
         .as_deref()
-        .and_then(|model| models.iter().position(|entry| entry.id == model))
+        .and_then(|model| models.iter().position(|entry| entry.info.id == model))
         .unwrap_or(0);
+    let mut current_service = state
+        .current_service
+        .or_else(|| state.current_model.as_deref().map(infer_service_for_model))
+        .unwrap_or(ApiService::NanoGpt);
     let mut query = String::new();
     let mut search_mode = false;
-    let mut filtered_indices = filtered_model_indices(models, &query);
+    let mut filtered_indices = filtered_model_indices(models, current_service, &query);
     let mut cursor = filtered_indices
         .iter()
         .position(|index| *index == current_index)
@@ -295,6 +447,7 @@ fn interactive_model_picker(
             state,
             &filtered_indices,
             cursor,
+            current_service,
             &query,
             search_mode,
         )?;
@@ -305,6 +458,25 @@ fn interactive_model_picker(
                 ..
             }) => {
                 search_mode = true;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Tab, ..
+            })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Right,
+                ..
+            }) if !search_mode => {
+                current_service = cycle_service(current_service, true);
+                filtered_indices = filtered_model_indices(models, current_service, &query);
+                cursor = 0;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Left,
+                ..
+            }) if !search_mode => {
+                current_service = cycle_service(current_service, false);
+                filtered_indices = filtered_model_indices(models, current_service, &query);
+                cursor = 0;
             }
             Event::Key(KeyEvent {
                 code: KeyCode::Up, ..
@@ -365,7 +537,7 @@ fn interactive_model_picker(
                 ..
             }) if !search_mode => {
                 if let Some(model_index) = filtered_indices.get(cursor) {
-                    toggle_favorite(&models[*model_index].id, state);
+                    toggle_favorite(&models[*model_index].info.id, state);
                     favorites_changed = true;
                 }
             }
@@ -383,7 +555,8 @@ fn interactive_model_picker(
                 disable_raw_mode()?;
                 write!(stdout, "\r\n")?;
                 return Ok(ModelSelection {
-                    selected_model: Some(models[*model_index].id.clone()),
+                    selected_model: Some(models[*model_index].info.id.clone()),
+                    selected_service: Some(models[*model_index].service),
                     favorites_changed,
                 });
             }
@@ -393,7 +566,7 @@ fn interactive_model_picker(
             }) => {
                 if !query.is_empty() {
                     query.pop();
-                    filtered_indices = filtered_model_indices(models, &query);
+                    filtered_indices = filtered_model_indices(models, current_service, &query);
                     cursor = updated_cursor(&filtered_indices, cursor, current_index);
                     search_mode = true;
                 }
@@ -404,7 +577,7 @@ fn interactive_model_picker(
                 ..
             }) if modifiers.contains(KeyModifiers::CONTROL) => {
                 query.clear();
-                filtered_indices = filtered_model_indices(models, &query);
+                filtered_indices = filtered_model_indices(models, current_service, &query);
                 cursor = updated_cursor(&filtered_indices, cursor, current_index);
                 search_mode = false;
             }
@@ -414,7 +587,7 @@ fn interactive_model_picker(
                 ..
             }) if search_mode && (modifiers.is_empty() || modifiers == KeyModifiers::SHIFT) => {
                 query.push(ch);
-                filtered_indices = filtered_model_indices(models, &query);
+                filtered_indices = filtered_model_indices(models, current_service, &query);
                 cursor = updated_cursor(&filtered_indices, cursor, current_index);
             }
             Event::Key(KeyEvent {
@@ -427,7 +600,7 @@ fn interactive_model_picker(
             }) => {
                 if search_mode || !query.is_empty() {
                     query.clear();
-                    filtered_indices = filtered_model_indices(models, &query);
+                    filtered_indices = filtered_model_indices(models, current_service, &query);
                     cursor = updated_cursor(&filtered_indices, cursor, current_index);
                     search_mode = false;
                     continue;
@@ -436,6 +609,7 @@ fn interactive_model_picker(
                 write!(stdout, "\r\n")?;
                 return Ok(ModelSelection {
                     selected_model: None,
+                    selected_service: None,
                     favorites_changed,
                 });
             }
@@ -446,28 +620,33 @@ fn interactive_model_picker(
 }
 
 fn select_model_fallback(
-    models: &[ModelInfo],
+    models: &[CatalogModel],
     state: &mut ModelState,
 ) -> Result<ModelSelection, Box<dyn std::error::Error>> {
-    println!("NanoGPT Models");
+    println!("Models");
     for (index, model) in models.iter().take(25).enumerate() {
-        let current = if state.current_model.as_deref() == Some(model.id.as_str()) {
+        let current = if state.current_model.as_deref() == Some(model.info.id.as_str()) {
             ">"
         } else {
             " "
         };
-        let favorite = if state.favorite_models.iter().any(|entry| entry == &model.id) {
+        let favorite = if state
+            .favorite_models
+            .iter()
+            .any(|entry| entry == &model.info.id)
+        {
             "*"
         } else {
             " "
         };
         println!(
-            "{:>2}. {}{} {} ({})",
+            "{:>2}. {}{} [{}] {} ({})",
             index + 1,
             current,
             favorite,
-            display_name(model),
-            model.id
+            model.service.display_name(),
+            display_name(&model.info),
+            model.info.id
         );
     }
     print!("Choose a model by number or exact id: ");
@@ -479,6 +658,7 @@ fn select_model_fallback(
     if input.is_empty() {
         return Ok(ModelSelection {
             selected_model: None,
+            selected_service: None,
             favorites_changed: false,
         });
     }
@@ -486,18 +666,19 @@ fn select_model_fallback(
     let selected_model = if let Ok(index) = input.parse::<usize>() {
         models
             .get(index.saturating_sub(1))
-            .map(|model| model.id.clone())
+            .map(|model| model.info.id.clone())
             .ok_or_else(|| format!("model number {index} is out of range"))?
     } else {
         models
             .iter()
-            .find(|model| model.id == input)
-            .map(|model| model.id.clone())
+            .find(|model| model.info.id == input)
+            .map(|model| model.info.id.clone())
             .ok_or_else(|| format!("unknown model id: {input}"))?
     };
 
     Ok(ModelSelection {
-        selected_model: Some(selected_model),
+        selected_model: Some(selected_model.clone()),
+        selected_service: Some(infer_service_for_model(&selected_model)),
         favorites_changed: false,
     })
 }
@@ -571,13 +752,20 @@ fn interactive_provider_picker(
         return Ok(ProviderSelection { selected_provider });
     }
 
-    let mut cursor = current_provider
+    let current_index = current_provider
         .as_deref()
         .and_then(|provider| {
             entries
                 .iter()
                 .position(|entry| entry.0.as_deref() == Some(provider))
         })
+        .unwrap_or(0);
+    let mut query = String::new();
+    let mut search_mode = false;
+    let mut filtered_indices = filtered_provider_indices(&entries, &query);
+    let mut cursor = filtered_indices
+        .iter()
+        .position(|index| *index == current_index)
         .unwrap_or(0);
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -586,8 +774,20 @@ fn interactive_provider_picker(
         write_raw_line(&mut stdout, &format!("Providers for {model}"))?;
         write_raw_line(
             &mut stdout,
-            "Use Up/Down or j/k to move, Enter to select, q to cancel",
+            "Up/Down move, Enter select, / search, q cancel",
         )?;
+        let search_label = if query.is_empty() {
+            if search_mode {
+                "Search: ".to_string()
+            } else {
+                "Search: / to filter".to_string()
+            }
+        } else if search_mode {
+            format!("Search: {query}_")
+        } else {
+            format!("Search: {query}")
+        };
+        write_raw_line(&mut stdout, &search_label)?;
         write_raw_line(
             &mut stdout,
             &format!(
@@ -597,21 +797,33 @@ fn interactive_provider_picker(
         )?;
         write_raw_line(&mut stdout, "")?;
 
-        for (index, (_, label)) in entries.iter().enumerate() {
-            let selected_marker = if index == cursor { ">" } else { " " };
-            let current_marker = if current_provider.as_deref() == entries[index].0.as_deref() {
-                "o"
-            } else {
-                " "
-            };
+        for (visible_index, entry_index) in filtered_indices.iter().enumerate() {
+            let (_, label) = &entries[*entry_index];
+            let selected_marker = if visible_index == cursor { ">" } else { " " };
+            let current_marker =
+                if current_provider.as_deref() == entries[*entry_index].0.as_deref() {
+                    "o"
+                } else {
+                    " "
+                };
             write_raw_line(
                 &mut stdout,
                 &format!("{}{} {}", selected_marker, current_marker, label),
             )?;
         }
+        if filtered_indices.is_empty() {
+            write_raw_line(&mut stdout, "No providers match the current search.")?;
+        }
         stdout.flush()?;
 
         match event::read()? {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('/'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }) => {
+                search_mode = true;
+            }
             Event::Key(KeyEvent {
                 code: KeyCode::Up, ..
             })
@@ -619,7 +831,12 @@ fn interactive_provider_picker(
                 code: KeyCode::Char('k'),
                 modifiers: KeyModifiers::NONE,
                 ..
-            }) => cursor = cursor.saturating_sub(1),
+            }) if !search_mode => cursor = cursor.saturating_sub(1),
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('k'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }) => {}
             Event::Key(KeyEvent {
                 code: KeyCode::Down,
                 ..
@@ -628,16 +845,60 @@ fn interactive_provider_picker(
                 code: KeyCode::Char('j'),
                 modifiers: KeyModifiers::NONE,
                 ..
-            }) => cursor = (cursor + 1).min(entries.len().saturating_sub(1)),
+            }) if !search_mode => {
+                cursor = (cursor + 1).min(filtered_indices.len().saturating_sub(1))
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }) => {}
             Event::Key(KeyEvent {
                 code: KeyCode::Enter,
                 ..
             }) => {
+                if search_mode {
+                    search_mode = false;
+                    continue;
+                }
+                let Some(entry_index) = filtered_indices.get(cursor) else {
+                    continue;
+                };
                 disable_raw_mode()?;
                 write!(stdout, "\r\n")?;
                 return Ok(ProviderSelection {
-                    selected_provider: entries[cursor].0.clone(),
+                    selected_provider: entries[*entry_index].0.clone(),
                 });
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            }) => {
+                if !query.is_empty() {
+                    query.pop();
+                    filtered_indices = filtered_provider_indices(&entries, &query);
+                    cursor = updated_cursor(&filtered_indices, cursor, current_index);
+                    search_mode = true;
+                }
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('u'),
+                modifiers,
+                ..
+            }) if modifiers.contains(KeyModifiers::CONTROL) => {
+                query.clear();
+                filtered_indices = filtered_provider_indices(&entries, &query);
+                cursor = updated_cursor(&filtered_indices, cursor, current_index);
+                search_mode = false;
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            }) if search_mode && (modifiers.is_empty() || modifiers == KeyModifiers::SHIFT) => {
+                query.push(ch);
+                filtered_indices = filtered_provider_indices(&entries, &query);
+                cursor = updated_cursor(&filtered_indices, cursor, current_index);
             }
             Event::Key(KeyEvent {
                 code: KeyCode::Esc, ..
@@ -647,6 +908,13 @@ fn interactive_provider_picker(
                 modifiers: KeyModifiers::NONE,
                 ..
             }) => {
+                if search_mode || !query.is_empty() {
+                    query.clear();
+                    filtered_indices = filtered_provider_indices(&entries, &query);
+                    cursor = updated_cursor(&filtered_indices, cursor, current_index);
+                    search_mode = false;
+                    continue;
+                }
                 disable_raw_mode()?;
                 write!(stdout, "\r\n")?;
                 return Ok(ProviderSelection {
@@ -660,10 +928,11 @@ fn interactive_provider_picker(
 
 fn draw_model_picker(
     stdout: &mut impl Write,
-    models: &[ModelInfo],
+    models: &[CatalogModel],
     state: &ModelState,
     filtered_indices: &[usize],
     cursor: usize,
+    current_service: ApiService,
     query: &str,
     search_mode: bool,
 ) -> io::Result<()> {
@@ -671,11 +940,23 @@ fn draw_model_picker(
     let (width, height) = terminal_dimensions();
     let content_width = width.saturating_sub(1).clamp(24, 88);
     let visible_rows = model_visible_rows(height);
-    write_raw_line(stdout, "NanoGPT Models")?;
+    write_raw_line(stdout, "Models")?;
     write_raw_line(
         stdout,
         &fit_line(
-            "Up/Down move, Enter select, / search, f favorite, q cancel",
+            "Tab/Left/Right switch service, Up/Down move, Enter select, / search, f favorite, q cancel",
+            content_width,
+        ),
+    )?;
+    write_raw_line(
+        stdout,
+        &fit_line(
+            &format!(
+                "Service: {}    Tabs: {}  {}",
+                current_service.display_name(),
+                service_tab_label(ApiService::NanoGpt, current_service),
+                service_tab_label(ApiService::Synthetic, current_service),
+            ),
             content_width,
         ),
     )?;
@@ -715,12 +996,16 @@ fn draw_model_picker(
     {
         let model = &models[*model_index];
         let selected_marker = if visible_index == cursor { ">" } else { " " };
-        let favorite_marker = if state.favorite_models.iter().any(|entry| entry == &model.id) {
+        let favorite_marker = if state
+            .favorite_models
+            .iter()
+            .any(|entry| entry == &model.info.id)
+        {
             "*"
         } else {
             " "
         };
-        let current_marker = if state.current_model.as_deref() == Some(model.id.as_str()) {
+        let current_marker = if state.current_model.as_deref() == Some(model.info.id.as_str()) {
             "o"
         } else {
             " "
@@ -744,7 +1029,7 @@ fn draw_model_picker(
             stdout,
             &fit_line(&selected_summary(selected), content_width),
         )?;
-        if let Some(description) = &selected.description {
+        if let Some(description) = &selected.info.description {
             for line in wrap_text(description, content_width, 2) {
                 write_raw_line(stdout, &line)?;
             }
@@ -762,6 +1047,23 @@ fn draw_model_picker(
     stdout.flush()
 }
 
+fn cycle_service(current: ApiService, forward: bool) -> ApiService {
+    match (current, forward) {
+        (ApiService::NanoGpt, true) => ApiService::Synthetic,
+        (ApiService::Synthetic, true) => ApiService::NanoGpt,
+        (ApiService::NanoGpt, false) => ApiService::Synthetic,
+        (ApiService::Synthetic, false) => ApiService::NanoGpt,
+    }
+}
+
+fn service_tab_label(service: ApiService, current: ApiService) -> String {
+    if service == current {
+        format!("[{}]", service.display_name())
+    } else {
+        service.display_name().to_string()
+    }
+}
+
 fn terminal_dimensions() -> (usize, usize) {
     size()
         .map(|(width, height)| (usize::from(width), usize::from(height)))
@@ -772,38 +1074,43 @@ fn model_visible_rows(height: usize) -> usize {
     height.saturating_sub(10).clamp(6, DEFAULT_VISIBLE_ROWS)
 }
 
-fn model_list_label(model: &ModelInfo) -> String {
-    let mut segments = vec![display_name(model).to_string()];
-    if display_name(model) != model.id {
-        segments.push(short_model_id(&model.id));
+fn model_list_label(model: &CatalogModel) -> String {
+    let mut segments = vec![display_name(&model.info).to_string()];
+    if display_name(&model.info) != model.info.id {
+        segments.push(short_model_id(&model.info.id));
     }
-    segments.push(model.owned_by.clone());
-    if let Some(category) = &model.category {
+    segments.push(model.info.owned_by.clone());
+    if let Some(category) = &model.info.category {
         segments.push(category.clone());
     }
     segments.join(" | ")
 }
 
-fn selected_summary(model: &ModelInfo) -> String {
-    format!("Selected: {} | {}", display_name(model), model.id)
+fn selected_summary(model: &CatalogModel) -> String {
+    format!(
+        "Selected: {} | {} | {}",
+        model.service.display_name(),
+        display_name(&model.info),
+        model.info.id
+    )
 }
 
-fn detail_line(model: &ModelInfo) -> String {
+fn detail_line(model: &CatalogModel) -> String {
     let mut parts = Vec::new();
-    if let Some(category) = &model.category {
+    if let Some(category) = &model.info.category {
         parts.push(format!("category={category}"));
     }
-    if let Some(context_length) = model.context_length {
+    if let Some(context_length) = model.info.context_length {
         parts.push(format!("ctx={context_length}"));
     }
-    if let Some(max_output_tokens) = model.max_output_tokens {
+    if let Some(max_output_tokens) = model.info.max_output_tokens {
         parts.push(format!("max_out={max_output_tokens}"));
     }
-    let pricing = pricing_summary(model.pricing.as_ref());
+    let pricing = pricing_summary(model.info.pricing.as_ref());
     if pricing != "pricing n/a" {
         parts.push(pricing);
     }
-    let capabilities = capability_summary(model.capabilities.as_ref());
+    let capabilities = capability_summary(model.info.capabilities.as_ref());
     if !capabilities.is_empty() {
         parts.push(format!("caps={capabilities}"));
     }
@@ -876,16 +1183,22 @@ fn write_raw_line(stdout: &mut impl Write, line: &str) -> io::Result<()> {
     write!(stdout, "{line}\r\n")
 }
 
-fn filtered_model_indices(models: &[ModelInfo], query: &str) -> Vec<usize> {
+fn filtered_model_indices(models: &[CatalogModel], service: ApiService, query: &str) -> Vec<usize> {
     if query.trim().is_empty() {
-        return (0..models.len()).collect();
+        return models
+            .iter()
+            .enumerate()
+            .filter_map(|(index, model)| (model.service == service).then_some(index))
+            .collect();
     }
 
     let query = query.to_ascii_lowercase();
     models
         .iter()
         .enumerate()
-        .filter_map(|(index, model)| model_matches_query(model, &query).then_some(index))
+        .filter_map(|(index, model)| {
+            (model.service == service && model_matches_query(&model.info, &query)).then_some(index)
+        })
         .collect()
 }
 
@@ -899,7 +1212,51 @@ fn model_matches_query(model: &ModelInfo, query: &str) -> bool {
     ]
     .into_iter()
     .flatten()
-    .any(|value| value.to_ascii_lowercase().contains(query))
+    .any(|value| fuzzy_match(&value.to_ascii_lowercase(), query))
+}
+
+fn filtered_provider_indices(entries: &[(Option<String>, String)], query: &str) -> Vec<usize> {
+    if query.trim().is_empty() {
+        return (0..entries.len()).collect();
+    }
+
+    let query = query.to_ascii_lowercase();
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (provider, label))| {
+            let matches_provider = provider
+                .as_deref()
+                .is_some_and(|value| fuzzy_match(&value.to_ascii_lowercase(), &query));
+            let matches_label = fuzzy_match(&label.to_ascii_lowercase(), &query);
+            (matches_provider || matches_label).then_some(index)
+        })
+        .collect()
+}
+
+fn fuzzy_match(haystack: &str, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    if haystack.contains(query) {
+        return true;
+    }
+
+    let mut query_chars = query.chars();
+    let mut current = match query_chars.next() {
+        Some(ch) => ch,
+        None => return true,
+    };
+
+    for hay in haystack.chars() {
+        if hay == current {
+            match query_chars.next() {
+                Some(next) => current = next,
+                None => return true,
+            }
+        }
+    }
+    false
 }
 
 fn updated_cursor(
@@ -1008,23 +1365,6 @@ fn toggle_favorite(model_id: &str, state: &mut ModelState) {
     }
 }
 
-fn load_credentials_api_key() -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let path = nanocode_config_home()?.join("credentials.json");
-    match fs::read_to_string(path) {
-        Ok(contents) => {
-            let parsed = serde_json::from_str::<serde_json::Value>(&contents)?;
-            Ok(parsed
-                .get("nanogpt_api_key")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| parsed.get("apiKey").and_then(serde_json::Value::as_str))
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned))
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(Box::new(error)),
-    }
-}
-
 fn state_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(nanocode_config_home()?.join("state.json"))
 }
@@ -1041,9 +1381,12 @@ fn nanocode_config_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use api::ModelInfo;
+    use api::{ApiService, ModelInfo};
 
-    use super::{filtered_model_indices, toggle_favorite, update_output_token_cache, ModelState};
+    use super::{
+        filtered_model_indices, toggle_favorite, update_output_token_cache, CatalogModel,
+        ModelState,
+    };
 
     #[test]
     fn toggles_favorite_membership() {
@@ -1057,13 +1400,36 @@ mod tests {
     #[test]
     fn filters_models_by_name_or_id_or_category() {
         let models = vec![
-            model("zai-org/glm-5.1", Some("GLM 5.1"), Some("More")),
-            model("openai/gpt-5.4", Some("GPT 5.4"), Some("Flagship")),
+            catalog_model(
+                ApiService::NanoGpt,
+                "zai-org/glm-5.1",
+                Some("GLM 5.1"),
+                Some("More"),
+            ),
+            catalog_model(
+                ApiService::NanoGpt,
+                "openai/gpt-5.4",
+                Some("GPT 5.4"),
+                Some("Flagship"),
+            ),
         ];
 
-        assert_eq!(filtered_model_indices(&models, "glm"), vec![0]);
-        assert_eq!(filtered_model_indices(&models, "gpt-5.4"), vec![1]);
-        assert_eq!(filtered_model_indices(&models, "flag"), vec![1]);
+        assert_eq!(
+            filtered_model_indices(&models, ApiService::NanoGpt, "glm"),
+            vec![0]
+        );
+        assert_eq!(
+            filtered_model_indices(&models, ApiService::NanoGpt, "gpt-5.4"),
+            vec![1]
+        );
+        assert_eq!(
+            filtered_model_indices(&models, ApiService::NanoGpt, "flag"),
+            vec![1]
+        );
+        assert_eq!(
+            filtered_model_indices(&models, ApiService::NanoGpt, "gm51"),
+            vec![0]
+        );
     }
 
     #[test]
@@ -1096,6 +1462,18 @@ mod tests {
             cost_estimate: None,
             tags: None,
             supports_provider_selection: None,
+        }
+    }
+
+    fn catalog_model(
+        service: ApiService,
+        id: &str,
+        name: Option<&str>,
+        category: Option<&str>,
+    ) -> CatalogModel {
+        CatalogModel {
+            service,
+            info: model(id, name, category),
         }
     }
 }

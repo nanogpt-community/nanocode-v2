@@ -95,24 +95,21 @@ impl Helper for SlashCommandHelper {}
 
 pub struct LineEditor {
     prompt: String,
+    completions: Vec<String>,
+    vim_enabled: bool,
     editor: Editor<SlashCommandHelper, DefaultHistory>,
 }
 
 impl LineEditor {
     #[must_use]
     pub fn new(prompt: impl Into<String>, completions: Vec<String>) -> Self {
-        let config = Config::builder()
-            .completion_type(CompletionType::List)
-            .edit_mode(EditMode::Emacs)
-            .build();
-        let mut editor = Editor::<SlashCommandHelper, DefaultHistory>::with_config(config)
-            .expect("rustyline editor should initialize");
-        editor.set_helper(Some(SlashCommandHelper::new(completions)));
-        editor.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
-        editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::SHIFT), Cmd::Newline);
+        let vim_enabled = env_flag_enabled("NANOCODE_VIM");
+        let editor = Self::build_editor(completions.clone(), vim_enabled);
 
         Self {
             prompt: prompt.into(),
+            completions,
+            vim_enabled,
             editor,
         }
     }
@@ -127,31 +124,60 @@ impl LineEditor {
     }
 
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
-        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-            return self.read_line_fallback();
-        }
+        loop {
+            if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                return self.read_line_fallback();
+            }
 
-        if let Some(helper) = self.editor.helper_mut() {
-            helper.reset_current_line();
-        }
+            if let Some(helper) = self.editor.helper_mut() {
+                helper.reset_current_line();
+            }
 
-        match self.editor.readline(&self.prompt) {
-            Ok(line) => Ok(ReadOutcome::Submit(line)),
-            Err(ReadlineError::Interrupted) => {
-                let has_input = !self.current_line().is_empty();
-                self.finish_interrupted_read()?;
-                if has_input {
-                    Ok(ReadOutcome::Cancel)
-                } else {
-                    Ok(ReadOutcome::Exit)
+            match self.editor.readline(&self.prompt) {
+                Ok(line) => {
+                    if self.handle_submission(&line)? {
+                        continue;
+                    }
+                    return Ok(ReadOutcome::Submit(line));
                 }
+                Err(ReadlineError::Interrupted) => {
+                    let has_input = !self.current_line().is_empty();
+                    self.finish_interrupted_read()?;
+                    return if has_input {
+                        Ok(ReadOutcome::Cancel)
+                    } else {
+                        Ok(ReadOutcome::Exit)
+                    };
+                }
+                Err(ReadlineError::Eof) => {
+                    self.finish_interrupted_read()?;
+                    return Ok(ReadOutcome::Exit);
+                }
+                Err(error) => return Err(io::Error::other(error)),
             }
-            Err(ReadlineError::Eof) => {
-                self.finish_interrupted_read()?;
-                Ok(ReadOutcome::Exit)
-            }
-            Err(error) => Err(io::Error::other(error)),
         }
+    }
+
+    fn build_editor(
+        completions: Vec<String>,
+        vim_enabled: bool,
+    ) -> Editor<SlashCommandHelper, DefaultHistory> {
+        let config = Config::builder()
+            .completion_type(CompletionType::List)
+            .edit_mode(if vim_enabled {
+                EditMode::Vi
+            } else {
+                EditMode::Emacs
+            })
+            .build();
+        let mut editor = Editor::<SlashCommandHelper, DefaultHistory>::with_config(config)
+            .expect("rustyline editor should initialize");
+        editor.set_helper(Some(SlashCommandHelper::new(completions)));
+        editor.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
+        editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::SHIFT), Cmd::Newline);
+        editor.bind_sequence(KeyEvent(KeyCode::Up, Modifiers::NONE), Cmd::PreviousHistory);
+        editor.bind_sequence(KeyEvent(KeyCode::Down, Modifiers::NONE), Cmd::NextHistory);
+        editor
     }
 
     fn current_line(&self) -> String {
@@ -168,22 +194,75 @@ impl LineEditor {
         writeln!(stdout)
     }
 
-    fn read_line_fallback(&self) -> io::Result<ReadOutcome> {
-        let mut stdout = io::stdout();
-        write!(stdout, "{}", self.prompt)?;
-        stdout.flush()?;
+    fn read_line_fallback(&mut self) -> io::Result<ReadOutcome> {
+        loop {
+            let mut stdout = io::stdout();
+            write!(stdout, "{}", self.prompt)?;
+            stdout.flush()?;
 
-        let mut buffer = String::new();
-        let bytes_read = io::stdin().read_line(&mut buffer)?;
-        if bytes_read == 0 {
-            return Ok(ReadOutcome::Exit);
-        }
+            let mut buffer = String::new();
+            let bytes_read = io::stdin().read_line(&mut buffer)?;
+            if bytes_read == 0 {
+                return Ok(ReadOutcome::Exit);
+            }
 
-        while matches!(buffer.chars().last(), Some('\n' | '\r')) {
-            buffer.pop();
+            while matches!(buffer.chars().last(), Some('\n' | '\r')) {
+                buffer.pop();
+            }
+
+            if self.handle_submission(&buffer)? {
+                continue;
+            }
+
+            return Ok(ReadOutcome::Submit(buffer));
         }
-        Ok(ReadOutcome::Submit(buffer))
     }
+
+    fn handle_submission(&mut self, line: &str) -> io::Result<bool> {
+        if line.trim() == "/vim" {
+            self.toggle_vim()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn toggle_vim(&mut self) -> io::Result<()> {
+        let history = self
+            .editor
+            .history()
+            .iter()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+
+        self.vim_enabled = !self.vim_enabled;
+        self.editor = Self::build_editor(self.completions.clone(), self.vim_enabled);
+        for entry in history {
+            let _ = self.editor.add_history_entry(entry);
+        }
+
+        let mut stdout = io::stdout();
+        writeln!(
+            stdout,
+            "Vim mode {}.",
+            if self.vim_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        )
+    }
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn slash_command_prefix(line: &str, pos: usize) -> Option<&str> {
@@ -264,6 +343,22 @@ mod tests {
         editor.push_history("   ");
         editor.push_history("/help");
 
+        assert_eq!(editor.editor.history().len(), 1);
+    }
+
+    #[test]
+    fn vim_toggle_rebuilds_editor_and_preserves_history() {
+        let mut editor = LineEditor::new("> ", vec!["/help".to_string(), "/vim".to_string()]);
+        editor.push_history("/help");
+
+        assert!(!editor.vim_enabled);
+
+        let toggled = editor
+            .handle_submission("/vim")
+            .expect("toggle should succeed");
+
+        assert!(toggled);
+        assert!(editor.vim_enabled);
         assert_eq!(editor.editor.history().len(), 1);
     }
 }

@@ -273,7 +273,10 @@ impl HookRunner {
             return HookRunResult {
                 denied: false,
                 cancelled: true,
-                messages: vec![format!("{} hook cancelled before execution", event.as_str())],
+                messages: vec![format!(
+                    "{} hook cancelled before execution",
+                    event.as_str()
+                )],
                 permission_override: None,
                 permission_reason: None,
                 updated_input: None,
@@ -733,7 +736,10 @@ mod tests {
 
         let result = runner.run_pre_tool_use("bash", r#"{"command":"pwd"}"#);
 
-        assert_eq!(result.permission_override(), Some(PermissionOverride::Allow));
+        assert_eq!(
+            result.permission_override(),
+            Some(PermissionOverride::Allow)
+        );
         assert_eq!(result.permission_reason(), Some("hook ok"));
         assert_eq!(result.updated_input(), Some(r#"{"command":"git status"}"#));
         assert!(result.messages().iter().any(|message| message == "updated"));

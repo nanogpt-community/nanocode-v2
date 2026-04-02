@@ -1120,9 +1120,8 @@ fn unix_time_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{
-        read_optional_json, HookRunner, PluginKind, PluginManager, PluginManagerConfig,
-        PluginTool, PluginToolDefinition, PluginToolPermission, MANIFEST_DIR_NAME,
-        MANIFEST_FILE_NAME,
+        read_optional_json, HookRunner, PluginKind, PluginManager, PluginManagerConfig, PluginTool,
+        PluginToolDefinition, PluginToolPermission, MANIFEST_DIR_NAME, MANIFEST_FILE_NAME,
     };
     use serde_json::json;
     use std::fs;

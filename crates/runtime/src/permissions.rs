@@ -230,8 +230,8 @@ impl PermissionPolicy {
 #[cfg(test)]
 mod tests {
     use super::{
-        PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride,
-        PermissionPolicy, PermissionPromptDecision, PermissionPrompter, PermissionRequest,
+        PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
+        PermissionPromptDecision, PermissionPrompter, PermissionRequest,
     };
 
     struct RecordingPrompter {

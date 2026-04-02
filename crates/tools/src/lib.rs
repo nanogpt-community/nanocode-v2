@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use api::{
-    InputContentBlock, InputMessage, MessageRequest, NanoGptClient, OutputContentBlock, ToolChoice,
-    ToolDefinition,
+    resolve_api_key_for, resolve_root_url_for, ApiService, InputContentBlock, InputMessage,
+    MessageRequest, NanoGptClient, OutputContentBlock, ToolChoice, ToolDefinition,
 };
 use plugins::{PluginManager, PluginManagerConfig, PluginTool};
 use reqwest::blocking::Client;
@@ -60,6 +61,34 @@ pub struct RegisteredTool {
     pub definition: ToolDefinition,
     pub required_permission: PermissionMode,
     handler: RegisteredToolHandler,
+}
+
+static ACTIVE_BACKEND_SERVICE: OnceLock<Mutex<ApiService>> = OnceLock::new();
+
+fn active_backend_service_cell() -> &'static Mutex<ApiService> {
+    ACTIVE_BACKEND_SERVICE.get_or_init(|| Mutex::new(ApiService::NanoGpt))
+}
+
+pub struct ActiveBackendServiceGuard {
+    previous: ApiService,
+}
+
+pub fn set_active_backend_service(service: ApiService) -> ActiveBackendServiceGuard {
+    let mut guard = active_backend_service_cell()
+        .lock()
+        .expect("active backend service lock should not be poisoned");
+    let previous = *guard;
+    *guard = service;
+    drop(guard);
+    ActiveBackendServiceGuard { previous }
+}
+
+impl Drop for ActiveBackendServiceGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = active_backend_service_cell().lock() {
+            *guard = self.previous;
+        }
+    }
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -461,6 +490,19 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "minLength": 2 },
+                    "provider": { "type": "string" },
+                    "depth": {
+                        "type": "string",
+                        "enum": ["standard", "deep"]
+                    },
+                    "outputType": {
+                        "type": "string",
+                        "enum": ["searchResults", "sourcedAnswer", "structured"]
+                    },
+                    "includeImages": { "type": "boolean" },
+                    "fromDate": { "type": "string" },
+                    "toDate": { "type": "string" },
+                    "structuredOutputSchema": { "type": "string" },
                     "allowed_domains": {
                         "type": "array",
                         "items": { "type": "string" }
@@ -471,6 +513,25 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     }
                 },
                 "required": ["query"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "WebScrape",
+            description: "Scrape one or more web pages into clean markdown and metadata.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "urls": {
+                        "type": "array",
+                        "items": { "type": "string", "format": "uri" },
+                        "minItems": 1,
+                        "maxItems": 5
+                    },
+                    "stealthMode": { "type": "boolean" }
+                },
+                "required": ["urls"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
@@ -668,6 +729,7 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
         "grep_search" => from_value::<GrepSearchInput>(input).and_then(run_grep_search),
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
+        "WebScrape" => from_value::<WebScrapeInput>(input).and_then(run_web_scrape),
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
@@ -735,6 +797,11 @@ fn run_web_fetch(input: WebFetchInput) -> Result<String, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn run_web_search(input: WebSearchInput) -> Result<String, String> {
     to_pretty_json(execute_web_search(&input)?)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_web_scrape(input: WebScrapeInput) -> Result<String, String> {
+    to_pretty_json(execute_web_scrape(&input)?)
 }
 
 fn run_todo_write(input: TodoWriteInput) -> Result<String, String> {
@@ -826,8 +893,27 @@ struct WebFetchInput {
 #[derive(Debug, Deserialize)]
 struct WebSearchInput {
     query: String,
+    provider: Option<String>,
+    depth: Option<String>,
+    #[serde(rename = "outputType")]
+    output_type: Option<String>,
+    #[serde(rename = "includeImages")]
+    include_images: Option<bool>,
+    #[serde(rename = "fromDate")]
+    from_date: Option<String>,
+    #[serde(rename = "toDate")]
+    to_date: Option<String>,
+    #[serde(rename = "structuredOutputSchema")]
+    structured_output_schema: Option<String>,
     allowed_domains: Option<Vec<String>>,
     blocked_domains: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebScrapeInput {
+    urls: Vec<String>,
+    #[serde(rename = "stealthMode")]
+    stealth_mode: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -965,6 +1051,14 @@ struct WebFetchOutput {
 struct WebSearchOutput {
     query: String,
     results: Vec<WebSearchResultItem>,
+    #[serde(rename = "durationSeconds")]
+    duration_seconds: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct WebScrapeOutput {
+    results: Vec<WebScrapeResultItem>,
+    summary: WebScrapeSummary,
     #[serde(rename = "durationSeconds")]
     duration_seconds: f64,
 }
@@ -1117,6 +1211,123 @@ struct SearchHit {
     url: String,
 }
 
+#[derive(Debug, Serialize)]
+struct WebScrapeResultItem {
+    url: String,
+    success: bool,
+    title: Option<String>,
+    content: Option<String>,
+    markdown: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WebScrapeSummary {
+    requested: u64,
+    processed: u64,
+    successful: u64,
+    failed: u64,
+    #[serde(rename = "totalCost")]
+    total_cost: Option<f64>,
+    #[serde(rename = "stealthModeUsed")]
+    stealth_mode_used: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct NanoGptWebSearchRequest {
+    query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depth: Option<String>,
+    #[serde(rename = "outputType", skip_serializing_if = "Option::is_none")]
+    output_type: Option<String>,
+    #[serde(
+        rename = "structuredOutputSchema",
+        skip_serializing_if = "Option::is_none"
+    )]
+    structured_output_schema: Option<String>,
+    #[serde(rename = "includeImages", skip_serializing_if = "Option::is_none")]
+    include_images: Option<bool>,
+    #[serde(rename = "fromDate", skip_serializing_if = "Option::is_none")]
+    from_date: Option<String>,
+    #[serde(rename = "toDate", skip_serializing_if = "Option::is_none")]
+    to_date: Option<String>,
+    #[serde(rename = "includeDomains", skip_serializing_if = "Option::is_none")]
+    include_domains: Option<Vec<String>>,
+    #[serde(rename = "excludeDomains", skip_serializing_if = "Option::is_none")]
+    exclude_domains: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NanoGptWebSearchResponse {
+    data: Value,
+    metadata: NanoGptWebSearchMetadata,
+}
+
+#[derive(Debug, Deserialize)]
+struct NanoGptWebSearchMetadata {
+    query: String,
+    provider: String,
+    depth: String,
+    #[serde(rename = "outputType")]
+    output_type: String,
+    cost: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct NanoGptWebScrapeRequest {
+    urls: Vec<String>,
+    #[serde(rename = "stealthMode", skip_serializing_if = "Option::is_none")]
+    stealth_mode: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NanoGptWebScrapeResponse {
+    results: Vec<NanoGptWebScrapeResult>,
+    summary: NanoGptWebScrapeSummary,
+}
+
+#[derive(Debug, Deserialize)]
+struct NanoGptWebScrapeResult {
+    url: String,
+    success: bool,
+    title: Option<String>,
+    content: Option<String>,
+    markdown: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NanoGptWebScrapeSummary {
+    requested: u64,
+    processed: u64,
+    successful: u64,
+    failed: u64,
+    #[serde(rename = "totalCost")]
+    total_cost: Option<f64>,
+    #[serde(rename = "stealthModeUsed")]
+    stealth_mode_used: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct SyntheticSearchRequest {
+    query: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyntheticSearchResponse {
+    results: Vec<SyntheticSearchResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyntheticSearchResult {
+    url: String,
+    title: Option<String>,
+    text: Option<String>,
+    published: Option<String>,
+}
+
 fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     let started = Instant::now();
     let client = build_http_client()?;
@@ -1152,45 +1363,88 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
 }
 
 fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
+    match active_backend_service() {
+        ApiService::NanoGpt => execute_nanogpt_web_search(input),
+        ApiService::Synthetic => execute_synthetic_web_search(input),
+    }
+}
+
+fn execute_nanogpt_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
     let started = Instant::now();
     let client = build_http_client()?;
-    let search_url = build_search_url(&input.query)?;
+    let api_key = resolve_api_key_for(ApiService::NanoGpt).map_err(|error| error.to_string())?;
+    let request = NanoGptWebSearchRequest {
+        query: input.query.clone(),
+        provider: input.provider.clone(),
+        depth: input.depth.clone(),
+        output_type: input.output_type.clone(),
+        structured_output_schema: input.structured_output_schema.clone(),
+        include_images: input.include_images,
+        from_date: input.from_date.clone(),
+        to_date: input.to_date.clone(),
+        include_domains: input.allowed_domains.clone(),
+        exclude_domains: input.blocked_domains.clone(),
+    };
     let response = client
-        .get(search_url)
+        .post(nanogpt_web_search_url()?)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header("authorization", format!("Bearer {api_key}"))
+        .header("x-api-key", &api_key)
+        .json(&request)
         .send()
         .map_err(|error| error.to_string())?;
+    let response = response
+        .error_for_status()
+        .map_err(|error| error.to_string())?;
+    let payload = response
+        .json::<NanoGptWebSearchResponse>()
+        .map_err(|error| error.to_string())?;
+    let hits = extract_nanogpt_search_hits(&payload.data);
 
-    let final_url = response.url().clone();
-    let html = response.text().map_err(|error| error.to_string())?;
-    let mut hits = extract_search_hits(&html);
+    let summary = summarize_nanogpt_web_search(&payload, &hits);
 
-    if hits.is_empty() && final_url.host_str().is_some() {
-        hits = extract_search_hits_from_generic_links(&html);
-    }
+    Ok(WebSearchOutput {
+        query: payload.metadata.query,
+        results: vec![
+            WebSearchResultItem::Commentary(summary),
+            WebSearchResultItem::SearchResult {
+                tool_use_id: String::from("web_search_1"),
+                content: hits,
+            },
+        ],
+        duration_seconds: started.elapsed().as_secs_f64(),
+    })
+}
 
-    if let Some(allowed) = input.allowed_domains.as_ref() {
-        hits.retain(|hit| host_matches_list(&hit.url, allowed));
-    }
-    if let Some(blocked) = input.blocked_domains.as_ref() {
-        hits.retain(|hit| !host_matches_list(&hit.url, blocked));
-    }
+fn execute_synthetic_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
+    let started = Instant::now();
+    let client = build_http_client()?;
+    let api_key = resolve_api_key_for(ApiService::Synthetic).map_err(|error| error.to_string())?;
+    let url = synthetic_web_search_url()?;
+    let payload = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .bearer_auth(api_key)
+        .json(&SyntheticSearchRequest {
+            query: input.query.clone(),
+        })
+        .send()
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?
+        .json::<SyntheticSearchResponse>()
+        .map_err(|error| error.to_string())?;
 
-    dedupe_hits(&mut hits);
-    hits.truncate(8);
+    let hits = payload
+        .results
+        .iter()
+        .map(|result| SearchHit {
+            title: result.title.clone().unwrap_or_else(|| result.url.clone()),
+            url: result.url.clone(),
+        })
+        .collect::<Vec<_>>();
 
-    let summary = if hits.is_empty() {
-        format!("No web search results matched the query {:?}.", input.query)
-    } else {
-        let rendered_hits = hits
-            .iter()
-            .map(|hit| format!("- [{}]({})", hit.title, hit.url))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!(
-            "Search results for {:?}. Include a Sources section in the final answer.\n{}",
-            input.query, rendered_hits
-        )
-    };
+    let summary = summarize_synthetic_search(&payload.results);
 
     Ok(WebSearchOutput {
         query: input.query.clone(),
@@ -1203,6 +1457,96 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
         ],
         duration_seconds: started.elapsed().as_secs_f64(),
     })
+}
+
+fn execute_web_scrape(input: &WebScrapeInput) -> Result<WebScrapeOutput, String> {
+    if input.urls.is_empty() {
+        return Err(String::from("at least one URL is required"));
+    }
+    if input.urls.len() > 5 {
+        return Err(String::from("a maximum of 5 URLs is allowed"));
+    }
+
+    for url in &input.urls {
+        reqwest::Url::parse(url).map_err(|error| error.to_string())?;
+    }
+
+    let started = Instant::now();
+    let client = build_http_client()?;
+    let api_key = resolve_api_key_for(ApiService::NanoGpt).map_err(|error| error.to_string())?;
+    let response = client
+        .post(nanogpt_web_scrape_url()?)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header("authorization", format!("Bearer {api_key}"))
+        .header("x-api-key", &api_key)
+        .json(&NanoGptWebScrapeRequest {
+            urls: input.urls.clone(),
+            stealth_mode: input.stealth_mode,
+        })
+        .send()
+        .map_err(|error| error.to_string())?;
+    let payload = response
+        .error_for_status()
+        .map_err(|error| error.to_string())?
+        .json::<NanoGptWebScrapeResponse>()
+        .map_err(|error| error.to_string())?;
+
+    Ok(WebScrapeOutput {
+        results: payload
+            .results
+            .into_iter()
+            .map(|result| WebScrapeResultItem {
+                url: result.url,
+                success: result.success,
+                title: result.title,
+                content: result.content,
+                markdown: result.markdown,
+                error: result.error,
+            })
+            .collect(),
+        summary: WebScrapeSummary {
+            requested: payload.summary.requested,
+            processed: payload.summary.processed,
+            successful: payload.summary.successful,
+            failed: payload.summary.failed,
+            total_cost: payload.summary.total_cost,
+            stealth_mode_used: payload.summary.stealth_mode_used,
+        },
+        duration_seconds: started.elapsed().as_secs_f64(),
+    })
+}
+
+fn nanogpt_web_search_url() -> Result<String, String> {
+    let url = format!(
+        "{}/api/web",
+        resolve_root_url_for(ApiService::NanoGpt).trim_end_matches('/')
+    );
+    reqwest::Url::parse(&url).map_err(|error| error.to_string())?;
+    Ok(url)
+}
+
+fn nanogpt_web_scrape_url() -> Result<String, String> {
+    let url = format!(
+        "{}/api/scrape-urls",
+        resolve_root_url_for(ApiService::NanoGpt).trim_end_matches('/')
+    );
+    reqwest::Url::parse(&url).map_err(|error| error.to_string())?;
+    Ok(url)
+}
+
+fn synthetic_web_search_url() -> Result<String, String> {
+    let url = format!(
+        "{}/v2/search",
+        resolve_root_url_for(ApiService::Synthetic).trim_end_matches('/')
+    );
+    reqwest::Url::parse(&url).map_err(|error| error.to_string())?;
+    Ok(url)
+}
+
+fn active_backend_service() -> ApiService {
+    *active_backend_service_cell()
+        .lock()
+        .expect("active backend service lock should not be poisoned")
 }
 
 fn build_http_client() -> Result<Client, String> {
@@ -1227,19 +1571,6 @@ fn normalize_fetch_url(url: &str) -> Result<String, String> {
         }
     }
     Ok(parsed.to_string())
-}
-
-fn build_search_url(query: &str) -> Result<reqwest::Url, String> {
-    if let Ok(base) = std::env::var("CLAWD_WEB_SEARCH_BASE_URL") {
-        let mut url = reqwest::Url::parse(&base).map_err(|error| error.to_string())?;
-        url.query_pairs_mut().append_pair("q", query);
-        return Ok(url);
-    }
-
-    let mut url = reqwest::Url::parse("https://html.duckduckgo.com/html/")
-        .map_err(|error| error.to_string())?;
-    url.query_pairs_mut().append_pair("q", query);
-    Ok(url)
 }
 
 fn normalize_fetched_content(body: &str, content_type: &str) -> String {
@@ -1351,153 +1682,111 @@ fn preview_text(input: &str, max_chars: usize) -> String {
     format!("{}…", shortened.trim_end())
 }
 
-fn extract_search_hits(html: &str) -> Vec<SearchHit> {
+fn extract_nanogpt_search_hits(data: &Value) -> Vec<SearchHit> {
+    let Some(items) = data.as_array() else {
+        return Vec::new();
+    };
     let mut hits = Vec::new();
-    let mut remaining = html;
-
-    while let Some(anchor_start) = remaining.find("result__a") {
-        let after_class = &remaining[anchor_start..];
-        let Some(href_idx) = after_class.find("href=") else {
-            remaining = &after_class[1..];
-            continue;
-        };
-        let href_slice = &after_class[href_idx + 5..];
-        let Some((url, rest)) = extract_quoted_value(href_slice) else {
-            remaining = &after_class[1..];
-            continue;
-        };
-        let Some(close_tag_idx) = rest.find('>') else {
-            remaining = &after_class[1..];
-            continue;
-        };
-        let after_tag = &rest[close_tag_idx + 1..];
-        let Some(end_anchor_idx) = after_tag.find("</a>") else {
-            remaining = &after_tag[1..];
-            continue;
-        };
-        let title = html_to_text(&after_tag[..end_anchor_idx]);
-        if let Some(decoded_url) = decode_duckduckgo_redirect(&url) {
-            hits.push(SearchHit {
-                title: title.trim().to_string(),
-                url: decoded_url,
-            });
-        }
-        remaining = &after_tag[end_anchor_idx + 4..];
-    }
-
-    hits
-}
-
-fn extract_search_hits_from_generic_links(html: &str) -> Vec<SearchHit> {
-    let mut hits = Vec::new();
-    let mut remaining = html;
-
-    while let Some(anchor_start) = remaining.find("<a") {
-        let after_anchor = &remaining[anchor_start..];
-        let Some(href_idx) = after_anchor.find("href=") else {
-            remaining = &after_anchor[2..];
-            continue;
-        };
-        let href_slice = &after_anchor[href_idx + 5..];
-        let Some((url, rest)) = extract_quoted_value(href_slice) else {
-            remaining = &after_anchor[2..];
-            continue;
-        };
-        let Some(close_tag_idx) = rest.find('>') else {
-            remaining = &after_anchor[2..];
-            continue;
-        };
-        let after_tag = &rest[close_tag_idx + 1..];
-        let Some(end_anchor_idx) = after_tag.find("</a>") else {
-            remaining = &after_anchor[2..];
-            continue;
-        };
-        let title = html_to_text(&after_tag[..end_anchor_idx]);
-        if title.trim().is_empty() {
-            remaining = &after_tag[end_anchor_idx + 4..];
-            continue;
-        }
-        let decoded_url = decode_duckduckgo_redirect(&url).unwrap_or(url);
-        if decoded_url.starts_with("http://") || decoded_url.starts_with("https://") {
-            hits.push(SearchHit {
-                title: title.trim().to_string(),
-                url: decoded_url,
-            });
-        }
-        remaining = &after_tag[end_anchor_idx + 4..];
-    }
-
-    hits
-}
-
-fn extract_quoted_value(input: &str) -> Option<(String, &str)> {
-    let quote = input.chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    let rest = &input[quote.len_utf8()..];
-    let end = rest.find(quote)?;
-    Some((rest[..end].to_string(), &rest[end + quote.len_utf8()..]))
-}
-
-fn decode_duckduckgo_redirect(url: &str) -> Option<String> {
-    if url.starts_with("http://") || url.starts_with("https://") {
-        return Some(html_entity_decode_url(url));
-    }
-
-    let joined = if url.starts_with("//") {
-        format!("https:{url}")
-    } else if url.starts_with('/') {
-        format!("https://duckduckgo.com{url}")
-    } else {
-        return None;
-    };
-
-    let parsed = reqwest::Url::parse(&joined).ok()?;
-    if parsed.path() == "/l/" || parsed.path() == "/l" {
-        for (key, value) in parsed.query_pairs() {
-            if key == "uddg" {
-                return Some(html_entity_decode_url(value.as_ref()));
-            }
-        }
-    }
-    Some(joined)
-}
-
-fn html_entity_decode_url(url: &str) -> String {
-    decode_html_entities(url)
-}
-
-fn host_matches_list(url: &str, domains: &[String]) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    let host = host.to_ascii_lowercase();
-    domains.iter().any(|domain| {
-        let normalized = normalize_domain_filter(domain);
-        !normalized.is_empty() && (host == normalized || host.ends_with(&format!(".{normalized}")))
-    })
-}
-
-fn normalize_domain_filter(domain: &str) -> String {
-    let trimmed = domain.trim();
-    let candidate = reqwest::Url::parse(trimmed)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_string))
-        .unwrap_or_else(|| trimmed.to_string());
-    candidate
-        .trim()
-        .trim_start_matches('.')
-        .trim_end_matches('/')
-        .to_ascii_lowercase()
-}
-
-fn dedupe_hits(hits: &mut Vec<SearchHit>) {
     let mut seen = BTreeSet::new();
-    hits.retain(|hit| seen.insert(hit.url.clone()));
+    for item in items {
+        let Some(url) = item
+            .get("url")
+            .or_else(|| item.get("link"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let title = item
+            .get("title")
+            .or_else(|| item.get("name"))
+            .or_else(|| item.get("headline"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(url);
+        if seen.insert(url.to_string()) {
+            hits.push(SearchHit {
+                title: title.to_string(),
+                url: url.to_string(),
+            });
+        }
+    }
+    hits.truncate(8);
+    hits
+}
+
+fn summarize_nanogpt_web_search(payload: &NanoGptWebSearchResponse, hits: &[SearchHit]) -> String {
+    let metadata = &payload.metadata;
+    if !hits.is_empty() {
+        let rendered_hits = hits
+            .iter()
+            .map(|hit| format!("- [{}]({})", hit.title, hit.url))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut summary = format!(
+            "Search results for {:?} via {} (depth: {}, output: {}). Include a Sources section in the final answer.\n{}",
+            metadata.query, metadata.provider, metadata.depth, metadata.output_type, rendered_hits
+        );
+        if let Some(cost) = metadata.cost {
+            summary.push_str(&format!("\nEstimated search cost: ${cost:.4}"));
+        }
+        return summary;
+    }
+
+    let rendered = match &payload.data {
+        Value::String(text) => text.trim().to_string(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    };
+    let mut summary = format!(
+        "Web search for {:?} via {} (depth: {}, output: {}). Include citations from the provider response in the final answer.\n{}",
+        metadata.query,
+        metadata.provider,
+        metadata.depth,
+        metadata.output_type,
+        preview_text(&collapse_whitespace(&rendered), 1600)
+    );
+    if let Some(cost) = metadata.cost {
+        summary.push_str(&format!("\nEstimated search cost: ${cost:.4}"));
+    }
+    summary
+}
+
+fn summarize_synthetic_search(results: &[SyntheticSearchResult]) -> String {
+    if results.is_empty() {
+        return "Synthetic web search returned no results.".to_string();
+    }
+
+    let rendered_hits = results
+        .iter()
+        .take(8)
+        .map(|hit| {
+            let title = hit
+                .title
+                .as_deref()
+                .filter(|title| !title.is_empty())
+                .unwrap_or(&hit.url);
+            let snippet = hit
+                .text
+                .as_deref()
+                .map(|text| preview_text(&collapse_whitespace(text), 160))
+                .unwrap_or_default();
+            let published = hit
+                .published
+                .as_deref()
+                .map(|value| format!(" published={value}"))
+                .unwrap_or_default();
+            format!("- [{}]({}){} {}", title, hit.url, published, snippet)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "Synthetic web search returned {} result(s). Include a Sources section in the final answer.\n{}",
+        results.len(),
+        rendered_hits
+    )
 }
 
 fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> {
@@ -3174,6 +3463,7 @@ mod tests {
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"WebFetch"));
         assert!(names.contains(&"WebSearch"));
+        assert!(names.contains(&"WebScrape"));
         assert!(names.contains(&"TodoWrite"));
         assert!(names.contains(&"Skill"));
         assert!(names.contains(&"Agent"));
@@ -3268,98 +3558,211 @@ mod tests {
     }
 
     #[test]
-    fn web_search_extracts_and_filters_results() {
+    fn web_search_uses_nanogpt_api_and_maps_domains() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
-            assert!(request_line.contains("GET /search?q=rust+web+search "));
-            HttpResponse::html(
+            assert!(request_line.starts_with("POST /api/web "));
+            HttpResponse::json(
                 200,
                 "OK",
                 r#"
-                <html><body>
-                  <a class="result__a" href="https://docs.rs/reqwest">Reqwest docs</a>
-                  <a class="result__a" href="https://example.com/blocked">Blocked result</a>
-                </body></html>
+                {
+                  "data": [
+                    { "title": "Reqwest docs", "url": "https://docs.rs/reqwest" },
+                    { "title": "Tokio docs", "url": "https://docs.rs/tokio" }
+                  ],
+                  "metadata": {
+                    "query": "rust web search",
+                    "provider": "linkup",
+                    "depth": "deep",
+                    "outputType": "searchResults",
+                    "timestamp": "2026-04-01T00:00:00Z",
+                    "cost": 0.06
+                  }
+                }
                 "#,
             )
         }));
 
-        std::env::set_var(
-            "CLAWD_WEB_SEARCH_BASE_URL",
-            format!("http://{}/search", server.addr()),
-        );
+        std::env::set_var("NANOGPT_API_KEY", "test-key");
+        std::env::set_var("NANOGPT_BASE_URL", format!("http://{}", server.addr()));
         let result = execute_tool(
             "WebSearch",
             &json!({
                 "query": "rust web search",
+                "provider": "linkup",
+                "depth": "deep",
+                "outputType": "searchResults",
                 "allowed_domains": ["https://DOCS.rs/"],
                 "blocked_domains": ["HTTPS://EXAMPLE.COM"]
             }),
         )
         .expect("WebSearch should succeed");
-        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+        std::env::remove_var("NANOGPT_API_KEY");
+        std::env::remove_var("NANOGPT_BASE_URL");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["query"], "rust web search");
         let results = output["results"].as_array().expect("results array");
-        let search_result = results
-            .iter()
-            .find(|item| item.get("content").is_some())
-            .expect("search result block present");
-        let content = search_result["content"].as_array().expect("content array");
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["title"], "Reqwest docs");
-        assert_eq!(content[0]["url"], "https://docs.rs/reqwest");
-    }
-
-    #[test]
-    fn web_search_handles_generic_links_and_invalid_base_url() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let server = TestServer::spawn(Arc::new(|request_line: &str| {
-            assert!(request_line.contains("GET /fallback?q=generic+links "));
-            HttpResponse::html(
-                200,
-                "OK",
-                r#"
-                <html><body>
-                  <a href="https://example.com/one">Example One</a>
-                  <a href="https://example.com/one">Duplicate Example One</a>
-                  <a href="https://docs.rs/tokio">Tokio Docs</a>
-                </body></html>
-                "#,
-            )
-        }));
-
-        std::env::set_var(
-            "CLAWD_WEB_SEARCH_BASE_URL",
-            format!("http://{}/fallback", server.addr()),
-        );
-        let result = execute_tool(
-            "WebSearch",
-            &json!({
-                "query": "generic links"
-            }),
-        )
-        .expect("WebSearch fallback parsing should succeed");
-        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
-
-        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
-        let results = output["results"].as_array().expect("results array");
+        let commentary = results[0].as_str().expect("commentary string");
+        assert!(commentary.contains("linkup"));
+        assert!(commentary.contains("depth: deep"));
+        assert!(commentary.contains("$0.0600"));
         let search_result = results
             .iter()
             .find(|item| item.get("content").is_some())
             .expect("search result block present");
         let content = search_result["content"].as_array().expect("content array");
         assert_eq!(content.len(), 2);
-        assert_eq!(content[0]["url"], "https://example.com/one");
-        assert_eq!(content[1]["url"], "https://docs.rs/tokio");
+        assert_eq!(content[0]["title"], "Reqwest docs");
+        assert_eq!(content[0]["url"], "https://docs.rs/reqwest");
+    }
 
-        std::env::set_var("CLAWD_WEB_SEARCH_BASE_URL", "://bad-base-url");
+    #[test]
+    fn web_search_handles_sourced_answer_payloads_and_invalid_base_url() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.starts_with("POST /api/web "));
+            HttpResponse::json(
+                200,
+                "OK",
+                r#"
+                {
+                  "data": {
+                    "answer": "Rust is a systems programming language focused on safety.",
+                    "sources": [
+                      { "title": "The Rust Book", "url": "https://doc.rust-lang.org/book/" }
+                    ]
+                  },
+                  "metadata": {
+                    "query": "what is rust",
+                    "provider": "linkup",
+                    "depth": "standard",
+                    "outputType": "sourcedAnswer",
+                    "timestamp": "2026-04-01T00:00:00Z",
+                    "cost": 0.006
+                  }
+                }
+                "#,
+            )
+        }));
+
+        std::env::set_var("NANOGPT_API_KEY", "test-key");
+        std::env::set_var("NANOGPT_BASE_URL", format!("http://{}", server.addr()));
+        let result = execute_tool(
+            "WebSearch",
+            &json!({
+                "query": "what is rust",
+                "outputType": "sourcedAnswer"
+            }),
+        )
+        .expect("WebSearch sourced answer parsing should succeed");
+        std::env::remove_var("NANOGPT_API_KEY");
+        std::env::remove_var("NANOGPT_BASE_URL");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        let results = output["results"].as_array().expect("results array");
+        let commentary = results[0].as_str().expect("commentary string");
+        assert!(commentary.contains("sourcedAnswer"));
+        assert!(commentary.contains("Rust is a systems programming language"));
+
+        std::env::set_var("NANOGPT_BASE_URL", "://bad-base-url");
+        std::env::set_var("NANOGPT_API_KEY", "test-key");
         let error = execute_tool("WebSearch", &json!({ "query": "generic links" }))
             .expect_err("invalid base URL should fail");
-        std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
+        std::env::remove_var("NANOGPT_BASE_URL");
+        std::env::remove_var("NANOGPT_API_KEY");
         assert!(error.contains("relative URL without a base") || error.contains("empty host"));
+    }
+
+    #[test]
+    fn web_scrape_uses_nanogpt_api_and_returns_scraped_markdown() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TestServer::spawn(Arc::new(|request_line: &str| {
+            assert!(request_line.starts_with("POST /api/scrape-urls "));
+            HttpResponse::json(
+                200,
+                "OK",
+                r##"
+                {
+                  "results": [
+                    {
+                      "url": "https://example.com/article",
+                      "success": true,
+                      "title": "Example Article",
+                      "content": "<html>raw</html>",
+                      "markdown": "# Example Article\n\nBody text."
+                    }
+                  ],
+                  "summary": {
+                    "requested": 1,
+                    "processed": 1,
+                    "successful": 1,
+                    "failed": 0,
+                    "totalCost": 0.001,
+                    "stealthModeUsed": false
+                  }
+                }
+                "##,
+            )
+        }));
+
+        std::env::set_var("NANOGPT_API_KEY", "test-key");
+        std::env::set_var("NANOGPT_BASE_URL", format!("http://{}", server.addr()));
+        let result = execute_tool(
+            "WebScrape",
+            &json!({
+                "urls": ["https://example.com/article"],
+                "stealthMode": false
+            }),
+        )
+        .expect("WebScrape should succeed");
+        std::env::remove_var("NANOGPT_API_KEY");
+        std::env::remove_var("NANOGPT_BASE_URL");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(output["summary"]["requested"], 1);
+        assert_eq!(output["summary"]["successful"], 1);
+        assert_eq!(output["summary"]["totalCost"], 0.001);
+        assert_eq!(output["results"][0]["title"], "Example Article");
+        assert_eq!(
+            output["results"][0]["markdown"],
+            "# Example Article\n\nBody text."
+        );
+    }
+
+    #[test]
+    fn web_scrape_rejects_invalid_urls_and_too_many_inputs() {
+        let error = execute_tool(
+            "WebScrape",
+            &json!({
+                "urls": ["not-a-url"]
+            }),
+        )
+        .expect_err("invalid url should fail");
+        assert!(error.contains("relative URL without a base") || error.contains("invalid"));
+
+        let error = execute_tool(
+            "WebScrape",
+            &json!({
+                "urls": [
+                    "https://example.com/1",
+                    "https://example.com/2",
+                    "https://example.com/3",
+                    "https://example.com/4",
+                    "https://example.com/5",
+                    "https://example.com/6"
+                ]
+            }),
+        )
+        .expect_err("too many urls should fail");
+        assert!(error.contains("maximum of 5 URLs"));
     }
 
     #[test]
@@ -4367,6 +4770,15 @@ printf 'pwsh:%s' "$1"
                 status,
                 reason,
                 content_type: "text/plain; charset=utf-8",
+                body: body.to_string(),
+            }
+        }
+
+        fn json(status: u16, reason: &'static str, body: &str) -> Self {
+            Self {
+                status,
+                reason,
+                content_type: "application/json; charset=utf-8",
                 body: body.to_string(),
             }
         }

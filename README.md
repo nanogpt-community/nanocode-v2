@@ -1,12 +1,22 @@
 # NanoCode v2
 
-NanoCode v2 is a rust based agentic coding harness for the nanogpt API
+NanoCode v2 is a rust based agentic coding harness for the nanogpt API (and now synthetic.new!)
 
 ## Includes
 
-- XML tool calling via /proxy command
+- JSON + XML tool calling via /proxy command
 - Select any nanogpt model via /model
 - Provider selection via /provider
+- NanoGPT Web Search/Web Scrape
+- MCP/Agents/Plugins...etc
+- Context compaction and such you'd expect
+- NanoGPT MCP built in
+- Git integration 
+- Sandboxes/Permissions
+- Sessions management
+- Command/Prompt history
+- Vim mode (WIP)
+- More stuff
 
 ## Prerequisites
 
