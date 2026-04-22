@@ -662,21 +662,11 @@ fn interactive_model_picker(
             }
             Event::Key(KeyEvent {
                 code: KeyCode::Up, ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('k'),
-                modifiers: KeyModifiers::NONE,
-                ..
             }) if !search_mode => {
                 cursor = cursor.saturating_sub(1);
             }
             Event::Key(KeyEvent {
                 code: KeyCode::Down,
-                ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('j'),
-                modifiers: KeyModifiers::NONE,
                 ..
             }) if !search_mode => {
                 cursor = (cursor + 1).min(filtered_indices.len().saturating_sub(1));
@@ -987,19 +977,9 @@ fn interactive_provider_picker(
             }
             Event::Key(KeyEvent {
                 code: KeyCode::Up, ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('k'),
-                modifiers: KeyModifiers::NONE,
-                ..
             }) if !search_mode => cursor = cursor.saturating_sub(1),
             Event::Key(KeyEvent {
                 code: KeyCode::Down,
-                ..
-            })
-            | Event::Key(KeyEvent {
-                code: KeyCode::Char('j'),
-                modifiers: KeyModifiers::NONE,
                 ..
             }) if !search_mode => {
                 cursor = (cursor + 1).min(filtered_indices.len().saturating_sub(1))
