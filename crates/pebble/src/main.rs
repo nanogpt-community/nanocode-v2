@@ -4,6 +4,7 @@ mod input;
 mod models;
 mod proxy;
 mod render;
+mod ui;
 
 fn main() {
     if let Err(error) = app::run() {

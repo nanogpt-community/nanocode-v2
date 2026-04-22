@@ -38,6 +38,7 @@ use crate::proxy::{
     ProxyCommand, ProxyMessage, ProxySegment, RuntimeToolSpec,
 };
 use crate::render::{MarkdownStreamState, Spinner, TerminalRenderer};
+use crate::ui;
 use commands::{
     command_names_and_aliases, handle_agents_slash_command, handle_branch_slash_command,
     handle_skills_slash_command, handle_worktree_slash_command, render_help_topics_overview,
@@ -64,7 +65,12 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 const DEFAULT_THINKING_BUDGET_TOKENS: u32 = 2_048;
 const INIT_PEBBLE_MD_MAX_TOKENS: u32 = 2_048;
 const DEFAULT_DATE: &str = "2026-03-31";
+// Retained for the structured proxy paths and external callers that still
+// want to truncate large payloads. The TUI now uses tighter per-tool limits
+// inline (see `render_bash_preview` etc.).
+#[allow(dead_code)]
 const MAX_TOOL_PREVIEW_CHARS: usize = 4_000;
+#[allow(dead_code)]
 const MAX_TOOL_PREVIEW_LINES: usize = 48;
 const MAX_INIT_CONTEXT_CHARS: usize = 1_200;
 const MAX_INIT_CONTEXT_FILES: usize = 6;
@@ -3254,16 +3260,30 @@ fn resolve_export_path(
 }
 
 fn render_repl_help() -> String {
-    [
-        "Pebble REPL".to_string(),
-        "  /login and /auth open a service picker when no service is provided.".to_string(),
-        "  Supported auth services: nanogpt, synthetic, opencode-go, exa.".to_string(),
-        "  /provider is only available for NanoGPT-backed models.".to_string(),
-        "  /vim toggles rustyline vi keybindings for the input editor only.".to_string(),
-        String::new(),
-        render_slash_command_help(),
-    ]
-    .join("\n")
+    let intro = ui::panel(
+        "Pebble REPL",
+        &[
+            ui::PanelRow::Line(
+                "An agentic coding shell. Slash-commands control the session; anything else is forwarded to the model."
+                    .to_string(),
+            ),
+            ui::PanelRow::Blank,
+            ui::PanelRow::Section("Tips".to_string()),
+            ui::PanelRow::Line(
+                "• /login and /auth open a service picker when no service is provided".to_string(),
+            ),
+            ui::PanelRow::Line(
+                "• supported auth services: nanogpt, synthetic, opencode-go, exa".to_string(),
+            ),
+            ui::PanelRow::Line(
+                "• /provider is only available for NanoGPT-backed models".to_string(),
+            ),
+            ui::PanelRow::Line(
+                "• /vim toggles rustyline vi keybindings for the input editor only".to_string(),
+            ),
+        ],
+    );
+    format!("{intro}\n\n{}", render_slash_command_help())
 }
 
 fn repl_completion_candidates(cli: &LiveCli) -> Vec<String> {
@@ -3454,21 +3474,29 @@ fn run_repl_from_session(
 }
 
 fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
-    let mut editor = input::LineEditor::new("> ", repl_completion_candidates(cli));
-    println!("Pebble");
-    println!("  service: {}", cli.service.display_name());
-    println!("  model: {}", cli.model);
-    if let Some(provider) = provider_label_for_service_model(cli.service, &cli.model) {
-        println!("  provider: {provider}");
-    }
-    println!(
-        "  prompt: {}",
-        "Shift+Enter/Ctrl+J newline, /vim toggles vi mode, /help for commands"
-    );
+    let mut editor = input::LineEditor::new(ui::prompt_string(), repl_completion_candidates(cli));
+
+    // Welcome banner: a single bordered panel that tells the user who they
+    // are talking to, how the agent is configured, and which keystrokes to
+    // remember. Printed once per REPL session.
+    let cwd_display = env::current_dir()
+        .ok()
+        .map(|path| path.display().to_string());
+    let provider_label = provider_label_for_service_model(cli.service, &cli.model);
+    let banner = ui::welcome_banner(&ui::BannerInfo {
+        version: VERSION,
+        service: cli.service.display_name(),
+        model: &cli.model,
+        provider: provider_label.as_deref(),
+        permission_mode: cli.permission_mode.as_str(),
+        cwd: cwd_display.as_deref(),
+    });
+    println!("{banner}");
     println!();
 
     loop {
         editor.set_completions(repl_completion_candidates(cli));
+        editor.set_status_line(Some(cli.prompt_status_line()));
         let input = match editor.read_line()? {
             input::ReadOutcome::Submit(input) => input,
             input::ReadOutcome::Cancel => continue,
@@ -3726,8 +3754,12 @@ impl LiveCli {
         self.enforce_budget_before_turn()?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
+        // Visual turn separator so the transcript has clear "acts": one per
+        // user message. Muted colour so it never steals attention from the
+        // actual content above or below.
+        println!("{}", ui::turn_separator());
         spinner.tick(
-            "Waiting for Pebble",
+            "thinking",
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
@@ -3736,7 +3768,7 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 spinner.finish(
-                    "Pebble response complete",
+                    "done",
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
@@ -3745,7 +3777,7 @@ impl LiveCli {
                 if let Some(event) = summary.auto_compaction {
                     println!(
                         "{}",
-                        format_auto_compaction_notice(event.removed_message_count)
+                        ui::dim_note(&format_auto_compaction_notice(event.removed_message_count))
                     );
                 }
                 println!();
@@ -3753,7 +3785,7 @@ impl LiveCli {
             }
             Err(error) => {
                 spinner.fail(
-                    "Pebble request failed",
+                    "request failed",
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
@@ -3790,6 +3822,27 @@ impl LiveCli {
             })
         );
         Ok(())
+    }
+
+    /// Build the one-line status strip rendered above the input prompt.
+    ///
+    /// The REPL calls this before every input read so the strip always
+    /// reflects the agent's current configuration and budget. We deliberately
+    /// compute this fresh each time instead of caching so toggled settings
+    /// (thinking, permissions, provider) take effect immediately.
+    fn prompt_status_line(&self) -> String {
+        let cumulative = self.runtime.usage().cumulative_usage();
+        let estimated = self.runtime.estimated_tokens();
+        let cumulative_cost = usage_cost_total(&self.model, cumulative);
+        let cost = (cumulative_cost > 0.0).then_some(cumulative_cost);
+        ui::prompt_status_line(&ui::PromptStatusInfo {
+            model: short_model_name(&self.model),
+            permission_mode: self.permission_mode.as_str(),
+            thinking_enabled: self.thinking_enabled,
+            proxy_tool_calls: self.proxy_tool_calls,
+            estimated_tokens: (estimated > 0).then_some(u64::try_from(estimated).unwrap_or(u64::MAX)),
+            cumulative_cost: cost,
+        })
     }
 
     fn print_status(&self) {
@@ -4572,6 +4625,16 @@ impl ApiClient for PebbleRuntimeClient {
             let mut pending_tool: Option<(String, String, String)> = None;
             let mut saw_stop = false;
             let mut stream_fallback_requested = false;
+            // Track whether we've already printed the "thinking" lead so we
+            // don't repeat it for each streamed thinking delta. The flag is
+            // reset every time the outer loop re-enters this closure.
+            let mut thinking_stream_started = false;
+            // Print the "● pebble" assistant lead exactly once per streamed
+            // response — right before the first text delta — so the model's
+            // reply is visually anchored even after a wall of tool output.
+            let mut assistant_lead_emitted = false;
+            let thinking_enabled = self.thinking_enabled;
+            let render_output_enabled = self.render_output;
 
             loop {
                 let event = match stream.next_event().await {
@@ -4619,6 +4682,12 @@ impl ApiClient for PebbleRuntimeClient {
                     ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                         ContentBlockDelta::TextDelta { text } => {
                             if !text.is_empty() {
+                                if render_output_enabled && !assistant_lead_emitted {
+                                    write!(output, "{}", ui::assistant_lead())
+                                        .and_then(|_| output.flush())
+                                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                    assistant_lead_emitted = true;
+                                }
                                 if let Some(rendered) = markdown_stream.push(&renderer, &text) {
                                     write!(output, "{rendered}")
                                         .and_then(|_| output.flush())
@@ -4629,6 +4698,23 @@ impl ApiClient for PebbleRuntimeClient {
                         }
                         ContentBlockDelta::ThinkingDelta { thinking } => {
                             if !thinking.is_empty() {
+                                // Surface reasoning live when the user has
+                                // opted in via `/thinking on`. We dim the
+                                // text heavily so it reads as subordinate
+                                // context rather than primary output.
+                                if thinking_enabled && render_output_enabled {
+                                    if !thinking_stream_started {
+                                        write!(output, "{}", ui::thinking_lead())
+                                            .and_then(|_| output.flush())
+                                            .map_err(|error| {
+                                                RuntimeError::new(error.to_string())
+                                            })?;
+                                        thinking_stream_started = true;
+                                    }
+                                    write!(output, "{}", ui::thinking_chunk(&thinking))
+                                        .and_then(|_| output.flush())
+                                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                }
                                 events.push(AssistantEvent::ThinkingDelta(thinking));
                             }
                         }
@@ -4648,6 +4734,15 @@ impl ApiClient for PebbleRuntimeClient {
                             write!(output, "{rendered}")
                                 .and_then(|_| output.flush())
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
+                        // If we were streaming a reasoning block, close it
+                        // with a blank line so the subsequent assistant text
+                        // visually separates from the thinking trail.
+                        if thinking_stream_started {
+                            writeln!(output)
+                                .and_then(|_| output.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            thinking_stream_started = false;
                         }
                         if let Some((id, name, input)) = pending_tool.take() {
                             render_streamed_tool_call_start(output.as_mut(), &name, &input)?;
@@ -4922,20 +5017,20 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
         _ => summarize_tool_payload(input),
     };
 
-    if detail.is_empty() {
-        format!("→ {name}")
-    } else {
-        format!("→ {name} {detail}")
-    }
+    ui::tool_call_header(name, &detail)
 }
 
 fn render_thinking_block_summary(
-    text: &str,
-    out: &mut (impl Write + ?Sized),
+    _text: &str,
+    _out: &mut (impl Write + ?Sized),
 ) -> Result<(), RuntimeError> {
-    writeln!(out, "▶ Thinking ({} chars hidden)", text.chars().count())
-        .and_then(|_| out.flush())
-        .map_err(|error| RuntimeError::new(error.to_string()))
+    // Intentionally silent. Historically this printed a "reasoning hidden
+    // (N chars)" note, but we already surface reasoning live via
+    // `ui::thinking_chunk` when the user opts in to `/thinking on`, and
+    // showing a stand-in summary otherwise is just noise — especially when
+    // the same turn contains multiple thinking blocks, which caused the
+    // note to repeat on every tool hop.
+    Ok(())
 }
 
 fn response_to_events(
@@ -5103,7 +5198,6 @@ fn contains_proxy_markup(text: &str) -> bool {
 
 struct CliToolExecutor {
     service: ApiService,
-    renderer: TerminalRenderer,
     tool_registry: GlobalToolRegistry,
     mcp_catalog: McpCatalog,
     tool_specs: Vec<RuntimeToolSpec>,
@@ -5122,7 +5216,6 @@ impl CliToolExecutor {
     ) -> Self {
         Self {
             service,
-            renderer: TerminalRenderer::new(),
             tool_registry,
             mcp_catalog,
             tool_specs,
@@ -5153,28 +5246,42 @@ impl ToolExecutor for CliToolExecutor {
                 .map_err(ToolError::new)
         }?;
         if self.emit_output {
-            let markdown = render_tool_result_markdown(tool_name, &output);
-            self.renderer
-                .stream_markdown(&markdown, &mut io::stdout())
-                .map_err(|error| ToolError::new(error.to_string()))?;
+            let block = render_tool_result_block(tool_name, &output);
+            if !block.is_empty() {
+                let mut stdout = io::stdout();
+                write!(stdout, "{block}")
+                    .and_then(|_| stdout.flush())
+                    .map_err(|error| ToolError::new(error.to_string()))?;
+            }
         }
         Ok(output)
     }
 }
 
-fn render_tool_result_markdown(tool_name: &str, output: &str) -> String {
-    if let Some(markdown) = render_structured_tool_preview(tool_name, output) {
-        return markdown;
+/// Render the compact, already-ANSI-styled result block that visually hangs
+/// off the tool-call header we printed when the model invoked the tool.
+///
+/// Where possible we use [`render_structured_tool_preview`] to produce a
+/// hand-crafted summary for the tool family. When the output is unknown we
+/// fall back to a single "N bytes / N lines" one-liner so the transcript
+/// stays compact. Full payloads are always retained in conversation context
+/// regardless of what the TUI shows.
+fn render_tool_result_block(tool_name: &str, output: &str) -> String {
+    if let Some(block) = render_structured_tool_preview(tool_name, output) {
+        return block;
     }
 
-    let preview = truncate_tool_text(output, MAX_TOOL_PREVIEW_LINES, MAX_TOOL_PREVIEW_CHARS);
-    if preview == output {
-        format!("#### {tool_name}\n\n_Result preview_\n\n```json\n{output}\n```\n")
-    } else {
-        format!(
-            "#### {tool_name}\n\n_Result preview truncated in the TUI; full output is still kept in conversation context._\n\n```json\n{preview}\n```\n"
-        )
+    if output.trim().is_empty() {
+        return ui::tool_result_block(&[("", "(empty result)")]);
     }
+    let line_count = output.lines().count();
+    let char_count = output.chars().count();
+    let summary = if line_count > 1 {
+        format!("{line_count} lines · {char_count} chars")
+    } else {
+        format!("{char_count} chars")
+    };
+    ui::tool_result_block(&[("", &summary)])
 }
 
 fn render_structured_tool_preview(tool_name: &str, output: &str) -> Option<String> {
@@ -5184,7 +5291,7 @@ fn render_structured_tool_preview(tool_name: &str, output: &str) -> Option<Strin
         "glob_search" => render_glob_search_preview(&value),
         "grep_search" => render_grep_search_preview(&value),
         "bash" => render_bash_preview(&value),
-        "write_file" | "edit_file" => render_write_edit_preview(tool_name, &value),
+        "write_file" | "edit_file" => render_write_edit_preview(&value),
         _ => None,
     }
 }
@@ -5199,36 +5306,41 @@ fn render_read_file_preview(value: &serde_json::Value) -> Option<String> {
         (Some(start), Some(count)) if count > 0 => Some(start + count - 1),
         _ => start_line,
     };
-    Some(format!(
-        "#### read_file\n\n- Path: `{}`\n- Range: lines {}-{} of {}\n- Preview: file contents hidden in the TUI; full content stays in conversation context.\n",
-        path,
+    let range = format!(
+        "lines {}–{} of {}",
         start_line.unwrap_or(1),
         end_line.unwrap_or(start_line.unwrap_or(1)),
         total_lines.unwrap_or(num_lines.unwrap_or(0))
-    ))
+    );
+    Some(ui::tool_result_block(&[("", path), ("range", &range)]))
 }
 
 fn render_glob_search_preview(value: &serde_json::Value) -> Option<String> {
     let num_files = value.get("numFiles").and_then(serde_json::Value::as_u64)?;
     let filenames = value.get("filenames")?.as_array()?;
-    let preview = filenames
+    let truncated = filenames.len() > 5
+        || value.get("truncated").and_then(serde_json::Value::as_bool) == Some(true);
+
+    // Only show a handful of filenames — just enough to make the match set
+    // recognisable without flooding the transcript.
+    let preview_names: Vec<String> = filenames
         .iter()
         .filter_map(serde_json::Value::as_str)
-        .take(20)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let truncated = filenames.len() > 20
-        || value.get("truncated").and_then(serde_json::Value::as_bool) == Some(true);
-    Some(format!(
-        "#### glob_search\n\n- Matched: {} files\n{}\n```text\n{}\n```\n",
-        num_files,
-        if truncated {
-            "- Preview: truncated in the TUI; full result kept in conversation context.\n"
-        } else {
-            ""
-        },
-        preview
-    ))
+        .take(5)
+        .map(std::string::ToString::to_string)
+        .collect();
+
+    let summary = if truncated {
+        format!("{num_files} files (showing first {})", preview_names.len())
+    } else {
+        format!("{num_files} files")
+    };
+
+    let mut block = ui::tool_result_block(&[("matched", &summary)]);
+    if !preview_names.is_empty() {
+        block.push_str(&ui::tool_result_body("files", &preview_names.join("\n")));
+    }
+    Some(block)
 }
 
 fn render_grep_search_preview(value: &serde_json::Value) -> Option<String> {
@@ -5238,20 +5350,20 @@ fn render_grep_search_preview(value: &serde_json::Value) -> Option<String> {
         .get("content")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let preview = truncate_tool_text(content, MAX_TOOL_PREVIEW_LINES, MAX_TOOL_PREVIEW_CHARS);
-    Some(format!(
-        "#### grep_search\n\n- Matched: {} files{}{}\n```text\n{}\n```\n",
-        num_files,
-        num_matches
-            .map(|count| format!(", {} matches", count))
-            .unwrap_or_default(),
-        if preview == content {
-            "\n"
-        } else {
-            "\n- Preview: truncated in the TUI; full result kept in conversation context.\n"
-        },
-        preview
-    ))
+
+    // Keep the preview tight — five lines is plenty of context in the
+    // transcript; the full result is still in conversation state.
+    let preview = truncate_tool_text(content, 5, 320);
+    let heading = match num_matches {
+        Some(matches) => format!("{num_files} files · {matches} matches"),
+        None => format!("{num_files} files"),
+    };
+
+    let mut block = ui::tool_result_block(&[("matched", &heading)]);
+    if !preview.trim().is_empty() {
+        block.push_str(&ui::tool_result_body("hits", &preview));
+    }
+    Some(block)
 }
 
 fn render_bash_preview(value: &serde_json::Value) -> Option<String> {
@@ -5263,32 +5375,35 @@ fn render_bash_preview(value: &serde_json::Value) -> Option<String> {
         .get("stderr")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
-    let mut sections = Vec::new();
+    let exit_code = value
+        .get("exitCode")
+        .or_else(|| value.get("exit_code"))
+        .and_then(serde_json::Value::as_i64);
+
+    let mut block = String::new();
+
+    // Always show the exit code so failed commands are instantly scannable.
+    if let Some(code) = exit_code {
+        let label = if code == 0 { "ok" } else { "exit" };
+        block.push_str(&ui::tool_result_block(&[(label, &code.to_string())]));
+    }
+
     if !stdout.trim().is_empty() {
-        let preview = truncate_tool_text(stdout, MAX_TOOL_PREVIEW_LINES, MAX_TOOL_PREVIEW_CHARS);
-        sections.push(format!("stdout\n```text\n{}\n```", preview));
-        if preview != stdout {
-            sections.push(
-                "Preview truncated in the TUI; full stdout is still kept in conversation context."
-                    .to_string(),
-            );
-        }
+        let preview = truncate_tool_text(stdout, 8, 600);
+        block.push_str(&ui::tool_result_body("stdout", &preview));
     }
     if !stderr.trim().is_empty() {
-        let preview = truncate_tool_text(
-            stderr,
-            MAX_TOOL_PREVIEW_LINES / 2,
-            MAX_TOOL_PREVIEW_CHARS / 2,
-        );
-        sections.push(format!("stderr\n```text\n{}\n```", preview));
+        let preview = truncate_tool_text(stderr, 4, 400);
+        block.push_str(&ui::tool_result_body("stderr", &preview));
     }
-    if sections.is_empty() {
-        return None;
+
+    if block.is_empty() {
+        block.push_str(&ui::tool_result_block(&[("", "(no output)")]));
     }
-    Some(format!("#### bash\n\n{}\n", sections.join("\n\n")))
+    Some(block)
 }
 
-fn render_write_edit_preview(tool_name: &str, value: &serde_json::Value) -> Option<String> {
+fn render_write_edit_preview(value: &serde_json::Value) -> Option<String> {
     let path = value
         .get("path")
         .and_then(serde_json::Value::as_str)
@@ -5302,15 +5417,19 @@ fn render_write_edit_preview(tool_name: &str, value: &serde_json::Value) -> Opti
         .get("content")
         .and_then(serde_json::Value::as_str)
         .map(|content| content.lines().count());
-    let mut body = format!("#### {tool_name}\n\n- Path: `{path}`");
+
+    let mut rows: Vec<(&str, String)> = vec![("", path.to_string())];
     if let Some(lines) = lines {
-        let _ = write!(body, "\n- Content: {lines} lines");
+        let word = if lines == 1 { "line" } else { "lines" };
+        rows.push(("content", format!("{lines} {word}")));
     }
     if !message.trim().is_empty() {
-        let _ = write!(body, "\n- Result: {}", message.trim());
+        rows.push(("result", message.trim().to_string()));
     }
-    body.push('\n');
-    Some(body)
+
+    // Borrow the string values to match `tool_result_block`'s signature.
+    let pairs: Vec<(&str, &str)> = rows.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    Some(ui::tool_result_block(&pairs))
 }
 
 fn truncate_tool_text(input: &str, max_lines: usize, max_chars: usize) -> String {
@@ -5828,6 +5947,13 @@ fn usage_cost_estimate(model: &str, usage: TokenUsage) -> runtime::UsageCostEsti
 
 fn usage_cost_total(model: &str, usage: TokenUsage) -> f64 {
     usage_cost_estimate(model, usage).total_cost_usd()
+}
+
+/// Derive a compact model label for the prompt status strip. Model IDs can
+/// be very long (e.g. `anthropic/claude-opus-4-20250514`); we trim the
+/// provider-style prefix so the strip stays readable on narrow terminals.
+fn short_model_name(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model)
 }
 
 fn collect_tool_uses(summary: &runtime::TurnSummary) -> Vec<JsonValue> {
@@ -7310,7 +7436,7 @@ mod tests {
         parse_checksum_for_asset, parse_mcp_command, parse_model_command,
         parse_permissions_command, parse_provider_command, parse_proxy_command,
         parse_tool_input_value, prompt_to_content_blocks, proxy_response_to_events,
-        push_output_block, render_streamed_tool_call_start, render_tool_result_markdown,
+        push_output_block, render_streamed_tool_call_start, render_tool_result_block,
         render_update_report, resolve_model_alias, response_to_events,
         should_retry_proxy_tool_prompt, strip_markdown_code_fence, tuned_tool_description,
         AssistantEvent, AuthService, CliAction, CliOutputFormat, GitHubRelease, GitHubReleaseAsset,
@@ -8249,13 +8375,16 @@ mod tests {
         })
         .to_string();
 
-        let markdown = render_tool_result_markdown("read_file", &output);
+        let block = render_tool_result_block("read_file", &output);
+        let plain = strip_ansi_for_test(&block);
 
-        assert!(markdown.contains("#### read_file"));
-        assert!(markdown.contains("Path: `/tmp/demo.rs`"));
-        assert!(markdown.contains("file contents hidden in the TUI"));
-        assert!(!markdown.contains("line 1"));
-        assert!(!markdown.contains("line 80"));
+        // The compact block mentions the path and a range, but never spills
+        // the full file contents into the transcript.
+        assert!(plain.contains("/tmp/demo.rs"));
+        assert!(plain.contains("range"));
+        assert!(plain.contains("lines 1"));
+        assert!(!plain.contains("line 1\n"));
+        assert!(!plain.contains("line 80"));
     }
 
     #[test]
@@ -8287,11 +8416,14 @@ mod tests {
         })
         .to_string();
 
-        let markdown = render_tool_result_markdown("bash", &output);
+        let block = render_tool_result_block("bash", &output);
+        let plain = strip_ansi_for_test(&block);
 
-        assert!(markdown.contains("#### bash"));
-        assert!(markdown.contains("Preview truncated in the TUI"));
-        assert!(!markdown.contains("output 100"));
+        // The compact block labels the stream and keeps at most a small
+        // preview; the tail of the 100-line output must not leak in.
+        assert!(plain.contains("stdout"));
+        assert!(plain.contains("output 1"));
+        assert!(!plain.contains("output 100"));
     }
 
     #[test]
@@ -8333,8 +8465,33 @@ mod tests {
             .expect("rendered tool call should succeed");
 
         let text = String::from_utf8(rendered).expect("rendered bytes should be utf8");
-        assert!(text.contains("→ read_file README.md"));
-        assert!(!text.contains("{}"));
+        // The renderer now emits an ANSI-styled, glyph-prefixed header
+        // (see `ui::tool_call_header`). Strip ANSI for deterministic
+        // substring checks and assert on the stable human-visible parts.
+        let plain = strip_ansi_for_test(&text);
+        assert!(plain.contains("read_file"));
+        assert!(plain.contains("README.md"));
+        assert!(!plain.contains("{}"));
+    }
+
+    fn strip_ansi_for_test(input: &str) -> String {
+        let mut out = String::new();
+        let mut chars = input.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if next.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
     }
 
     #[test]

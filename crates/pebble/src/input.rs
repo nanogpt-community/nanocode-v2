@@ -99,6 +99,7 @@ impl Helper for SlashCommandHelper {}
 
 pub struct LineEditor {
     prompt: String,
+    status_line: Option<String>,
     completions: Vec<String>,
     vim_enabled: bool,
     editor: Editor<SlashCommandHelper, DefaultHistory>,
@@ -112,10 +113,27 @@ impl LineEditor {
 
         Self {
             prompt: prompt.into(),
+            status_line: None,
             completions,
             vim_enabled,
             editor,
         }
+    }
+
+    /// Update the visible input prompt glyph. Callers typically do this when
+    /// switching modes (e.g. toggling thinking) so the prompt stays in sync
+    /// with ambient state.
+    #[allow(dead_code)]
+    pub fn set_prompt(&mut self, prompt: impl Into<String>) {
+        self.prompt = prompt.into();
+    }
+
+    /// Set (or clear) a single-line status indicator that is printed just
+    /// above the input prompt on every `read_line` call. This is where the
+    /// REPL advertises the current model, permission mode, token budget,
+    /// etc. `None` disables the line.
+    pub fn set_status_line(&mut self, status_line: Option<String>) {
+        self.status_line = status_line;
     }
 
     pub fn push_history(&mut self, entry: impl Into<String>) {
@@ -134,6 +152,15 @@ impl LineEditor {
         }
     }
 
+    fn print_status_line(&self) -> io::Result<()> {
+        if let Some(status) = self.status_line.as_ref() {
+            let mut stdout = io::stdout();
+            writeln!(stdout, "{status}")?;
+            stdout.flush()?;
+        }
+        Ok(())
+    }
+
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
         loop {
             if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -143,6 +170,8 @@ impl LineEditor {
             if let Some(helper) = self.editor.helper_mut() {
                 helper.reset_current_line();
             }
+
+            self.print_status_line()?;
 
             match self.editor.readline(&self.prompt) {
                 Ok(line) => {
@@ -207,6 +236,7 @@ impl LineEditor {
 
     fn read_line_fallback(&mut self) -> io::Result<ReadOutcome> {
         loop {
+            self.print_status_line()?;
             let mut stdout = io::stdout();
             write!(stdout, "{}", self.prompt)?;
             stdout.flush()?;
