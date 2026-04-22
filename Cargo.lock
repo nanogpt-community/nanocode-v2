@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "api"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "reqwest",
  "serde",
@@ -108,14 +108,14 @@ dependencies = [
 
 [[package]]
 name = "commands"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "runtime",
 ]
 
 [[package]]
 name = "compat-harness"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "commands",
  "runtime",
@@ -797,7 +797,7 @@ dependencies = [
 
 [[package]]
 name = "pebble"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "api",
  "commands",
@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "glob",
  "plugins",
@@ -1557,7 +1557,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "api",
  "plugins",

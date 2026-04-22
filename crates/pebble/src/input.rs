@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -9,7 +9,8 @@ use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
 use rustyline::{
-    Cmd, CompletionType, Config, Context, EditMode, Editor, Helper, KeyCode, KeyEvent, Modifiers,
+    Cmd, CompletionType, ConditionalEventHandler, Config, Context, EditMode, Editor, Event,
+    EventContext, EventHandler, Helper, KeyCode, KeyEvent, Modifiers,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +97,28 @@ impl Highlighter for SlashCommandHelper {
 
 impl Validator for SlashCommandHelper {}
 impl Helper for SlashCommandHelper {}
+
+struct PasteSafeSubmitHandler;
+
+impl ConditionalEventHandler for PasteSafeSubmitHandler {
+    fn handle(
+        &self,
+        _evt: &Event,
+        _n: rustyline::RepeatCount,
+        _positive: bool,
+        ctx: &EventContext,
+    ) -> Option<Cmd> {
+        if ctx.line().is_empty() {
+            None
+        } else {
+            Some(Cmd::AcceptLine)
+        }
+    }
+}
+
+fn paste_safe_mode_enabled() -> bool {
+    env_flag_enabled("PEBBLE_PASTE_SAFE")
+}
 
 pub struct LineEditor {
     prompt: String,
@@ -202,6 +225,7 @@ impl LineEditor {
         completions: Vec<String>,
         vim_enabled: bool,
     ) -> Editor<SlashCommandHelper, DefaultHistory> {
+        let paste_safe_mode = paste_safe_mode_enabled();
         let config = Config::builder()
             .completion_type(CompletionType::List)
             .edit_mode(if vim_enabled {
@@ -213,8 +237,15 @@ impl LineEditor {
         let mut editor = Editor::<SlashCommandHelper, DefaultHistory>::with_config(config)
             .expect("rustyline editor should initialize");
         editor.set_helper(Some(SlashCommandHelper::new(completions)));
-        editor.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
         editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::SHIFT), Cmd::Newline);
+        editor.bind_sequence(KeyEvent(KeyCode::Char('J'), Modifiers::CTRL), Cmd::Newline);
+        if paste_safe_mode {
+            editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::NONE), Cmd::Newline);
+            editor.bind_sequence(
+                KeyEvent(KeyCode::Char('D'), Modifiers::CTRL),
+                EventHandler::Conditional(Box::new(PasteSafeSubmitHandler)),
+            );
+        }
         editor.bind_sequence(KeyEvent(KeyCode::Up, Modifiers::NONE), Cmd::PreviousHistory);
         editor.bind_sequence(KeyEvent(KeyCode::Down, Modifiers::NONE), Cmd::NextHistory);
         editor
@@ -241,15 +272,9 @@ impl LineEditor {
             write!(stdout, "{}", self.prompt)?;
             stdout.flush()?;
 
-            let mut buffer = String::new();
-            let bytes_read = io::stdin().read_line(&mut buffer)?;
-            if bytes_read == 0 {
+            let Some(buffer) = read_full_fallback_input(&mut io::stdin())? else {
                 return Ok(ReadOutcome::Exit);
-            }
-
-            while matches!(buffer.chars().last(), Some('\n' | '\r')) {
-                buffer.pop();
-            }
+            };
 
             if self.handle_submission(&buffer)? {
                 continue;
@@ -306,6 +331,20 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn read_full_fallback_input(reader: &mut impl Read) -> io::Result<Option<String>> {
+    let mut buffer = String::new();
+    reader.read_to_string(&mut buffer)?;
+    if buffer.is_empty() {
+        return Ok(None);
+    }
+
+    while matches!(buffer.chars().last(), Some('\n' | '\r')) {
+        buffer.pop();
+    }
+
+    Ok(Some(buffer))
+}
+
 fn slash_command_prefix(line: &str, pos: usize) -> Option<(usize, &str)> {
     if pos != line.len() {
         return None;
@@ -321,7 +360,11 @@ fn slash_command_prefix(line: &str, pos: usize) -> Option<(usize, &str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{slash_command_prefix, LineEditor, SlashCommandHelper};
+    use super::{
+        paste_safe_mode_enabled, read_full_fallback_input, slash_command_prefix, LineEditor,
+        SlashCommandHelper,
+    };
+    use std::io::Cursor;
     use rustyline::completion::Completer;
     use rustyline::highlight::Highlighter;
     use rustyline::history::{DefaultHistory, History};
@@ -424,5 +467,44 @@ mod tests {
         assert!(toggled);
         assert!(editor.vim_enabled);
         assert_eq!(editor.editor.history().len(), 1);
+    }
+
+    #[test]
+    fn fallback_input_reads_full_multiline_payload() {
+        let mut input = Cursor::new("first line\nsecond line\nthird line\n");
+
+        let result = read_full_fallback_input(&mut input).expect("fallback read should succeed");
+
+        assert_eq!(
+            result,
+            Some("first line\nsecond line\nthird line".to_string())
+        );
+    }
+
+    #[test]
+    fn fallback_input_trims_final_crlf_without_touching_internal_newlines() {
+        let mut input = Cursor::new("alpha\r\nbeta\r\n");
+
+        let result = read_full_fallback_input(&mut input).expect("fallback read should succeed");
+
+        assert_eq!(result, Some("alpha\r\nbeta".to_string()));
+    }
+
+    #[test]
+    fn fallback_input_returns_none_for_empty_stdin() {
+        let mut input = Cursor::new("");
+
+        let result = read_full_fallback_input(&mut input).expect("fallback read should succeed");
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn paste_safe_mode_reads_env_flag() {
+        std::env::set_var("PEBBLE_PASTE_SAFE", "1");
+        assert!(paste_safe_mode_enabled());
+
+        std::env::remove_var("PEBBLE_PASTE_SAFE");
+        assert!(!paste_safe_mode_enabled());
     }
 }
