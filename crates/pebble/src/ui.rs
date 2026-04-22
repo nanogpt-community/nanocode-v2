@@ -124,7 +124,9 @@ pub fn panel(title: &str, rows: &[PanelRow]) -> String {
     let bottom = format!(
         "{}{}{}",
         "╰".with(palette::ACCENT_DIM),
-        "─".repeat(width.saturating_sub(2)).with(palette::ACCENT_DIM),
+        "─"
+            .repeat(width.saturating_sub(2))
+            .with(palette::ACCENT_DIM),
         "╯".with(palette::ACCENT_DIM),
     );
     out.push_str(&bottom);
@@ -210,7 +212,9 @@ fn shortcut_hints() -> String {
         .map(|(key, desc)| {
             format!(
                 "{} {}",
-                format!(" {key} ").on(palette::ACCENT_DIM).with(Color::Black),
+                format!(" {key} ")
+                    .on(palette::ACCENT_DIM)
+                    .with(Color::Black),
                 desc.to_string().with(palette::MUTED),
             )
         })
@@ -250,7 +254,14 @@ pub fn turn_separator() -> String {
 /// output-heavy sessions.
 #[must_use]
 pub fn prompt_string() -> String {
-    format!("{} ", "❯".bold().with(palette::BRAND))
+    #[cfg(windows)]
+    {
+        "> ".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        format!("{} ", "❯".bold().with(palette::BRAND))
+    }
 }
 
 /// Render a compact one-line hint shown immediately above the prompt. This
@@ -261,14 +272,20 @@ pub fn prompt_status_line(info: &PromptStatusInfo<'_>) -> String {
     let mut segments = Vec::new();
 
     segments.push(styled_pill("model", info.model, palette::ACCENT));
-    if info.thinking_enabled {
-        segments.push(styled_pill("thinking", "on", palette::BRAND));
-    }
+    segments.push(styled_pill("mode", info.collaboration_mode, palette::BRAND));
+    segments.push(styled_pill(
+        "reasoning",
+        info.reasoning_effort,
+        palette::BRAND,
+    ));
     segments.push(styled_pill(
         "perms",
         info.permission_mode,
         palette::PERMISSION,
     ));
+    if info.fast_mode {
+        segments.push(styled_pill("fast", "on", palette::OK));
+    }
     if info.proxy_tool_calls {
         segments.push(styled_pill("proxy", "on", palette::INFO));
     }
@@ -278,9 +295,6 @@ pub fn prompt_status_line(info: &PromptStatusInfo<'_>) -> String {
             &format_compact_tokens(tokens),
             palette::MUTED,
         ));
-    }
-    if let Some(cost) = info.cumulative_cost {
-        segments.push(styled_pill("cost", &format!("${cost:.3}"), palette::OK));
     }
 
     segments.join(" ")
@@ -308,10 +322,11 @@ fn format_compact_tokens(tokens: u64) -> String {
 pub struct PromptStatusInfo<'a> {
     pub model: &'a str,
     pub permission_mode: &'a str,
-    pub thinking_enabled: bool,
+    pub collaboration_mode: &'a str,
+    pub reasoning_effort: &'a str,
+    pub fast_mode: bool,
     pub proxy_tool_calls: bool,
     pub estimated_tokens: Option<u64>,
-    pub cumulative_cost: Option<f64>,
 }
 
 /// Render the header that precedes a tool call in the transcript.
@@ -540,15 +555,17 @@ mod tests {
         let line = prompt_status_line(&PromptStatusInfo {
             model: "glm-5.1",
             permission_mode: "read-only",
-            thinking_enabled: true,
+            collaboration_mode: "build",
+            reasoning_effort: "medium",
+            fast_mode: true,
             proxy_tool_calls: false,
             estimated_tokens: Some(12_000),
-            cumulative_cost: Some(0.042),
         });
         assert!(line.contains("glm-5.1"));
         assert!(line.contains("read-only"));
-        assert!(line.contains("thinking"));
+        assert!(line.contains("build"));
+        assert!(line.contains("medium"));
+        assert!(line.contains("fast"));
         assert!(line.contains("12.0k"));
-        assert!(line.contains("$0.042"));
     }
 }

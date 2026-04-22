@@ -18,9 +18,10 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_SYNTHETIC_MODELS_URL: &str = "https://api.synthetic.new/openai/v1/models";
 const DEFAULT_VISIBLE_ROWS: usize = 14;
-const AVAILABLE_SERVICES: [ApiService; 3] = [
+const AVAILABLE_SERVICES: [ApiService; 4] = [
     ApiService::NanoGpt,
     ApiService::Synthetic,
+    ApiService::OpenAiCodex,
     ApiService::OpencodeGo,
 ];
 
@@ -102,6 +103,8 @@ pub fn infer_service_for_model(model: &str) -> ApiService {
     let trimmed = model.trim();
     if trimmed.starts_with("hf:") {
         ApiService::Synthetic
+    } else if trimmed.starts_with("openai-codex/") {
+        ApiService::OpenAiCodex
     } else if trimmed.starts_with("opencode-go/") {
         ApiService::OpencodeGo
     } else {
@@ -284,6 +287,7 @@ fn fetch_all_sorted_models(
 ) -> Result<Vec<CatalogModel>, Box<dyn std::error::Error>> {
     let mut models = fetch_service_models(ApiService::NanoGpt)?;
     models.extend(fetch_service_models(ApiService::Synthetic)?);
+    models.extend(fetch_service_models(ApiService::OpenAiCodex)?);
     models.extend(fetch_service_models(ApiService::OpencodeGo)?);
     models.sort_by(|left, right| compare_models(left, right, state));
     Ok(models)
@@ -304,6 +308,7 @@ fn fetch_service_models(
                 .collect())
         }
         ApiService::Synthetic => fetch_synthetic_models(),
+        ApiService::OpenAiCodex => Ok(openai_codex_models()),
         ApiService::OpencodeGo => Ok(opencode_go_models()),
     }
 }
@@ -417,6 +422,56 @@ fn opencode_go_models() -> Vec<CatalogModel> {
             category: Some("OpenCode Go".to_string()),
             cost_estimate: None,
             tags: None,
+            supports_provider_selection: Some(false),
+        },
+    })
+    .collect()
+}
+
+fn openai_codex_models() -> Vec<CatalogModel> {
+    [
+        ("gpt-5.1-codex", "GPT-5.1 Codex"),
+        ("gpt-5.1-codex-mini", "GPT-5.1 Codex Mini"),
+        ("gpt-5.1-codex-max", "GPT-5.1 Codex Max"),
+        ("gpt-5.2", "GPT-5.2"),
+        ("gpt-5.2-codex", "GPT-5.2 Codex"),
+        ("gpt-5.3-codex", "GPT-5.3 Codex"),
+        ("gpt-5.4", "GPT-5.4"),
+        ("gpt-5.4-mini", "GPT-5.4 Mini"),
+        ("gpt-5.5", "GPT-5.5"),
+    ]
+    .into_iter()
+    .map(|(id, name)| CatalogModel {
+        service: ApiService::OpenAiCodex,
+        info: ModelInfo {
+            id: format!("openai-codex/{id}"),
+            object: "model".to_string(),
+            created: 0,
+            owned_by: "openai-codex".to_string(),
+            name: Some(name.to_string()),
+            description: Some(
+                "ChatGPT plan-backed Codex model accessed through OpenAI OAuth/device-code authentication."
+                    .to_string(),
+            ),
+            context_length: None,
+            max_output_tokens: None,
+            pricing: Some(ModelPricing {
+                prompt: Some(0.0),
+                completion: Some(0.0),
+                currency: Some("USD".to_string()),
+                unit: Some("included_with_plan".to_string()),
+            }),
+            capabilities: Some(ModelCapabilities {
+                vision: Some(false),
+                reasoning: Some(true),
+                tool_calling: Some(true),
+                parallel_tool_calls: Some(true),
+                structured_output: Some(true),
+                pdf_upload: None,
+            }),
+            category: Some("OpenAI Codex".to_string()),
+            cost_estimate: None,
+            tags: Some(vec!["chatgpt-plan".to_string(), "oauth".to_string()]),
             supports_provider_selection: Some(false),
         },
     })
@@ -734,18 +789,12 @@ fn select_model_fallback(
 
 fn interactive_provider_picker(
     model: &str,
-    default_price: Option<&ProviderPrice>,
+    _default_price: Option<&ProviderPrice>,
     providers: &[ModelProvider],
     current_provider: Option<String>,
 ) -> Result<ProviderSelection, Box<dyn std::error::Error>> {
     let mut entries = Vec::with_capacity(providers.len() + 1);
-    entries.push((
-        None,
-        format!(
-            "Platform default ({})",
-            provider_price_summary(default_price)
-        ),
-    ));
+    entries.push((None, "Platform default".to_string()));
     for provider in providers {
         let availability = if provider.available == Some(false) {
             "unavailable"
@@ -754,12 +803,7 @@ fn interactive_provider_picker(
         };
         entries.push((
             Some(provider.provider.clone()),
-            format!(
-                "{} [{}] {}",
-                provider.provider,
-                availability,
-                provider_price_summary(provider.pricing.as_ref())
-            ),
+            format!("{} [{}]", provider.provider, availability),
         ));
     }
 
@@ -1163,10 +1207,6 @@ fn detail_line(model: &CatalogModel) -> String {
     if let Some(max_output_tokens) = model.info.max_output_tokens {
         parts.push(format!("max_out={max_output_tokens}"));
     }
-    let pricing = pricing_summary(model.info.pricing.as_ref());
-    if pricing != "pricing n/a" {
-        parts.push(pricing);
-    }
     let capabilities = capability_summary(model.info.capabilities.as_ref());
     if !capabilities.is_empty() {
         parts.push(format!("caps={capabilities}"));
@@ -1198,30 +1238,6 @@ fn capability_summary(capabilities: Option<&ModelCapabilities>) -> String {
         names.push("pdf");
     }
     names.join(", ")
-}
-
-fn pricing_summary(pricing: Option<&ModelPricing>) -> String {
-    let Some(pricing) = pricing else {
-        return "pricing n/a".to_string();
-    };
-    match (pricing.prompt, pricing.completion) {
-        (Some(prompt), Some(completion)) => format!("in ${prompt:.4}/M out ${completion:.4}/M"),
-        (Some(prompt), None) => format!("in ${prompt:.4}/M"),
-        (None, Some(completion)) => format!("out ${completion:.4}/M"),
-        (None, None) => "pricing n/a".to_string(),
-    }
-}
-
-fn provider_price_summary(pricing: Option<&ProviderPrice>) -> String {
-    let Some(pricing) = pricing else {
-        return "pricing n/a".to_string();
-    };
-    match (pricing.input_per_1k_tokens, pricing.output_per_1k_tokens) {
-        (Some(input), Some(output)) => format!("in ${input:.6}/1K out ${output:.6}/1K"),
-        (Some(input), None) => format!("in ${input:.6}/1K"),
-        (None, Some(output)) => format!("out ${output:.6}/1K"),
-        (None, None) => "pricing n/a".to_string(),
-    }
 }
 
 fn display_name(model: &ModelInfo) -> &str {
@@ -1486,6 +1502,10 @@ mod tests {
 
     #[test]
     fn infers_opencode_go_service_from_model_prefix() {
+        assert_eq!(
+            infer_service_for_model("openai-codex/gpt-5.4"),
+            ApiService::OpenAiCodex
+        );
         assert_eq!(
             infer_service_for_model("opencode-go/glm-5.1"),
             ApiService::OpencodeGo

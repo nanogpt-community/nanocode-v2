@@ -70,8 +70,9 @@ pub use permissions::{
     PermissionPromptDecision, PermissionPrompter, PermissionRequest,
 };
 pub use prompt::{
-    load_system_prompt, prepend_bullets, ContextFile, ProjectContext, PromptBuildError,
-    SystemPromptBuilder, FRONTIER_MODEL_NAME, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    load_system_prompt, load_system_prompt_with_model_family, prepend_bullets, ContextFile,
+    ProjectContext, PromptBuildError, SystemPromptBuilder, FRONTIER_MODEL_NAME,
+    SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use remote::{
     inherited_upstream_proxy_env, no_proxy_list, read_token, upstream_proxy_ws_url,

@@ -11,6 +11,7 @@ pub fn user_home_dir() -> Option<PathBuf> {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
         })
+        .or_else(windows_home_from_drive_path)
 }
 
 #[must_use]
@@ -35,7 +36,9 @@ mod tests {
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock")
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[test]
@@ -65,10 +68,14 @@ mod tests {
         let previous_config = std::env::var_os("PEBBLE_CONFIG_HOME");
         let previous_home = std::env::var_os("HOME");
         let previous_userprofile = std::env::var_os("USERPROFILE");
+        let previous_homedrive = std::env::var_os("HOMEDRIVE");
+        let previous_homepath = std::env::var_os("HOMEPATH");
 
         std::env::remove_var("PEBBLE_CONFIG_HOME");
         std::env::remove_var("HOME");
         std::env::set_var("USERPROFILE", "C:\\Users\\pebble");
+        std::env::remove_var("HOMEDRIVE");
+        std::env::remove_var("HOMEPATH");
 
         assert_eq!(
             user_home_dir().expect("user home"),
@@ -82,6 +89,39 @@ mod tests {
         restore_var("PEBBLE_CONFIG_HOME", previous_config);
         restore_var("HOME", previous_home);
         restore_var("USERPROFILE", previous_userprofile);
+        restore_var("HOMEDRIVE", previous_homedrive);
+        restore_var("HOMEPATH", previous_homepath);
+    }
+
+    #[test]
+    fn falls_back_to_homedrive_and_homepath() {
+        let _guard = env_lock();
+        let previous_config = std::env::var_os("PEBBLE_CONFIG_HOME");
+        let previous_home = std::env::var_os("HOME");
+        let previous_userprofile = std::env::var_os("USERPROFILE");
+        let previous_homedrive = std::env::var_os("HOMEDRIVE");
+        let previous_homepath = std::env::var_os("HOMEPATH");
+
+        std::env::remove_var("PEBBLE_CONFIG_HOME");
+        std::env::remove_var("HOME");
+        std::env::remove_var("USERPROFILE");
+        std::env::set_var("HOMEDRIVE", "C:");
+        std::env::set_var("HOMEPATH", "\\Users\\pebble");
+
+        assert_eq!(
+            user_home_dir().expect("user home"),
+            PathBuf::from("C:\\Users\\pebble")
+        );
+        assert_eq!(
+            pebble_config_home_or_default(),
+            PathBuf::from("C:\\Users\\pebble").join(".pebble")
+        );
+
+        restore_var("PEBBLE_CONFIG_HOME", previous_config);
+        restore_var("HOME", previous_home);
+        restore_var("USERPROFILE", previous_userprofile);
+        restore_var("HOMEDRIVE", previous_homedrive);
+        restore_var("HOMEPATH", previous_homepath);
     }
 
     fn restore_var(name: &str, value: Option<OsString>) {
@@ -91,4 +131,13 @@ mod tests {
             std::env::remove_var(name);
         }
     }
+}
+
+fn windows_home_from_drive_path() -> Option<PathBuf> {
+    let drive = env::var_os("HOMEDRIVE").filter(|value| !value.is_empty())?;
+    let path = env::var_os("HOMEPATH").filter(|value| !value.is_empty())?;
+
+    let mut home = drive;
+    home.push(path);
+    Some(PathBuf::from(home))
 }

@@ -96,12 +96,30 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
-        name: "thinking",
+        name: "reasoning",
+        aliases: &["thinking"],
+        summary: "Show or set reasoning effort",
+        argument_hint: Some("[default|minimal|low|medium|high|xhigh]"),
+        category: SlashCommandCategory::Core,
+        detail: "Without an argument, reports the current reasoning effort. `/thinking` remains as a compatibility alias.",
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "fast",
         aliases: &[],
-        summary: "Show or toggle extended thinking",
+        summary: "Show or toggle ChatGPT fast mode",
         argument_hint: Some("[on|off]"),
         category: SlashCommandCategory::Core,
-        detail: "Without an argument, reports whether extended thinking is enabled for the current session.",
+        detail: "Without an argument, reports whether fast mode is enabled for the current session.",
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "mode",
+        aliases: &[],
+        summary: "Show or switch between build and plan mode",
+        argument_hint: Some("[build|plan]"),
+        category: SlashCommandCategory::Core,
+        detail: "Without an argument, reports the current collaboration mode. Press Tab on an empty prompt to toggle modes quickly.",
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -111,6 +129,15 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         argument_hint: Some("[model]"),
         category: SlashCommandCategory::Core,
         detail: "With no argument, opens the model picker. Model IDs are service-qualified, e.g. `opencode-go/kimi-k2.6`.",
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "logout",
+        aliases: &[],
+        summary: "Remove saved credentials for a service",
+        argument_hint: Some("[service]"),
+        category: SlashCommandCategory::Core,
+        detail: "With no argument, opens the auth service picker. Removes saved credentials from `~/.pebble/credentials.json`, but shell environment variables still take precedence if set.",
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -138,15 +165,6 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         argument_hint: Some("[--confirm]"),
         category: SlashCommandCategory::Session,
         detail: "Creates a new managed session while preserving the current model and runtime toggles.",
-        resume_supported: true,
-    },
-    SlashCommandSpec {
-        name: "cost",
-        aliases: &[],
-        summary: "Show cumulative token usage for this session",
-        argument_hint: None,
-        category: SlashCommandCategory::Core,
-        detail: "Reports cumulative token usage and estimated cost for the current session.",
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -295,7 +313,7 @@ const HELP_TOPICS: &[HelpTopic] = &[
     HelpTopic {
         name: "auth",
         summary: "Authenticate model services and Exa",
-        detail: "Run `/login` or `/auth` with no argument to open a service picker. Supported services are `nanogpt`, `synthetic`, `opencode-go`, and `exa`. API keys are stored in `~/.pebble/credentials.json`, and shell-scoped env vars still take precedence.",
+        detail: "Run `/login` or `/auth` with no argument to open a service picker, or `/logout [service]` to remove saved credentials. Supported services are `nanogpt`, `synthetic`, `openai-codex`, `opencode-go`, and `exa`. API keys are stored in `~/.pebble/credentials.json`; `openai-codex` stores device-code auth tokens there instead, and shell-scoped env vars still take precedence.",
     },
     HelpTopic {
         name: "sessions",
@@ -326,11 +344,20 @@ pub enum SlashCommand {
     },
     Status,
     Compact,
-    Thinking {
+    Reasoning {
+        effort: Option<String>,
+    },
+    Fast {
         enabled: Option<bool>,
+    },
+    Mode {
+        mode: Option<String>,
     },
     Model {
         model: Option<String>,
+    },
+    Logout {
+        service: Option<String>,
     },
     Mcp {
         action: Option<String>,
@@ -341,7 +368,6 @@ pub enum SlashCommand {
     Clear {
         confirm: bool,
     },
-    Cost,
     Resume {
         session_path: Option<String>,
     },
@@ -398,15 +424,24 @@ impl SlashCommand {
             },
             "status" => Self::Status,
             "compact" => Self::Compact,
-            "thinking" => Self::Thinking {
+            "reasoning" | "thinking" => Self::Reasoning {
+                effort: parts.next().map(ToOwned::to_owned),
+            },
+            "fast" => Self::Fast {
                 enabled: match parts.next() {
                     Some("on") => Some(true),
                     Some("off") => Some(false),
                     Some(_) | None => None,
                 },
             },
+            "mode" => Self::Mode {
+                mode: parts.next().map(ToOwned::to_owned),
+            },
             "model" => Self::Model {
                 model: parts.next().map(ToOwned::to_owned),
+            },
+            "logout" => Self::Logout {
+                service: parts.next().map(ToOwned::to_owned),
             },
             "mcp" => Self::Mcp {
                 action: parts.next().map(ToOwned::to_owned),
@@ -420,7 +455,6 @@ impl SlashCommand {
             "clear" => Self::Clear {
                 confirm: parts.next() == Some("--confirm"),
             },
-            "cost" => Self::Cost,
             "resume" => Self::Resume {
                 session_path: parts.next().map(ToOwned::to_owned),
             },
@@ -648,12 +682,14 @@ pub fn handle_slash_command(
             session: session.clone(),
         }),
         SlashCommand::Status
-        | SlashCommand::Thinking { .. }
+        | SlashCommand::Reasoning { .. }
+        | SlashCommand::Fast { .. }
+        | SlashCommand::Mode { .. }
         | SlashCommand::Model { .. }
+        | SlashCommand::Logout { .. }
         | SlashCommand::Mcp { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Clear { .. }
-        | SlashCommand::Cost
         | SlashCommand::Resume { .. }
         | SlashCommand::Config { .. }
         | SlashCommand::Memory
@@ -1239,6 +1275,12 @@ mod tests {
             Some(SlashCommand::Model { model: None })
         );
         assert_eq!(
+            SlashCommand::parse("/logout openai-codex"),
+            Some(SlashCommand::Logout {
+                service: Some("openai-codex".to_string()),
+            })
+        );
+        assert_eq!(
             SlashCommand::parse("/permissions read-only"),
             Some(SlashCommand::Permissions {
                 mode: Some("read-only".to_string()),
@@ -1258,7 +1300,28 @@ mod tests {
             SlashCommand::parse("/clear --confirm"),
             Some(SlashCommand::Clear { confirm: true })
         );
-        assert_eq!(SlashCommand::parse("/cost"), Some(SlashCommand::Cost));
+        assert_eq!(
+            SlashCommand::parse("/reasoning high"),
+            Some(SlashCommand::Reasoning {
+                effort: Some("high".to_string()),
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/thinking"),
+            Some(SlashCommand::Reasoning { effort: None })
+        );
+        assert_eq!(
+            SlashCommand::parse("/fast on"),
+            Some(SlashCommand::Fast {
+                enabled: Some(true)
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/mode plan"),
+            Some(SlashCommand::Mode {
+                mode: Some("plan".to_string()),
+            })
+        );
         assert_eq!(
             SlashCommand::parse("/resume session.json"),
             Some(SlashCommand::Resume {
@@ -1340,13 +1403,16 @@ mod tests {
         assert!(help.contains("/help"));
         assert!(help.contains("/status"));
         assert!(help.contains("/compact"));
-        assert!(help.contains("/thinking [on|off]"));
+        assert!(help.contains("/reasoning [default|minimal|low|medium|high|xhigh]"));
+        assert!(help.contains("aliases: thinking"));
+        assert!(help.contains("/fast [on|off]"));
+        assert!(help.contains("/mode [build|plan]"));
         assert!(help.contains("/model [model]"));
+        assert!(help.contains("/logout [service]"));
         assert!(help.contains("/mcp [status|tools|reload|add <name>|enable <name>|disable <name>]"));
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
         assert!(help.contains("aliases: bypass"));
         assert!(help.contains("/clear [--confirm]"));
-        assert!(help.contains("/cost"));
         assert!(help.contains("/resume [session-id-or-path]"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
         assert!(help.contains("/memory"));
@@ -1364,8 +1430,8 @@ mod tests {
         assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|help|init <name>]"));
         assert!(help.contains("Help topics"));
-        assert_eq!(slash_command_specs().len(), 23);
-        assert_eq!(resume_supported_slash_commands().len(), 13);
+        assert_eq!(slash_command_specs().len(), 25);
+        assert_eq!(resume_supported_slash_commands().len(), 12);
     }
 
     #[test]
@@ -1441,7 +1507,10 @@ mod tests {
             handle_slash_command("/clear --confirm", &session, CompactionConfig::default())
                 .is_none()
         );
-        assert!(handle_slash_command("/cost", &session, CompactionConfig::default()).is_none());
+        assert!(
+            handle_slash_command("/reasoning high", &session, CompactionConfig::default())
+                .is_none()
+        );
         assert!(handle_slash_command(
             "/resume session.json",
             &session,

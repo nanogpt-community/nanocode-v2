@@ -130,6 +130,8 @@ async fn opencode_go_chat_models_translate_messages_to_chat_completions() {
             }]),
             tool_choice: Some(ToolChoice::Auto),
             thinking: None,
+            reasoning_effort: None,
+            fast_mode: false,
             stream: false,
         })
         .await
@@ -220,6 +222,8 @@ async fn opencode_go_stream_message_emits_buffered_content_blocks() {
             tools: None,
             tool_choice: None,
             thinking: None,
+            reasoning_effort: None,
+            fast_mode: false,
             stream: true,
         })
         .await
@@ -276,6 +280,8 @@ fn image_content_blocks_serialize_with_base64_source() {
         tools: None,
         tool_choice: None,
         thinking: None,
+        reasoning_effort: None,
+        fast_mode: false,
         stream: false,
     };
 
@@ -522,6 +528,8 @@ async fn provider_override_forces_paygo_headers() {
             tools: None,
             tool_choice: None,
             thinking: None,
+            reasoning_effort: None,
+            fast_mode: false,
             stream: false,
         })
         .await
@@ -602,6 +610,8 @@ async fn live_stream_smoke_test() {
             tools: None,
             tool_choice: None,
             thinking: None,
+            reasoning_effort: None,
+            fast_mode: false,
             stream: false,
         })
         .await
@@ -785,6 +795,8 @@ fn sample_request(stream: bool) -> MessageRequest {
         }]),
         tool_choice: Some(ToolChoice::Auto),
         thinking: None,
+        reasoning_effort: None,
+        fast_mode: false,
         stream,
     }
 }

@@ -5,6 +5,7 @@ use std::time::Duration;
 #[derive(Debug)]
 pub enum ApiError {
     MissingApiKey,
+    MissingOpenAiCodexAuth,
     InvalidApiKeyEnv(VarError),
     Http(reqwest::Error),
     Io(std::io::Error),
@@ -41,6 +42,7 @@ impl ApiError {
             Self::StreamApi { .. } => false,
             Self::RetriesExhausted { last_error, .. } => last_error.is_retryable(),
             Self::MissingApiKey
+            | Self::MissingOpenAiCodexAuth
             | Self::InvalidApiKeyEnv(_)
             | Self::Io(_)
             | Self::Json(_)
@@ -57,6 +59,12 @@ impl Display for ApiError {
                 write!(
                     f,
                     "required API key is not configured; set the service environment variable or save credentials first"
+                )
+            }
+            Self::MissingOpenAiCodexAuth => {
+                write!(
+                    f,
+                    "required ChatGPT Codex authentication is not configured; run `/login openai-codex` first"
                 )
             }
             Self::InvalidApiKeyEnv(error) => {

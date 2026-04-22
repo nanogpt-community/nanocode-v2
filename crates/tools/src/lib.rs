@@ -13,10 +13,11 @@ use platform::pebble_config_home;
 use plugins::{PluginManager, PluginManagerConfig, PluginTool};
 use reqwest::blocking::Client;
 use runtime::{
-    edit_file, execute_bash, glob_search, grep_search, load_system_prompt, read_file, write_file,
-    ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ConfigLoader, ContentBlock,
-    ConversationMessage, ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode,
-    PermissionPolicy, RuntimeConfig, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    edit_file, execute_bash, glob_search, grep_search, load_system_prompt_with_model_family,
+    read_file, write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ConfigLoader,
+    ContentBlock, ConversationMessage, ConversationRuntime, GrepSearchInput, MessageRole,
+    PermissionMode, PermissionPolicy, RuntimeConfig, RuntimeError, Session, TokenUsage, ToolError,
+    ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -2098,8 +2099,27 @@ fn build_agent_system_prompt() -> Result<Vec<String>, String> {
     let date = std::env::var("PEBBLE_CURRENT_DATE")
         .or_else(|_| std::env::var("CLAWD_CURRENT_DATE"))
         .unwrap_or_else(|_| String::from("2026-04-01"));
-    load_system_prompt(cwd, &date, std::env::consts::OS, "unknown")
-        .map_err(|error| error.to_string())
+    let model = default_agent_model();
+    load_system_prompt_with_model_family(
+        cwd,
+        &date,
+        std::env::consts::OS,
+        "unknown",
+        prompt_model_family(&model),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn prompt_model_family(model: &str) -> String {
+    if model.starts_with("openai-codex/") {
+        format!("OpenAI Codex ({model})")
+    } else if model.starts_with("opencode-go/") {
+        format!("OpenCode Go ({model})")
+    } else if model.starts_with("hf:") {
+        format!("Synthetic ({model})")
+    } else {
+        "NanoGPT Messages API".to_string()
+    }
 }
 
 fn agent_permission_policy(tool_registry: &GlobalToolRegistry) -> PermissionPolicy {
@@ -2167,6 +2187,8 @@ impl ApiClient for PebbleAgentApiClient {
             tools: Some(self.tool_registry.definitions(None)),
             tool_choice: Some(ToolChoice::Auto),
             thinking: None,
+            reasoning_effort: None,
+            fast_mode: false,
             stream: false,
         };
 

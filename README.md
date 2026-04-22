@@ -6,6 +6,7 @@ It supports:
 
 - Nano-GPT
 - Synthetic
+- OpenAI Codex / ChatGPT plans
 - OpenCode Go
 
 Pebble is designed around an interactive REPL, local tools, managed sessions, MCP servers, and a user-controlled permission model. Web retrieval is provider-agnostic and always runs through Exa.
@@ -15,7 +16,7 @@ Pebble is designed around an interactive REPL, local tools, managed sessions, MC
 
 ## First-run setup
 
-### 1. Save a model API key
+### 1. Authenticate a model service
 
 Pebble can prompt you for credentials interactively:
 
@@ -27,29 +28,35 @@ You can also target a specific service directly:
 
 ```bash
 pebble login synthetic
+pebble login openai-codex
 pebble login opencode-go
 pebble login nanogpt
 ```
 
-Or pass the key inline:
+For API-key services, you can also pass the key inline:
 
 ```bash
 pebble login opencode-go --api-key "$OPENCODE_GO_API_KEY"
 ```
+
+`openai-codex` uses ChatGPT device-code auth instead of an API key.
 
 Inside the REPL, the equivalent commands are:
 
 ```text
 /login
 /auth
+/login openai-codex
 /login opencode-go
 /auth synthetic
+/logout openai-codex
 ```
 
 If you run `/login` or `/auth` without a service, Pebble opens a picker with:
 
 - `nanogpt`
 - `synthetic`
+- `openai-codex`
 - `opencode-go`
 - `exa`
 
@@ -99,6 +106,7 @@ Useful first commands:
 /status
 /model
 /login
+/logout
 /sessions
 ```
 
@@ -141,6 +149,8 @@ Common commands:
 - `/help web`
 - `/status`
 - `/model`
+- `/login`
+- `/logout`
 - `/provider`
 - `/permissions`
 - `/bypass`
@@ -177,6 +187,7 @@ Possible stored keys:
 
 - `nanogpt_api_key`
 - `synthetic_api_key`
+- `openai_codex_auth`
 - `opencode_go_api_key`
 - `exa_api_key`
 
@@ -186,16 +197,22 @@ Useful environment variables:
 
 - `NANOGPT_API_KEY`
 - `SYNTHETIC_API_KEY`
+- `OPENAI_CODEX_ACCESS_TOKEN`
+- `OPENAI_CODEX_REFRESH_TOKEN`
+- `OPENAI_CODEX_ACCOUNT_ID`
+- `OPENAI_CODEX_EXPIRES_AT`
 - `OPENCODE_GO_API_KEY`
 - `EXA_API_KEY`
 - `NANOGPT_BASE_URL`
 - `SYNTHETIC_BASE_URL`
+- `OPENAI_CODEX_BASE_URL`
 - `OPENCODE_GO_BASE_URL`
 - `EXA_BASE_URL`
 - `PEBBLE_CONFIG_HOME`
 - `PEBBLE_VIM=1`
 
 `EXA_BASE_URL` defaults to `https://api.exa.ai`.
+`OPENAI_CODEX_BASE_URL` defaults to `https://chatgpt.com/backend-api/codex`.
 
 ## Sessions and restore
 

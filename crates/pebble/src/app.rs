@@ -6,16 +6,21 @@ use std::io::{self, IsTerminal, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::{
     resolve_api_key as resolve_nanogpt_api_key, resolve_api_key_for, resolve_base_url_for,
-    ApiError, ApiService, ContentBlockDelta, ImageSource, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, NanoGptClient, OutputContentBlock,
-    StreamEvent as ApiStreamEvent, ThinkingConfig, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    save_openai_codex_credentials, ApiError, ApiService, ContentBlockDelta, ImageSource,
+    InputContentBlock, InputMessage, MessageRequest, MessageResponse, NanoGptClient,
+    OpenAiCodexCredentials, OutputContentBlock, ReasoningEffort, StreamEvent as ApiStreamEvent,
+    ThinkingConfig, ToolChoice, ToolDefinition, ToolResultContentBlock, OPENAI_CODEX_CLIENT_ID,
+    OPENAI_CODEX_ISSUER,
 };
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
+use crossterm::execute;
 use crossterm::style::{Color, Stylize};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use platform::pebble_config_home as resolve_pebble_config_home;
@@ -47,7 +52,7 @@ use commands::{
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use runtime::{
-    format_usd, load_system_prompt, mcp_tool_name, pricing_for_model, resolve_sandbox_status,
+    load_system_prompt_with_model_family, mcp_tool_name, resolve_sandbox_status,
     spawn_mcp_stdio_process, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
     ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, JsonRpcId,
     JsonRpcRequest, JsonRpcResponse, McpClientAuth, McpClientBootstrap, McpClientTransport,
@@ -66,6 +71,9 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 const DEFAULT_THINKING_BUDGET_TOKENS: u32 = 2_048;
 const INIT_PEBBLE_MD_MAX_TOKENS: u32 = 2_048;
 const DEFAULT_DATE: &str = "2026-03-31";
+const SECRET_PROMPT_STALE_ENTER_WINDOW: Duration = Duration::from_millis(150);
+const OPENAI_CODEX_DEVICE_AUTH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const OPENAI_CODEX_DEVICE_POLL_SAFETY_MARGIN: Duration = Duration::from_secs(3);
 // Retained for the structured proxy paths and external callers that still
 // want to truncate large payloads. The TUI now uses tighter per-tool limits
 // inline (see `render_bash_preview` etc.).
@@ -77,7 +85,6 @@ const MAX_INIT_CONTEXT_CHARS: usize = 1_200;
 const MAX_INIT_CONTEXT_FILES: usize = 6;
 const MAX_INIT_TOP_LEVEL_ENTRIES: usize = 40;
 const MCP_DISCOVERY_TIMEOUT_SECS: u64 = 30;
-const COST_WARNING_FRACTION: f64 = 0.8;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("PEBBLE_BUILD_TARGET");
 const IMAGE_REF_PREFIX: &str = "@";
@@ -154,16 +161,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             allowed_tools,
             permission_mode,
-            max_cost_usd,
-            thinking,
+            collaboration_mode,
+            reasoning_effort,
+            fast_mode,
             output_format,
         } => LiveCli::new(
             model,
             true,
             allowed_tools,
             permission_mode,
-            max_cost_usd,
-            thinking,
+            collaboration_mode,
+            reasoning_effort,
+            fast_mode,
             matches!(output_format, CliOutputFormat::Text),
         )?
         .run_turn_with_output(&prompt, output_format)?,
@@ -171,16 +180,19 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             allowed_tools,
             permission_mode,
-            max_cost_usd,
-            thinking,
+            collaboration_mode,
+            reasoning_effort,
+            fast_mode,
         } => run_repl(
             model,
             allowed_tools,
             permission_mode,
-            max_cost_usd,
-            thinking,
+            collaboration_mode,
+            reasoning_effort,
+            fast_mode,
         )?,
         CliAction::Login { service, api_key } => login(service, api_key)?,
+        CliAction::Logout { service } => logout(service)?,
         CliAction::Help => print_help(),
         CliAction::Version => print_version(),
     }
@@ -238,20 +250,25 @@ enum CliAction {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
-        max_cost_usd: Option<f64>,
-        thinking: bool,
+        collaboration_mode: CollaborationMode,
+        reasoning_effort: Option<ReasoningEffort>,
+        fast_mode: FastMode,
         output_format: CliOutputFormat,
     },
     Login {
         service: Option<AuthService>,
         api_key: Option<String>,
     },
+    Logout {
+        service: Option<AuthService>,
+    },
     Repl {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
-        max_cost_usd: Option<f64>,
-        thinking: bool,
+        collaboration_mode: CollaborationMode,
+        reasoning_effort: Option<ReasoningEffort>,
+        fast_mode: FastMode,
     },
     Help,
     Version,
@@ -276,9 +293,44 @@ impl CliOutputFormat {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollaborationMode {
+    Build,
+    Plan,
+}
+
+impl CollaborationMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Plan => "plan",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FastMode {
+    Off,
+    On,
+}
+
+impl FastMode {
+    const fn enabled(self) -> bool {
+        matches!(self, Self::On)
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthService {
     NanoGpt,
     Synthetic,
+    OpenAiCodex,
     OpencodeGo,
     Exa,
 }
@@ -288,6 +340,7 @@ impl AuthService {
         match self {
             Self::NanoGpt => "NanoGPT",
             Self::Synthetic => "Synthetic",
+            Self::OpenAiCodex => "OpenAI Codex",
             Self::OpencodeGo => "OpenCode Go",
             Self::Exa => "Exa",
         }
@@ -297,6 +350,7 @@ impl AuthService {
         match self {
             Self::NanoGpt => "nanogpt",
             Self::Synthetic => "synthetic",
+            Self::OpenAiCodex => "openai-codex",
             Self::OpencodeGo => "opencode-go",
             Self::Exa => "exa",
         }
@@ -306,14 +360,54 @@ impl AuthService {
         match self {
             Self::NanoGpt => "nanogpt_api_key",
             Self::Synthetic => "synthetic_api_key",
+            Self::OpenAiCodex => "openai_codex_auth",
             Self::OpencodeGo => "opencode_go_api_key",
             Self::Exa => "exa_api_key",
         }
     }
 
     const fn all() -> &'static [AuthService] {
-        &[Self::NanoGpt, Self::Synthetic, Self::OpencodeGo, Self::Exa]
+        &[
+            Self::NanoGpt,
+            Self::Synthetic,
+            Self::OpenAiCodex,
+            Self::OpencodeGo,
+            Self::Exa,
+        ]
     }
+
+    const fn runtime_service(self) -> Option<ApiService> {
+        match self {
+            Self::NanoGpt => Some(ApiService::NanoGpt),
+            Self::Synthetic => Some(ApiService::Synthetic),
+            Self::OpenAiCodex => Some(ApiService::OpenAiCodex),
+            Self::OpencodeGo => Some(ApiService::OpencodeGo),
+            Self::Exa => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiCodexTokenResponse {
+    access_token: String,
+    refresh_token: String,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiCodexDeviceCodeResponse {
+    device_auth_id: String,
+    user_code: String,
+    interval: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiCodexDeviceTokenResponse {
+    authorization_code: String,
+    code_verifier: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,15 +470,18 @@ struct SessionRuntimeState {
     service: ApiService,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    thinking_enabled: bool,
+    collaboration_mode: CollaborationMode,
+    reasoning_effort: Option<ReasoningEffort>,
+    fast_mode: FastMode,
     proxy_tool_calls: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut model = resolve_model_alias(&default_model_or(DEFAULT_MODEL)).to_string();
     let mut permission_mode = default_permission_mode();
-    let mut max_cost_usd: Option<f64> = None;
-    let mut thinking = false;
+    let mut collaboration_mode = CollaborationMode::Build;
+    let mut reasoning_effort = None;
+    let mut fast_mode = FastMode::Off;
     let mut output_format = CliOutputFormat::Text;
     let mut allowed_tool_values = Vec::new();
     let mut rest = Vec::new();
@@ -414,19 +511,34 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode = parse_permission_mode_arg(&flag[18..])?;
                 index += 1;
             }
-            "--max-cost" => {
+            "--mode" => {
                 let value = args
                     .get(index + 1)
-                    .ok_or_else(|| "missing value for --max-cost".to_string())?;
-                max_cost_usd = Some(parse_max_cost_arg(value)?);
+                    .ok_or_else(|| "missing value for --mode".to_string())?;
+                collaboration_mode = parse_collaboration_mode_arg(value)?;
                 index += 2;
             }
-            flag if flag.starts_with("--max-cost=") => {
-                max_cost_usd = Some(parse_max_cost_arg(&flag[11..])?);
+            flag if flag.starts_with("--mode=") => {
+                collaboration_mode = parse_collaboration_mode_arg(&flag[7..])?;
+                index += 1;
+            }
+            "--reasoning" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --reasoning".to_string())?;
+                reasoning_effort = parse_reasoning_effort_arg(value)?;
+                index += 2;
+            }
+            flag if flag.starts_with("--reasoning=") => {
+                reasoning_effort = parse_reasoning_effort_arg(&flag[12..])?;
                 index += 1;
             }
             "--thinking" => {
-                thinking = true;
+                reasoning_effort = Some(ReasoningEffort::Medium);
+                index += 1;
+            }
+            "--fast" => {
+                fast_mode = FastMode::On;
                 index += 1;
             }
             "--output-format" => {
@@ -450,8 +562,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     model: resolve_model_alias(&model).to_string(),
                     allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
                     permission_mode,
-                    max_cost_usd,
-                    thinking,
+                    collaboration_mode,
+                    reasoning_effort,
+                    fast_mode,
                     output_format,
                 });
             }
@@ -488,8 +601,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             model,
             allowed_tools,
             permission_mode,
-            max_cost_usd,
-            thinking,
+            collaboration_mode,
+            reasoning_effort,
+            fast_mode,
         });
     }
     if matches!(rest.first().map(String::as_str), Some("--help" | "-h")) {
@@ -507,6 +621,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan),
         "system-prompt" => parse_system_prompt_args(&rest[1..]),
         "login" | "auth" => parse_login_args(&rest[1..]),
+        "logout" => parse_logout_args(&rest[1..]),
         "model" | "models" => parse_model_args(&rest[1..]),
         "provider" | "providers" => parse_provider_args(&rest[1..]),
         "proxy" => parse_proxy_args(&rest[1..]),
@@ -547,8 +662,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 model,
                 allowed_tools,
                 permission_mode,
-                max_cost_usd,
-                thinking,
+                collaboration_mode,
+                reasoning_effort,
+                fast_mode,
                 output_format,
             })
         }
@@ -558,8 +674,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             model,
             allowed_tools,
             permission_mode,
-            max_cost_usd,
-            thinking,
+            collaboration_mode,
+            reasoning_effort,
+            fast_mode,
             output_format,
         }),
         other => Err(format!("unknown subcommand: {other}")),
@@ -657,6 +774,13 @@ fn parse_login_args(args: &[String]) -> Result<CliAction, String> {
     })
 }
 
+fn parse_logout_args(args: &[String]) -> Result<CliAction, String> {
+    let parsed = parse_logout_tokens(args.iter().map(String::as_str).collect())?;
+    Ok(CliAction::Logout {
+        service: parsed.service,
+    })
+}
+
 fn parse_login_tokens(tokens: Vec<&str>) -> Result<LoginCommand, String> {
     let mut service = None;
     let mut api_key = None;
@@ -694,6 +818,9 @@ fn parse_login_tokens(tokens: Vec<&str>) -> Result<LoginCommand, String> {
                         | "nano"
                         | "synthetic"
                         | "synthetic.new"
+                        | "openai-codex"
+                        | "openai_codex"
+                        | "chatgpt"
                         | "opencode-go"
                         | "opencodego"
                         | "exa"
@@ -717,12 +844,56 @@ fn parse_login_service(value: &str) -> Result<AuthService, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "nanogpt" | "nano-gpt" | "nano" => Ok(AuthService::NanoGpt),
         "synthetic" | "synthetic.new" => Ok(AuthService::Synthetic),
+        "openai-codex" | "openai_codex" | "chatgpt" => Ok(AuthService::OpenAiCodex),
         "opencode-go" | "opencodego" => Ok(AuthService::OpencodeGo),
         "exa" => Ok(AuthService::Exa),
         other => Err(format!(
-            "unsupported login service `{other}`; expected nanogpt, synthetic, opencode-go, or exa"
+            "unsupported login service `{other}`; expected nanogpt, synthetic, openai-codex, opencode-go, or exa"
         )),
     }
+}
+
+fn parse_logout_tokens(tokens: Vec<&str>) -> Result<LogoutCommand, String> {
+    let mut service = None;
+    let mut index = 0;
+
+    while index < tokens.len() {
+        match tokens[index] {
+            "--service" => {
+                let value = tokens
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --service".to_string())?;
+                service = Some(parse_login_service(value)?);
+                index += 2;
+            }
+            flag if flag.starts_with("--service=") => {
+                service = Some(parse_login_service(&flag[10..])?);
+                index += 1;
+            }
+            value
+                if matches!(
+                    value,
+                    "nanogpt"
+                        | "nano-gpt"
+                        | "nano"
+                        | "synthetic"
+                        | "synthetic.new"
+                        | "openai-codex"
+                        | "openai_codex"
+                        | "chatgpt"
+                        | "opencode-go"
+                        | "opencodego"
+                        | "exa"
+                ) =>
+            {
+                service = Some(parse_login_service(value)?);
+                index += 1;
+            }
+            other => return Err(format!("unexpected logout argument: {other}")),
+        }
+    }
+
+    Ok(LogoutCommand { service })
 }
 
 fn parse_proxy_args(args: &[String]) -> Result<CliAction, String> {
@@ -827,7 +998,15 @@ fn print_bootstrap_plan() {
 }
 
 fn print_system_prompt(cwd: PathBuf, date: String) {
-    match load_system_prompt(cwd, date, env::consts::OS, "unknown") {
+    let model = default_model_or(DEFAULT_MODEL);
+    let service = infer_service_for_model(&model);
+    match load_system_prompt_with_model_family(
+        cwd,
+        date,
+        env::consts::OS,
+        "unknown",
+        prompt_model_family(service, &model),
+    ) {
         Ok(sections) => println!("{}", sections.join("\n\n")),
         Err(error) => {
             eprintln!("failed to build system prompt: {error}");
@@ -1038,6 +1217,24 @@ fn login(
             None => return Ok(()),
         },
     };
+    if service == AuthService::OpenAiCodex {
+        if api_key.is_some() {
+            return Err(
+                "OpenAI Codex login uses device-code authentication and does not accept API keys"
+                    .into(),
+            );
+        }
+        let credentials_path = login_openai_codex()?;
+        println!(
+            "Saved {} credentials to {}",
+            service.display_name(),
+            credentials_path.display()
+        );
+        if let Some(note) = login_model_guidance(service) {
+            println!("{note}");
+        }
+        return Ok(());
+    }
     let api_key = resolve_auth_api_key(service, api_key)?;
     let credentials_path = save_credentials(service, &api_key)?;
     println!(
@@ -1045,7 +1242,246 @@ fn login(
         service.display_name(),
         credentials_path.display()
     );
+    if let Some(note) = login_model_guidance(service) {
+        println!("{note}");
+    }
     Ok(())
+}
+
+fn login_model_guidance(service: AuthService) -> Option<String> {
+    let target_service = service.runtime_service()?;
+    let active_model = default_model_or(DEFAULT_MODEL);
+    let active_service = infer_service_for_model(&active_model);
+    if active_service == target_service {
+        return None;
+    }
+
+    let switch_hint = match service {
+        AuthService::Synthetic => {
+            "Run `/model` and choose a Synthetic model id (usually prefixed with `hf:`)."
+        }
+        AuthService::OpenAiCodex => {
+            "Run `/model` and choose an OpenAI Codex model id prefixed with `openai-codex/`."
+        }
+        AuthService::OpencodeGo => {
+            "Run `/model` and choose an OpenCode Go model id prefixed with `opencode-go/`."
+        }
+        AuthService::NanoGpt => {
+            "Run `/model zai-org/glm-5.1` or another NanoGPT-backed model if you want to use this key immediately."
+        }
+        AuthService::Exa => return None,
+    };
+
+    Some(format!(
+        "Note: your current model is `{active_model}` on {}. Logging into {} saves credentials but does not switch the active model. {switch_hint}",
+        active_service.display_name(),
+        service.display_name(),
+    ))
+}
+
+fn logout(service: Option<AuthService>) -> Result<(), Box<dyn std::error::Error>> {
+    let service = match service {
+        Some(service) => service,
+        None => match prompt_for_auth_service_selection()? {
+            Some(service) => service,
+            None => return Ok(()),
+        },
+    };
+
+    let outcome = remove_saved_credentials(service)?;
+    match outcome {
+        CredentialRemovalOutcome::Removed { path } => {
+            println!(
+                "Removed saved {} credentials from {}",
+                service.display_name(),
+                path.display()
+            );
+        }
+        CredentialRemovalOutcome::Missing { path } => {
+            println!(
+                "No saved {} credentials found in {}",
+                service.display_name(),
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn login_openai_codex() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    login_openai_codex_device_code()
+}
+
+fn login_openai_codex_device_code() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let client = BlockingClient::builder()
+        .timeout(Duration::from_secs(20))
+        .build()?;
+    let response = client
+        .post(format!(
+            "{OPENAI_CODEX_ISSUER}/api/accounts/deviceauth/usercode"
+        ))
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({ "client_id": OPENAI_CODEX_CLIENT_ID }))
+        .send()?;
+    let response = response.error_for_status()?;
+    let payload: OpenAiCodexDeviceCodeResponse = response.json()?;
+    let interval_secs = payload
+        .interval
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .unwrap_or(5);
+
+    println!(
+        "Open this URL in your browser and sign in with ChatGPT:\n\n{issuer}/codex/device\n\nEnter this one-time code:\n\n{code}\n",
+        issuer = OPENAI_CODEX_ISSUER,
+        code = payload.user_code
+    );
+
+    let deadline = std::time::Instant::now() + OPENAI_CODEX_DEVICE_AUTH_TIMEOUT;
+    loop {
+        let response = client
+            .post(format!(
+                "{OPENAI_CODEX_ISSUER}/api/accounts/deviceauth/token"
+            ))
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({
+                "device_auth_id": payload.device_auth_id,
+                "user_code": payload.user_code,
+            }))
+            .send()?;
+
+        if response.status().is_success() {
+            let payload: OpenAiCodexDeviceTokenResponse = response.json()?;
+            let tokens = exchange_openai_codex_authorization_code(
+                &payload.authorization_code,
+                &format!("{OPENAI_CODEX_ISSUER}/deviceauth/callback"),
+                &payload.code_verifier,
+            )?;
+            return persist_openai_codex_tokens(tokens);
+        }
+
+        let status = response.status();
+        if !matches!(status.as_u16(), 403 | 404) {
+            let body = response.text().unwrap_or_default();
+            return Err(format!(
+                "device code authorization failed with status {}: {}",
+                status, body
+            )
+            .into());
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Err("device code authorization timed out after 15 minutes".into());
+        }
+
+        std::thread::sleep(
+            Duration::from_secs(interval_secs)
+                .saturating_add(OPENAI_CODEX_DEVICE_POLL_SAFETY_MARGIN),
+        );
+    }
+}
+
+fn exchange_openai_codex_authorization_code(
+    code: &str,
+    redirect_uri: &str,
+    verifier: &str,
+) -> Result<OpenAiCodexTokenResponse, Box<dyn std::error::Error>> {
+    let client = BlockingClient::builder()
+        .timeout(Duration::from_secs(20))
+        .build()?;
+    let response = client
+        .post(format!("{OPENAI_CODEX_ISSUER}/oauth/token"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("client_id", OPENAI_CODEX_CLIENT_ID),
+            ("code_verifier", verifier),
+        ])
+        .send()?;
+    let response = response.error_for_status()?;
+    Ok(response.json()?)
+}
+
+fn persist_openai_codex_tokens(
+    tokens: OpenAiCodexTokenResponse,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let expires_at = tokens
+        .expires_in
+        .map(|seconds| current_epoch_millis().saturating_add(seconds.saturating_mul(1_000)));
+    let account_id = tokens
+        .id_token
+        .as_deref()
+        .and_then(extract_openai_codex_account_id)
+        .or_else(|| extract_openai_codex_account_id(&tokens.access_token));
+    let credentials = OpenAiCodexCredentials {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        expires_at,
+        account_id,
+    };
+    Ok(save_openai_codex_credentials(&credentials)?)
+}
+
+fn extract_openai_codex_account_id(token: &str) -> Option<String> {
+    let claims = decode_jwt_claims(token)?;
+    claims
+        .get("chatgpt_account_id")
+        .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            claims
+                .get("https://api.openai.com/auth")
+                .and_then(JsonValue::as_object)
+                .and_then(|value| value.get("chatgpt_account_id"))
+                .and_then(JsonValue::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            claims
+                .get("organizations")
+                .and_then(JsonValue::as_array)
+                .and_then(|values| values.first())
+                .and_then(JsonValue::as_object)
+                .and_then(|value| value.get("id"))
+                .and_then(JsonValue::as_str)
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn decode_jwt_claims(token: &str) -> Option<JsonValue> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = decode_base64_url(payload)?;
+    serde_json::from_slice(&decoded).ok()
+}
+
+fn decode_base64_url(value: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = 0_u32;
+    let mut bits = 0_u8;
+
+    for byte in value.bytes() {
+        let sextet = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        buffer = (buffer << 6) | u32::from(sextet);
+        bits += 6;
+        while bits >= 8 {
+            bits -= 8;
+            output.push(((buffer >> bits) & 0xFF) as u8);
+        }
+    }
+
+    Some(output)
 }
 
 fn handle_model_action(model: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -1355,6 +1791,12 @@ fn resolve_auth_api_key(
     service: AuthService,
     api_key: Option<String>,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    if service == AuthService::OpenAiCodex {
+        return Err(
+            "OpenAI Codex login uses device-code authentication and does not accept API keys"
+                .into(),
+        );
+    }
     match api_key {
         Some(api_key) if !api_key.trim().is_empty() => Ok(api_key),
         Some(_) => Err(format!("{} API key cannot be empty", service.display_name()).into()),
@@ -1395,6 +1837,53 @@ fn save_credentials(
     Ok(credentials_path)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CredentialRemovalOutcome {
+    Removed { path: PathBuf },
+    Missing { path: PathBuf },
+}
+
+fn remove_saved_credentials(
+    service: AuthService,
+) -> Result<CredentialRemovalOutcome, Box<dyn std::error::Error>> {
+    let credentials_path = pebble_config_home()?.join("credentials.json");
+    let contents = match fs::read_to_string(&credentials_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(CredentialRemovalOutcome::Missing {
+                path: credentials_path,
+            });
+        }
+        Err(error) => return Err(Box::new(error)),
+    };
+
+    let mut parsed = serde_json::from_str::<serde_json::Value>(&contents)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    if !parsed.is_object() {
+        parsed = serde_json::json!({});
+    }
+
+    let removed = parsed
+        .as_object_mut()
+        .is_some_and(|object| object.remove(service.credential_key()).is_some());
+    if !removed {
+        return Ok(CredentialRemovalOutcome::Missing {
+            path: credentials_path,
+        });
+    }
+
+    fs::write(&credentials_path, serde_json::to_string_pretty(&parsed)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&credentials_path, fs::Permissions::from_mode(0o600))?;
+    }
+
+    Ok(CredentialRemovalOutcome::Removed {
+        path: credentials_path,
+    })
+}
+
 fn pebble_config_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
     resolve_pebble_config_home()
         .ok_or_else(|| "could not resolve PEBBLE_CONFIG_HOME, HOME, or USERPROFILE".into())
@@ -1406,6 +1895,11 @@ struct LoginCommand {
     api_key: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogoutCommand {
+    service: Option<AuthService>,
+}
+
 fn parse_auth_command(input: &str) -> Option<LoginCommand> {
     let mut parts = input.split_whitespace();
     let command = parts.next()?;
@@ -1413,6 +1907,15 @@ fn parse_auth_command(input: &str) -> Option<LoginCommand> {
         return None;
     }
     parse_login_tokens(parts.collect::<Vec<_>>()).ok()
+}
+
+fn parse_logout_command(input: &str) -> Option<LogoutCommand> {
+    let mut parts = input.split_whitespace();
+    let command = parts.next()?;
+    if command != "/logout" {
+        return None;
+    }
+    parse_logout_tokens(parts.collect::<Vec<_>>()).ok()
 }
 
 fn parse_model_command(input: &str) -> Option<Option<String>> {
@@ -1458,10 +1961,42 @@ fn parse_proxy_command(input: &str) -> Option<Result<ProxyCommand, String>> {
     ))
 }
 
-fn parse_thinking_command(input: &str) -> Option<Result<Option<bool>, String>> {
+fn parse_reasoning_command(input: &str) -> Option<Result<Option<Option<ReasoningEffort>>, String>> {
     let mut parts = input.split_whitespace();
     let command = parts.next()?;
-    if command != "/thinking" {
+    if command != "/reasoning" && command != "/thinking" {
+        return None;
+    }
+
+    let remainder = parts.collect::<Vec<_>>().join(" ");
+    let trimmed = remainder.trim();
+    Some(if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        parse_reasoning_effort_arg(trimmed).map(Some)
+    })
+}
+
+fn parse_mode_command(input: &str) -> Option<Result<Option<CollaborationMode>, String>> {
+    let mut parts = input.split_whitespace();
+    let command = parts.next()?;
+    if command != "/mode" {
+        return None;
+    }
+
+    let remainder = parts.collect::<Vec<_>>().join(" ");
+    let trimmed = remainder.trim();
+    Some(if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        parse_collaboration_mode_arg(trimmed).map(Some)
+    })
+}
+
+fn parse_fast_command(input: &str) -> Option<Result<Option<FastMode>, String>> {
+    let mut parts = input.split_whitespace();
+    let command = parts.next()?;
+    if command != "/fast" {
         return None;
     }
 
@@ -1469,10 +2004,10 @@ fn parse_thinking_command(input: &str) -> Option<Result<Option<bool>, String>> {
     let trimmed = remainder.trim();
     Some(match trimmed {
         "" => Ok(None),
-        "on" => Ok(Some(true)),
-        "off" => Ok(Some(false)),
+        "on" => Ok(Some(FastMode::On)),
+        "off" => Ok(Some(FastMode::Off)),
         other => Err(format!(
-            "/thinking accepts one optional argument: on or off (got {other})"
+            "/fast accepts one optional argument: on or off (got {other})"
         )),
     })
 }
@@ -1555,16 +2090,26 @@ fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
         .map(permission_mode_from_label)
 }
 
-fn parse_max_cost_arg(value: &str) -> Result<f64, String> {
-    let parsed = value
-        .parse::<f64>()
-        .map_err(|_| format!("invalid value for --max-cost: {value}"))?;
-    if !parsed.is_finite() || parsed <= 0.0 {
-        return Err(format!(
-            "--max-cost must be a positive finite USD amount: {value}"
-        ));
+fn parse_collaboration_mode_arg(value: &str) -> Result<CollaborationMode, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "build" => Ok(CollaborationMode::Build),
+        "plan" => Ok(CollaborationMode::Plan),
+        other => Err(format!("unsupported mode '{other}'. Use build or plan.")),
     }
-    Ok(parsed)
+}
+
+fn parse_reasoning_effort_arg(value: &str) -> Result<Option<ReasoningEffort>, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "default" | "auto" | "off" => Ok(None),
+        "minimal" => Ok(Some(ReasoningEffort::Minimal)),
+        "low" => Ok(Some(ReasoningEffort::Low)),
+        "medium" | "on" => Ok(Some(ReasoningEffort::Medium)),
+        "high" => Ok(Some(ReasoningEffort::High)),
+        "xhigh" | "x-high" => Ok(Some(ReasoningEffort::XHigh)),
+        other => Err(format!(
+            "unsupported reasoning effort '{other}'. Use default, minimal, low, medium, high, or xhigh."
+        )),
+    }
 }
 
 fn default_permission_mode() -> PermissionMode {
@@ -1594,16 +2139,32 @@ fn read_secret(prompt: &str) -> io::Result<String> {
     }
 
     enable_raw_mode()?;
+    if let Err(error) = execute!(stdout, EnableBracketedPaste) {
+        let _ = disable_raw_mode();
+        return Err(error);
+    }
     let result = read_secret_raw(&mut stdout);
-    disable_raw_mode()?;
+    let disable_paste_result = execute!(stdout, DisableBracketedPaste);
+    let disable_raw_result = disable_raw_mode();
     writeln!(stdout)?;
+    disable_paste_result?;
+    disable_raw_result?;
     result
 }
 
 fn read_secret_raw(out: &mut impl Write) -> io::Result<String> {
     let mut secret = String::new();
+    let opened_at = Instant::now();
     loop {
         match event::read()? {
+            Event::Paste(data) => {
+                secret.push_str(trim_trailing_line_endings(&data));
+            }
+            Event::Key(KeyEvent { kind, .. }) if kind == KeyEventKind::Release => {}
+            Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            }) if should_ignore_stale_secret_submit(&secret, opened_at.elapsed()) => {}
             Event::Key(KeyEvent {
                 code: KeyCode::Enter,
                 ..
@@ -1635,6 +2196,14 @@ fn read_secret_raw(out: &mut impl Write) -> io::Result<String> {
         }
         out.flush()?;
     }
+}
+
+fn should_ignore_stale_secret_submit(secret: &str, elapsed: Duration) -> bool {
+    secret.is_empty() && elapsed <= SECRET_PROMPT_STALE_ENTER_WINDOW
+}
+
+fn trim_trailing_line_endings(value: &str) -> &str {
+    value.trim_end_matches(['\r', '\n'])
 }
 
 fn base_runtime_tool_specs(tool_registry: &GlobalToolRegistry) -> Vec<RuntimeToolSpec> {
@@ -2310,8 +2879,9 @@ fn format_status_report(
     permission_mode: &str,
     provider: Option<&str>,
     proxy_tool_calls: bool,
-    thinking_enabled: bool,
-    max_cost_usd: Option<f64>,
+    collaboration_mode: CollaborationMode,
+    reasoning_effort: Option<ReasoningEffort>,
+    fast_mode: FastMode,
     mcp_catalog: &McpCatalog,
     context: &StatusContext,
 ) -> String {
@@ -2326,7 +2896,7 @@ fn format_status_report(
         .unwrap_or_default();
     [
         format!(
-            "{}\n  {}\n    {} {}\n    {} {}{}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}",
+            "{}\n  {}\n    {} {}\n    {} {}{}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}",
             report_title("Pebble Status"),
             report_section("Session"),
             report_label("service"),
@@ -2338,8 +2908,12 @@ fn format_status_report(
             report_value(permission_mode),
             report_label("proxy_tools"),
             if proxy_tool_calls { "enabled" } else { "disabled" },
-            report_label("thinking"),
-            if thinking_enabled { "enabled" } else { "disabled" },
+            report_label("mode"),
+            collaboration_mode.as_str(),
+            report_label("reasoning"),
+            reasoning_effort_label(reasoning_effort),
+            report_label("fast_mode"),
+            fast_mode.as_str(),
             report_label("messages"),
             usage.message_count,
             report_label("turns"),
@@ -2348,7 +2922,7 @@ fn format_status_report(
             usage.estimated_tokens,
         ),
         format!(
-            "  {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}",
+            "  {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}",
             report_section("Usage"),
             report_label("latest_total"),
             usage.latest.total_tokens(),
@@ -2358,10 +2932,6 @@ fn format_status_report(
             usage.cumulative.output_tokens,
             report_label("cumulative_total"),
             usage.cumulative.total_tokens(),
-            report_label("estimated_cost"),
-            format_usd(usage_cost_total(model, usage.cumulative)),
-            report_label("budget"),
-            format_budget_line(usage_cost_total(model, usage.cumulative), max_cost_usd),
         ),
         format!(
             "  {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} loaded {}/{}\n    {} {}\n    {} {}\n    {} servers={} tools={}",
@@ -2669,6 +3239,13 @@ fn current_epoch_secs() -> u64 {
         .unwrap_or_default()
 }
 
+fn current_epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
+
 fn current_timestamp_rfc3339ish() -> String {
     format!("{}Z", current_epoch_secs())
 }
@@ -2693,7 +3270,9 @@ fn derive_session_metadata(
     model: &str,
     allowed_tools: Option<&AllowedToolSet>,
     permission_mode: PermissionMode,
-    thinking_enabled: bool,
+    collaboration_mode: CollaborationMode,
+    reasoning_effort: Option<ReasoningEffort>,
+    fast_mode: FastMode,
     proxy_tool_calls: bool,
 ) -> SessionMetadata {
     let started_at = session
@@ -2708,7 +3287,11 @@ fn derive_session_metadata(
         message_count: session.messages.len().try_into().unwrap_or(u32::MAX),
         last_prompt: last_prompt_from_session(session),
         permission_mode: Some(permission_mode.as_str().to_string()),
-        thinking_enabled: Some(thinking_enabled),
+        thinking_enabled: Some(reasoning_effort.is_some()),
+        collaboration_mode: Some(collaboration_mode.as_str().to_string()),
+        reasoning_effort: reasoning_effort
+            .map(|effort| reasoning_effort_label(Some(effort)).to_string()),
+        fast_mode: Some(fast_mode.enabled()),
         proxy_tool_calls: Some(proxy_tool_calls),
         allowed_tools: allowed_tools.map(|allowed| allowed.iter().cloned().collect()),
     }
@@ -2719,7 +3302,9 @@ fn session_runtime_state(
     fallback_model: &str,
     fallback_allowed_tools: Option<&AllowedToolSet>,
     fallback_permission_mode: PermissionMode,
-    fallback_thinking_enabled: bool,
+    fallback_collaboration_mode: CollaborationMode,
+    fallback_reasoning_effort: Option<ReasoningEffort>,
+    fallback_fast_mode: FastMode,
     fallback_proxy_tool_calls: bool,
 ) -> SessionRuntimeState {
     let metadata = session.metadata.as_ref();
@@ -2735,9 +3320,19 @@ fn session_runtime_state(
         .and_then(|metadata| metadata.permission_mode.as_deref())
         .and_then(|value| parse_permission_mode_arg(value).ok())
         .unwrap_or(fallback_permission_mode);
-    let thinking_enabled = metadata
-        .and_then(|metadata| metadata.thinking_enabled)
-        .unwrap_or(fallback_thinking_enabled);
+    let collaboration_mode = metadata
+        .and_then(|metadata| metadata.collaboration_mode.as_deref())
+        .and_then(|value| parse_collaboration_mode_arg(value).ok())
+        .unwrap_or(fallback_collaboration_mode);
+    let reasoning_effort = metadata
+        .and_then(|metadata| metadata.reasoning_effort.as_deref())
+        .and_then(|value| parse_reasoning_effort_arg(value).ok())
+        .flatten()
+        .or(fallback_reasoning_effort);
+    let fast_mode = metadata
+        .and_then(|metadata| metadata.fast_mode)
+        .map(|enabled| if enabled { FastMode::On } else { FastMode::Off })
+        .unwrap_or(fallback_fast_mode);
     let proxy_tool_calls = metadata
         .and_then(|metadata| metadata.proxy_tool_calls)
         .unwrap_or(fallback_proxy_tool_calls);
@@ -2747,7 +3342,9 @@ fn session_runtime_state(
         service,
         allowed_tools,
         permission_mode,
-        thinking_enabled,
+        collaboration_mode,
+        reasoning_effort,
+        fast_mode,
         proxy_tool_calls,
     }
 }
@@ -2783,7 +3380,9 @@ fn auto_compact_inactive_sessions(
             &model,
             None,
             default_permission_mode(),
-            false,
+            CollaborationMode::Build,
+            None,
+            FastMode::Off,
             false,
         );
         compacted.metadata = Some(derive_session_metadata(
@@ -2791,7 +3390,9 @@ fn auto_compact_inactive_sessions(
             &model,
             state.allowed_tools.as_ref(),
             state.permission_mode,
-            state.thinking_enabled,
+            state.collaboration_mode,
+            state.reasoning_effort,
+            state.fast_mode,
             state.proxy_tool_calls,
         ));
         compacted.save_to_path(&path)?;
@@ -3269,7 +3870,11 @@ fn render_repl_help() -> String {
                 "• /login and /auth open a service picker when no service is provided".to_string(),
             ),
             ui::PanelRow::Line(
-                "• supported auth services: nanogpt, synthetic, opencode-go, exa".to_string(),
+                "• /logout removes saved credentials for a service".to_string(),
+            ),
+            ui::PanelRow::Line(
+                "• supported auth services: nanogpt, synthetic, openai-codex, opencode-go, exa"
+                    .to_string(),
             ),
             ui::PanelRow::Line(
                 "• /provider is only available for NanoGPT-backed models".to_string(),
@@ -3293,9 +3898,10 @@ fn repl_completion_candidates(cli: &LiveCli) -> Vec<String> {
         candidates.insert(format!("/help {topic}"));
     }
 
-    for service in ["nanogpt", "synthetic", "opencode-go", "exa"] {
+    for service in ["nanogpt", "synthetic", "openai-codex", "opencode-go", "exa"] {
         candidates.insert(format!("/login {service}"));
         candidates.insert(format!("/auth {service}"));
+        candidates.insert(format!("/logout {service}"));
     }
 
     for mode in ["read-only", "workspace-write", "danger-full-access"] {
@@ -3432,16 +4038,18 @@ fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    max_cost_usd: Option<f64>,
-    thinking_enabled: bool,
+    collaboration_mode: CollaborationMode,
+    reasoning_effort: Option<ReasoningEffort>,
+    fast_mode: FastMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut cli = LiveCli::new(
         model,
         true,
         allowed_tools,
         permission_mode,
-        max_cost_usd,
-        thinking_enabled,
+        collaboration_mode,
+        reasoning_effort,
+        fast_mode,
         true,
     )?;
     run_repl_loop(&mut cli)
@@ -3462,8 +4070,9 @@ fn run_repl_from_session(
         model,
         None,
         default_permission_mode(),
+        CollaborationMode::Build,
         None,
-        false,
+        FastMode::Off,
         true,
     )?;
     run_repl_loop(&mut cli)
@@ -3497,6 +4106,10 @@ fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
             input::ReadOutcome::Submit(input) => input,
             input::ReadOutcome::Cancel => continue,
             input::ReadOutcome::Exit => break,
+            input::ReadOutcome::ToggleMode => {
+                cli.toggle_mode()?;
+                continue;
+            }
         };
         let trimmed = input.trim();
         if trimmed.is_empty() {
@@ -3505,6 +4118,10 @@ fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
         editor.push_history(trimmed.to_string());
         if let Some(login_command) = parse_auth_command(trimmed) {
             login(login_command.service, login_command.api_key)?;
+            continue;
+        }
+        if let Some(logout_command) = parse_logout_command(trimmed) {
+            logout(logout_command.service)?;
             continue;
         }
         if let Some(model) = parse_model_command(trimmed) {
@@ -3533,8 +4150,16 @@ fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
             handle_proxy_runtime_command(cli, mode?)?;
             continue;
         }
-        if let Some(enabled) = parse_thinking_command(trimmed) {
-            cli.set_thinking(enabled?)?;
+        if let Some(reasoning_effort) = parse_reasoning_command(trimmed) {
+            cli.set_reasoning(reasoning_effort?)?;
+            continue;
+        }
+        if let Some(mode) = parse_mode_command(trimmed) {
+            cli.set_mode(mode?)?;
+            continue;
+        }
+        if let Some(fast_mode) = parse_fast_command(trimmed) {
+            cli.set_fast_mode(fast_mode?)?;
             continue;
         }
         if let Some(command) = parse_mcp_command(trimmed) {
@@ -3560,11 +4185,29 @@ fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                     ),
                     SlashCommand::Status => cli.print_status(),
                     SlashCommand::Compact => cli.compact()?,
-                    SlashCommand::Thinking { enabled } => cli.set_thinking(enabled)?,
+                    SlashCommand::Reasoning { effort } => {
+                        cli.set_reasoning(match effort.as_deref() {
+                            Some(value) => Some(parse_reasoning_effort_arg(value)?),
+                            None => None,
+                        })?
+                    }
+                    SlashCommand::Fast { enabled } => {
+                        cli.set_fast_mode(enabled.map(|enabled| {
+                            if enabled {
+                                FastMode::On
+                            } else {
+                                FastMode::Off
+                            }
+                        }))?
+                    }
+                    SlashCommand::Mode { mode } => cli.set_mode(
+                        mode.as_deref()
+                            .map(parse_collaboration_mode_arg)
+                            .transpose()?,
+                    )?,
                     SlashCommand::Permissions { mode } => cli.set_permissions(
                         mode.as_deref().map(parse_permission_mode_arg).transpose()?,
                     )?,
-                    SlashCommand::Cost => cli.print_cost(),
                     SlashCommand::Clear { confirm } => cli.clear_session(confirm)?,
                     SlashCommand::Resume { session_path } => cli.resume_session(session_path)?,
                     SlashCommand::Config { section } => {
@@ -3612,7 +4255,9 @@ fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                         handle_skills_slash_command(args.as_deref(), &env::current_dir()?)?
                     ),
                     SlashCommand::Unknown(name) => eprintln!("unknown slash command: /{name}"),
-                    SlashCommand::Model { .. } | SlashCommand::Mcp { .. } => {
+                    SlashCommand::Model { .. }
+                    | SlashCommand::Logout { .. }
+                    | SlashCommand::Mcp { .. } => {
                         unreachable!("handled before shared slash command dispatch")
                     }
                 }
@@ -3629,8 +4274,9 @@ struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    max_cost_usd: Option<f64>,
-    thinking_enabled: bool,
+    collaboration_mode: CollaborationMode,
+    reasoning_effort: Option<ReasoningEffort>,
+    fast_mode: FastMode,
     system_prompt: Vec<String>,
     proxy_tool_calls: bool,
     mcp_catalog: McpCatalog,
@@ -3645,12 +4291,13 @@ impl LiveCli {
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
-        max_cost_usd: Option<f64>,
-        thinking_enabled: bool,
+        collaboration_mode: CollaborationMode,
+        reasoning_effort: Option<ReasoningEffort>,
+        fast_mode: FastMode,
         render_model_output: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let service = infer_service_for_model(&model);
-        let system_prompt = build_system_prompt()?;
+        let system_prompt = build_system_prompt(service, &model, collaboration_mode)?;
         let proxy_tool_calls = proxy_tool_calls_enabled();
         let mcp_catalog = load_mcp_catalog(&env::current_dir()?)?;
         let session = create_managed_session_handle()?;
@@ -3665,7 +4312,9 @@ impl LiveCli {
             mcp_catalog.clone(),
             allowed_tools.clone(),
             permission_mode,
-            thinking_enabled,
+            collaboration_mode,
+            reasoning_effort,
+            fast_mode,
             render_model_output,
         )?;
         let cli = Self {
@@ -3673,8 +4322,9 @@ impl LiveCli {
             model,
             allowed_tools,
             permission_mode,
-            max_cost_usd,
-            thinking_enabled,
+            collaboration_mode,
+            reasoning_effort,
+            fast_mode,
             system_prompt,
             proxy_tool_calls,
             mcp_catalog,
@@ -3692,19 +4342,26 @@ impl LiveCli {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
-        max_cost_usd: Option<f64>,
-        thinking_enabled: bool,
+        collaboration_mode: CollaborationMode,
+        reasoning_effort: Option<ReasoningEffort>,
+        fast_mode: FastMode,
         render_model_output: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let system_prompt = build_system_prompt()?;
         let restored = session_runtime_state(
             &session,
             &model,
             allowed_tools.as_ref(),
             permission_mode,
-            thinking_enabled,
+            collaboration_mode,
+            reasoning_effort,
+            fast_mode,
             proxy_tool_calls_enabled(),
         );
+        let system_prompt = build_system_prompt(
+            restored.service,
+            &restored.model,
+            restored.collaboration_mode,
+        )?;
         let mcp_catalog = load_mcp_catalog(&env::current_dir()?)?;
         let runtime = build_runtime(
             session,
@@ -3716,7 +4373,9 @@ impl LiveCli {
             mcp_catalog.clone(),
             restored.allowed_tools.clone(),
             restored.permission_mode,
-            restored.thinking_enabled,
+            restored.collaboration_mode,
+            restored.reasoning_effort,
+            restored.fast_mode,
             render_model_output,
         )?;
         Ok(Self {
@@ -3724,8 +4383,9 @@ impl LiveCli {
             model: restored.model,
             allowed_tools: restored.allowed_tools,
             permission_mode: restored.permission_mode,
-            max_cost_usd,
-            thinking_enabled: restored.thinking_enabled,
+            collaboration_mode: restored.collaboration_mode,
+            reasoning_effort: restored.reasoning_effort,
+            fast_mode: restored.fast_mode,
             system_prompt,
             proxy_tool_calls: restored.proxy_tool_calls,
             mcp_catalog,
@@ -3747,7 +4407,6 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        self.enforce_budget_before_turn()?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         // Visual turn separator so the transcript has clear "acts": one per
@@ -3755,7 +4414,11 @@ impl LiveCli {
         // actual content above or below.
         println!("{}", ui::turn_separator());
         spinner.tick(
-            "thinking",
+            if self.collaboration_mode == CollaborationMode::Plan {
+                "planning"
+            } else {
+                "thinking"
+            },
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
@@ -3763,13 +4426,8 @@ impl LiveCli {
         let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
         match result {
             Ok(summary) => {
-                spinner.finish(
-                    "done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
+                spinner.finish("done", TerminalRenderer::new().color_theme(), &mut stdout)?;
                 self.persist_session()?;
-                self.print_budget_notice(summary.usage);
                 if let Some(event) = summary.auto_compaction {
                     println!(
                         "{}",
@@ -3791,7 +4449,6 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        self.enforce_budget_before_turn()?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let summary = self
             .runtime
@@ -3823,21 +4480,20 @@ impl LiveCli {
     /// Build the one-line status strip rendered above the input prompt.
     ///
     /// The REPL calls this before every input read so the strip always
-    /// reflects the agent's current configuration and budget. We deliberately
+    /// reflects the agent's current configuration. We deliberately
     /// compute this fresh each time instead of caching so toggled settings
-    /// (thinking, permissions, provider) take effect immediately.
+    /// (mode, reasoning, permissions, provider) take effect immediately.
     fn prompt_status_line(&self) -> String {
-        let cumulative = self.runtime.usage().cumulative_usage();
         let estimated = self.runtime.estimated_tokens();
-        let cumulative_cost = usage_cost_total(&self.model, cumulative);
-        let cost = (cumulative_cost > 0.0).then_some(cumulative_cost);
         ui::prompt_status_line(&ui::PromptStatusInfo {
             model: short_model_name(&self.model),
             permission_mode: self.permission_mode.as_str(),
-            thinking_enabled: self.thinking_enabled,
+            collaboration_mode: self.collaboration_mode.as_str(),
+            reasoning_effort: reasoning_effort_label(self.effective_reasoning_effort()),
+            fast_mode: self.fast_mode.enabled(),
             proxy_tool_calls: self.proxy_tool_calls,
-            estimated_tokens: (estimated > 0).then_some(u64::try_from(estimated).unwrap_or(u64::MAX)),
-            cumulative_cost: cost,
+            estimated_tokens: (estimated > 0)
+                .then_some(u64::try_from(estimated).unwrap_or(u64::MAX)),
         })
     }
 
@@ -3860,8 +4516,9 @@ impl LiveCli {
                 self.permission_mode.as_str(),
                 provider_label_for_service_model(self.service, &self.model).as_deref(),
                 self.proxy_tool_calls,
-                self.thinking_enabled,
-                self.max_cost_usd,
+                self.collaboration_mode,
+                self.effective_reasoning_effort(),
+                self.fast_mode,
                 &self.mcp_catalog,
                 &context,
             )
@@ -3880,19 +4537,7 @@ impl LiveCli {
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let result = self.runtime.compact(CompactionConfig::default());
         let removed = result.removed_message_count;
-        self.runtime = build_runtime(
-            result.compacted_session,
-            self.service,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            self.proxy_tool_calls,
-            self.mcp_catalog.clone(),
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            self.thinking_enabled,
-            self.render_model_output,
-        )?;
+        self.rebuild_runtime(result.compacted_session)?;
         self.persist_session()?;
         println!("Compacted {removed} messages.");
         Ok(())
@@ -3900,24 +4545,10 @@ impl LiveCli {
 
     fn set_model(&mut self, model: String) -> Result<(), Box<dyn std::error::Error>> {
         let model = resolve_model_alias(&model).to_string();
-        let service = infer_service_for_model(&model);
-        let session = self.runtime.session().clone();
         persist_current_model(model.clone())?;
-        self.runtime = build_runtime(
-            session,
-            service,
-            model.clone(),
-            self.system_prompt.clone(),
-            true,
-            self.proxy_tool_calls,
-            self.mcp_catalog.clone(),
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            self.thinking_enabled,
-            self.render_model_output,
-        )?;
-        self.service = service;
+        self.service = infer_service_for_model(&model);
         self.model = model.clone();
+        self.rebuild_runtime(self.runtime.session().clone())?;
         self.persist_session()?;
         println!("Switched to service: {}", self.service.display_name());
         println!("Switched to model: {model}");
@@ -3944,19 +4575,7 @@ impl LiveCli {
             .clone()
             .unwrap_or_else(|| "<platform default>".to_string());
         persist_provider_for_model(&self.model, provider)?;
-        self.runtime = build_runtime(
-            session,
-            self.service,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            self.proxy_tool_calls,
-            self.mcp_catalog.clone(),
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            self.thinking_enabled,
-            self.render_model_output,
-        )?;
+        self.rebuild_runtime(session)?;
         self.persist_session()?;
         if provider_label == "<platform default>" {
             println!(
@@ -3975,20 +4594,8 @@ impl LiveCli {
     fn set_proxy_tool_calls(&mut self, enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
         let session = self.runtime.session().clone();
         persist_proxy_tool_calls(enabled)?;
-        self.runtime = build_runtime(
-            session,
-            self.service,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            enabled,
-            self.mcp_catalog.clone(),
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            self.thinking_enabled,
-            self.render_model_output,
-        )?;
         self.proxy_tool_calls = enabled;
+        self.rebuild_runtime(session)?;
         self.persist_session()?;
         println!(
             "Proxy tool-call translation: {}",
@@ -4004,21 +4611,8 @@ impl LiveCli {
 
     fn reload_mcp(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let session = self.runtime.session().clone();
-        let catalog = load_mcp_catalog(&env::current_dir()?)?;
-        self.runtime = build_runtime(
-            session,
-            self.service,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            self.proxy_tool_calls,
-            catalog.clone(),
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            self.thinking_enabled,
-            self.render_model_output,
-        )?;
-        self.mcp_catalog = catalog;
+        self.mcp_catalog = load_mcp_catalog(&env::current_dir()?)?;
+        self.rebuild_runtime(session)?;
         self.persist_session()?;
         println!("Reloaded MCP config.");
         self.print_mcp_status();
@@ -4046,38 +4640,99 @@ impl LiveCli {
             return Ok(());
         }
 
-        let session = self.runtime.session().clone();
         self.permission_mode = mode;
-        self.runtime = build_runtime(
-            session,
-            self.service,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            self.proxy_tool_calls,
-            self.mcp_catalog.clone(),
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            self.thinking_enabled,
-            self.render_model_output,
-        )?;
+        self.rebuild_runtime(self.runtime.session().clone())?;
         self.persist_session()?;
         println!("Permission mode: {}", self.permission_mode.as_str());
         Ok(())
     }
 
-    fn set_thinking(&mut self, enabled: Option<bool>) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(enabled) = enabled else {
-            println!("{}", format_thinking_report(self.thinking_enabled));
+    fn toggle_mode(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.set_mode(Some(match self.collaboration_mode {
+            CollaborationMode::Build => CollaborationMode::Plan,
+            CollaborationMode::Plan => CollaborationMode::Build,
+        }))
+    }
+
+    fn set_mode(
+        &mut self,
+        mode: Option<CollaborationMode>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(mode) = mode else {
+            println!("{}", format_mode_report(self.collaboration_mode));
             return Ok(());
         };
-        if enabled == self.thinking_enabled {
-            println!("{}", format_thinking_report(self.thinking_enabled));
+        if mode == self.collaboration_mode {
+            println!("{}", format_mode_report(self.collaboration_mode));
             return Ok(());
         }
 
-        let session = self.runtime.session().clone();
-        self.thinking_enabled = enabled;
+        self.collaboration_mode = mode;
+        self.rebuild_runtime(self.runtime.session().clone())?;
+        self.persist_session()?;
+        println!("{}", format_mode_switch_report(self.collaboration_mode));
+        Ok(())
+    }
+
+    fn set_reasoning(
+        &mut self,
+        reasoning_effort: Option<Option<ReasoningEffort>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(reasoning_effort) = reasoning_effort else {
+            println!(
+                "{}",
+                format_reasoning_report(self.reasoning_effort, self.effective_reasoning_effort())
+            );
+            return Ok(());
+        };
+        if reasoning_effort == self.reasoning_effort {
+            println!(
+                "{}",
+                format_reasoning_report(self.reasoning_effort, self.effective_reasoning_effort())
+            );
+            return Ok(());
+        }
+
+        self.reasoning_effort = reasoning_effort;
+        self.rebuild_runtime(self.runtime.session().clone())?;
+        self.persist_session()?;
+        println!(
+            "{}",
+            format_reasoning_switch_report(
+                self.reasoning_effort,
+                self.effective_reasoning_effort()
+            )
+        );
+        Ok(())
+    }
+
+    fn set_fast_mode(
+        &mut self,
+        fast_mode: Option<FastMode>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(fast_mode) = fast_mode else {
+            println!("{}", format_fast_mode_report(self.fast_mode));
+            return Ok(());
+        };
+        if fast_mode == self.fast_mode {
+            println!("{}", format_fast_mode_report(self.fast_mode));
+            return Ok(());
+        }
+
+        self.fast_mode = fast_mode;
+        self.rebuild_runtime(self.runtime.session().clone())?;
+        self.persist_session()?;
+        println!("{}", format_fast_mode_switch_report(self.fast_mode));
+        Ok(())
+    }
+
+    fn effective_reasoning_effort(&self) -> Option<ReasoningEffort> {
+        effective_reasoning_effort(self.collaboration_mode, self.reasoning_effort)
+    }
+
+    fn rebuild_runtime(&mut self, session: Session) -> Result<(), Box<dyn std::error::Error>> {
+        self.system_prompt =
+            build_system_prompt(self.service, &self.model, self.collaboration_mode)?;
         self.runtime = build_runtime(
             session,
             self.service,
@@ -4088,11 +4743,11 @@ impl LiveCli {
             self.mcp_catalog.clone(),
             self.allowed_tools.clone(),
             self.permission_mode,
-            self.thinking_enabled,
+            self.collaboration_mode,
+            self.reasoning_effort,
+            self.fast_mode,
             self.render_model_output,
         )?;
-        self.persist_session()?;
-        println!("{}", format_thinking_switch_report(self.thinking_enabled));
         Ok(())
     }
 
@@ -4103,56 +4758,10 @@ impl LiveCli {
     ) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", handle_plugins_command(action, target)?);
         if plugins_command_is_mutating(action) {
-            let session = self.runtime.session().clone();
-            self.runtime = build_runtime(
-                session,
-                self.service,
-                self.model.clone(),
-                self.system_prompt.clone(),
-                true,
-                self.proxy_tool_calls,
-                self.mcp_catalog.clone(),
-                self.allowed_tools.clone(),
-                self.permission_mode,
-                self.thinking_enabled,
-                self.render_model_output,
-            )?;
+            self.rebuild_runtime(self.runtime.session().clone())?;
             self.persist_session()?;
         }
         Ok(())
-    }
-
-    fn print_cost(&self) {
-        println!(
-            "{}",
-            format_cost_report(
-                &self.model,
-                self.runtime.usage().cumulative_usage(),
-                self.max_cost_usd
-            )
-        );
-    }
-
-    fn enforce_budget_before_turn(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(limit) = self.max_cost_usd else {
-            return Ok(());
-        };
-        let cumulative = usage_cost_total(&self.model, self.runtime.usage().cumulative_usage());
-        if cumulative >= limit {
-            return Err(format!(
-                "cost budget exceeded before starting turn: cumulative={} budget={}",
-                format_usd(cumulative),
-                format_usd(limit)
-            )
-            .into());
-        }
-        Ok(())
-    }
-
-    fn print_budget_notice(&self, usage: TokenUsage) {
-        if let Some(message) = budget_notice_message(&self.model, usage, self.max_cost_usd) {
-            eprintln!("warning: {message}");
-        }
     }
 
     fn clear_session(&mut self, confirm: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -4164,23 +4773,12 @@ impl LiveCli {
         }
 
         self.session = create_managed_session_handle()?;
-        self.runtime = build_runtime(
-            Session::new(),
-            self.service,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            self.proxy_tool_calls,
-            self.mcp_catalog.clone(),
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            self.thinking_enabled,
-            self.render_model_output,
-        )?;
+        self.rebuild_runtime(Session::new())?;
         self.persist_session()?;
         println!(
-            "Session cleared\n  Mode             fresh session\n  Preserved model  {}\n  Permission mode  {}\n  Session          {}",
+            "Session cleared\n  Mode             fresh session\n  Preserved model  {}\n  Session mode     {}\n  Permission mode  {}\n  Session          {}",
             self.model,
+            self.collaboration_mode.as_str(),
             self.permission_mode.as_str(),
             self.session.id,
         );
@@ -4277,29 +4875,21 @@ impl LiveCli {
             &self.model,
             self.allowed_tools.as_ref(),
             self.permission_mode,
-            self.thinking_enabled,
+            self.collaboration_mode,
+            self.reasoning_effort,
+            self.fast_mode,
             self.proxy_tool_calls,
         );
         self.model = state.model;
         self.service = state.service;
         self.allowed_tools = state.allowed_tools;
         self.permission_mode = state.permission_mode;
-        self.thinking_enabled = state.thinking_enabled;
+        self.collaboration_mode = state.collaboration_mode;
+        self.reasoning_effort = state.reasoning_effort;
+        self.fast_mode = state.fast_mode;
         self.proxy_tool_calls = state.proxy_tool_calls;
         self.mcp_catalog = load_mcp_catalog(&env::current_dir()?)?;
-        self.runtime = build_runtime(
-            session,
-            self.service,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            self.proxy_tool_calls,
-            self.mcp_catalog.clone(),
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            self.thinking_enabled,
-            self.render_model_output,
-        )?;
+        self.rebuild_runtime(session)?;
         self.session = handle;
         Ok(())
     }
@@ -4311,7 +4901,9 @@ impl LiveCli {
             &self.model,
             self.allowed_tools.as_ref(),
             self.permission_mode,
-            self.thinking_enabled,
+            self.collaboration_mode,
+            self.reasoning_effort,
+            self.fast_mode,
             self.proxy_tool_calls,
         ));
         session.save_to_path(&self.session.path)?;
@@ -4423,12 +5015,17 @@ impl PermissionPrompter for CliPermissionPrompter {
     }
 }
 
-fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let mut prompt = load_system_prompt(
+fn build_system_prompt(
+    service: ApiService,
+    model: &str,
+    collaboration_mode: CollaborationMode,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut prompt = load_system_prompt_with_model_family(
         env::current_dir()?,
         DEFAULT_DATE,
         env::consts::OS,
         "unknown",
+        prompt_model_family(service, model),
     )?;
     prompt.push(
         [
@@ -4440,7 +5037,42 @@ fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
         ]
         .join("\n"),
     );
+    prompt.push(mode_instructions(collaboration_mode));
     Ok(prompt)
+}
+
+fn mode_instructions(collaboration_mode: CollaborationMode) -> String {
+    match collaboration_mode {
+        CollaborationMode::Build => [
+            "# Collaboration Mode: Build",
+            "",
+            "You are in Build mode. Execute the user's request directly and make the requested changes when appropriate.",
+            "Prefer taking action over only proposing plans, and make reasonable assumptions when the repo can answer them.",
+        ]
+        .join("\n"),
+        CollaborationMode::Plan => [
+            "# Collaboration Mode: Plan",
+            "",
+            "You are in Plan mode until the system prompt changes again.",
+            "Plan mode is not changed by user intent or imperative phrasing; if the user asks you to execute, plan that execution instead of doing it.",
+            "",
+            "Rules:",
+            " - You may explore the repo, inspect files, and run non-mutating commands that improve the plan.",
+            " - You must not edit files, apply patches, run mutating formatters/codegen, or otherwise perform implementation work.",
+            " - Ask focused questions only when the answer cannot be discovered from the environment and materially changes the plan.",
+            " - Final answers in this mode should be implementation-ready plans, not code changes.",
+        ]
+        .join("\n"),
+    }
+}
+
+fn prompt_model_family(service: ApiService, model: &str) -> String {
+    match service {
+        ApiService::NanoGpt => "NanoGPT Messages API".to_string(),
+        ApiService::Synthetic => format!("Synthetic ({model})"),
+        ApiService::OpenAiCodex => format!("OpenAI Codex ({model})"),
+        ApiService::OpencodeGo => format!("OpenCode Go ({model})"),
+    }
 }
 
 fn build_runtime_feature_config(
@@ -4484,7 +5116,9 @@ fn build_runtime(
     mcp_catalog: McpCatalog,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    thinking_enabled: bool,
+    collaboration_mode: CollaborationMode,
+    reasoning_effort: Option<ReasoningEffort>,
+    fast_mode: FastMode,
     render_model_output: bool,
 ) -> Result<ConversationRuntime<PebbleRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>> {
     let tool_registry = current_tool_registry()
@@ -4514,7 +5148,9 @@ fn build_runtime(
             enable_tools,
             proxy_tool_calls,
             tool_specs.clone(),
-            thinking_enabled,
+            collaboration_mode,
+            reasoning_effort,
+            fast_mode,
             render_model_output,
         )?,
         CliToolExecutor::new(
@@ -4533,14 +5169,16 @@ fn build_runtime(
 
 struct PebbleRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: NanoGptClient,
     service: ApiService,
     model: String,
+    provider: Option<String>,
     max_output_tokens: u32,
     enable_tools: bool,
     proxy_tool_calls: bool,
     tool_specs: Vec<RuntimeToolSpec>,
-    thinking_enabled: bool,
+    collaboration_mode: CollaborationMode,
+    reasoning_effort: Option<ReasoningEffort>,
+    fast_mode: FastMode,
     render_output: bool,
 }
 
@@ -4552,25 +5190,24 @@ impl PebbleRuntimeClient {
         enable_tools: bool,
         proxy_tool_calls: bool,
         tool_specs: Vec<RuntimeToolSpec>,
-        thinking_enabled: bool,
+        collaboration_mode: CollaborationMode,
+        reasoning_effort: Option<ReasoningEffort>,
+        fast_mode: FastMode,
         render_output: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut client = NanoGptClient::new(resolve_api_key_for(service)?)
-            .with_service(service)
-            .with_base_url(resolve_base_url_for(service));
-        if service == ApiService::NanoGpt {
-            client = client.with_provider(provider.clone());
-        }
+        let max_output_tokens = max_output_tokens_for_model_or(&model, DEFAULT_MAX_TOKENS);
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client,
             service,
-            max_output_tokens: max_output_tokens_for_model_or(&model, DEFAULT_MAX_TOKENS),
             model,
+            provider,
+            max_output_tokens,
             enable_tools,
             proxy_tool_calls,
             tool_specs,
-            thinking_enabled,
+            collaboration_mode,
+            reasoning_effort,
+            fast_mode,
             render_output,
         })
     }
@@ -4582,6 +5219,8 @@ impl ApiClient for PebbleRuntimeClient {
             return self.stream_via_proxy(request);
         }
 
+        let effective_reasoning_effort =
+            effective_reasoning_effort(self.collaboration_mode, self.reasoning_effort);
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: self.max_output_tokens,
@@ -4598,15 +5237,17 @@ impl ApiClient for PebbleRuntimeClient {
                     .collect()
             }),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
-            thinking: self
-                .thinking_enabled
-                .then_some(ThinkingConfig::enabled(DEFAULT_THINKING_BUDGET_TOKENS)),
+            thinking: (self.service != ApiService::OpenAiCodex
+                && effective_reasoning_effort.is_some())
+            .then_some(ThinkingConfig::enabled(DEFAULT_THINKING_BUDGET_TOKENS)),
+            reasoning_effort: effective_reasoning_effort,
+            fast_mode: self.fast_mode.enabled(),
             stream: true,
         };
 
+        let client = self.service_client()?;
         self.runtime.block_on(async {
-            let mut stream = self
-                .client
+            let mut stream = client
                 .stream_message(&message_request)
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -4629,7 +5270,7 @@ impl ApiClient for PebbleRuntimeClient {
             // response — right before the first text delta — so the model's
             // reply is visually anchored even after a wall of tool output.
             let mut assistant_lead_emitted = false;
-            let thinking_enabled = self.thinking_enabled;
+            let thinking_enabled = effective_reasoning_effort.is_some();
             let render_output_enabled = self.render_output;
 
             loop {
@@ -4784,8 +5425,7 @@ impl ApiClient for PebbleRuntimeClient {
                 return Ok(events);
             }
 
-            let response = self
-                .client
+            let response = client
                 .send_message(&MessageRequest {
                     stream: false,
                     ..message_request.clone()
@@ -4798,10 +5438,21 @@ impl ApiClient for PebbleRuntimeClient {
 }
 
 impl PebbleRuntimeClient {
+    fn service_client(&self) -> Result<NanoGptClient, RuntimeError> {
+        let mut client = NanoGptClient::from_service_env(self.service)
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if self.service == ApiService::NanoGpt {
+            client = client.with_provider(self.provider.clone());
+        }
+        Ok(client)
+    }
+
     fn stream_via_proxy(
         &mut self,
         request: ApiRequest,
     ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        let effective_reasoning_effort =
+            effective_reasoning_effort(self.collaboration_mode, self.reasoning_effort);
         let mut messages = convert_proxy_messages_to_input_messages(
             convert_messages_for_proxy(&request.messages).map_err(RuntimeError::new)?,
         );
@@ -4812,15 +5463,17 @@ impl PebbleRuntimeClient {
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: None,
             tool_choice: None,
-            thinking: self
-                .thinking_enabled
-                .then_some(ThinkingConfig::enabled(DEFAULT_THINKING_BUDGET_TOKENS)),
+            thinking: (self.service != ApiService::OpenAiCodex
+                && effective_reasoning_effort.is_some())
+            .then_some(ThinkingConfig::enabled(DEFAULT_THINKING_BUDGET_TOKENS)),
+            reasoning_effort: effective_reasoning_effort,
+            fast_mode: self.fast_mode.enabled(),
             stream: false,
         };
 
+        let client = self.service_client()?;
         self.runtime.block_on(async {
-            let response = self
-                .client
+            let response = client
                 .send_message(&base_message_request)
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -4834,8 +5487,7 @@ impl PebbleRuntimeClient {
                     messages,
                     ..base_message_request
                 };
-                let retry_response = self
-                    .client
+                let retry_response = client
                     .send_message(&retry_request)
                     .await
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -5892,57 +6544,75 @@ fn convert_proxy_messages_to_input_messages(messages: Vec<ProxyMessage>) -> Vec<
         .collect()
 }
 
-fn format_thinking_report(enabled: bool) -> String {
-    let state = if enabled { "on" } else { "off" };
-    let budget = if enabled {
-        DEFAULT_THINKING_BUDGET_TOKENS.to_string()
-    } else {
-        "disabled".to_string()
-    };
+fn effective_reasoning_effort(
+    collaboration_mode: CollaborationMode,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> Option<ReasoningEffort> {
+    reasoning_effort.or(match collaboration_mode {
+        CollaborationMode::Build => None,
+        CollaborationMode::Plan => Some(ReasoningEffort::Medium),
+    })
+}
+
+fn reasoning_effort_label(reasoning_effort: Option<ReasoningEffort>) -> &'static str {
+    match reasoning_effort {
+        Some(ReasoningEffort::Minimal) => "minimal",
+        Some(ReasoningEffort::Low) => "low",
+        Some(ReasoningEffort::Medium) => "medium",
+        Some(ReasoningEffort::High) => "high",
+        Some(ReasoningEffort::XHigh) => "xhigh",
+        None => "default",
+    }
+}
+
+fn format_mode_report(collaboration_mode: CollaborationMode) -> String {
     format!(
-        "Thinking\n  Active mode      {state}\n  Budget tokens    {budget}\n\nUsage\n  Inspect current mode with /thinking\n  Toggle with /thinking on or /thinking off"
+        "Mode\n  Active mode      {}\n  Toggle           press Tab on an empty prompt or use /mode build|plan",
+        collaboration_mode.as_str()
     )
 }
 
-fn format_thinking_switch_report(enabled: bool) -> String {
-    let state = if enabled { "enabled" } else { "disabled" };
+fn format_mode_switch_report(collaboration_mode: CollaborationMode) -> String {
     format!(
-        "Thinking updated\n  Result           {state}\n  Budget tokens    {}\n  Applies to       subsequent requests",
-        if enabled {
-            DEFAULT_THINKING_BUDGET_TOKENS.to_string()
-        } else {
-            "disabled".to_string()
-        }
+        "Mode updated\n  Result           {}\n  Applies to       subsequent requests",
+        collaboration_mode.as_str()
     )
 }
 
-fn format_cost_report(model: &str, usage: TokenUsage, max_cost_usd: Option<f64>) -> String {
-    let estimate = usage_cost_estimate(model, usage);
+fn format_reasoning_report(
+    configured: Option<ReasoningEffort>,
+    effective: Option<ReasoningEffort>,
+) -> String {
     format!(
-        "Cost\n  Model            {model}\n  Input tokens     {}\n  Output tokens    {}\n  Cache create     {}\n  Cache read       {}\n  Total tokens     {}\n  Input cost       {}\n  Output cost      {}\n  Cache create usd {}\n  Cache read usd   {}\n  Estimated cost   {}\n  Budget           {}",
-        usage.input_tokens,
-        usage.output_tokens,
-        usage.cache_creation_input_tokens,
-        usage.cache_read_input_tokens,
-        usage.total_tokens(),
-        format_usd(estimate.input_cost_usd),
-        format_usd(estimate.output_cost_usd),
-        format_usd(estimate.cache_creation_cost_usd),
-        format_usd(estimate.cache_read_cost_usd),
-        format_usd(estimate.total_cost_usd()),
-        format_budget_line(estimate.total_cost_usd(), max_cost_usd),
+        "Reasoning\n  Configured       {}\n  Effective        {}\n\nUsage\n  Inspect with     /reasoning\n  Set with         /reasoning default|minimal|low|medium|high|xhigh",
+        reasoning_effort_label(configured),
+        reasoning_effort_label(effective),
     )
 }
 
-fn usage_cost_estimate(model: &str, usage: TokenUsage) -> runtime::UsageCostEstimate {
-    pricing_for_model(model).map_or_else(
-        || usage.estimate_cost_usd(),
-        |pricing| usage.estimate_cost_usd_with_pricing(pricing),
+fn format_reasoning_switch_report(
+    configured: Option<ReasoningEffort>,
+    effective: Option<ReasoningEffort>,
+) -> String {
+    format!(
+        "Reasoning updated\n  Configured       {}\n  Effective        {}\n  Applies to       subsequent requests",
+        reasoning_effort_label(configured),
+        reasoning_effort_label(effective),
     )
 }
 
-fn usage_cost_total(model: &str, usage: TokenUsage) -> f64 {
-    usage_cost_estimate(model, usage).total_cost_usd()
+fn format_fast_mode_report(fast_mode: FastMode) -> String {
+    format!(
+        "Fast Mode\n  Active mode      {}\n\nUsage\n  Inspect with     /fast\n  Toggle with      /fast on or /fast off",
+        fast_mode.as_str()
+    )
+}
+
+fn format_fast_mode_switch_report(fast_mode: FastMode) -> String {
+    format!(
+        "Fast mode updated\n  Result           {}\n  Applies to       subsequent requests",
+        fast_mode.as_str()
+    )
 }
 
 /// Derive a compact model label for the prompt status strip. Model IDs can
@@ -5988,37 +6658,6 @@ fn collect_tool_results(summary: &runtime::TurnSummary) -> Vec<JsonValue> {
             _ => None,
         })
         .collect()
-}
-
-fn format_budget_line(cost_usd: f64, max_cost_usd: Option<f64>) -> String {
-    match max_cost_usd {
-        Some(limit) => format!("{} / {}", format_usd(cost_usd), format_usd(limit)),
-        None => format!("{} (unlimited)", format_usd(cost_usd)),
-    }
-}
-
-fn budget_notice_message(
-    model: &str,
-    usage: TokenUsage,
-    max_cost_usd: Option<f64>,
-) -> Option<String> {
-    let limit = max_cost_usd?;
-    let cost = usage_cost_total(model, usage);
-    if cost >= limit {
-        Some(format!(
-            "cost budget exceeded: cumulative={} budget={}",
-            format_usd(cost),
-            format_usd(limit)
-        ))
-    } else if cost >= limit * COST_WARNING_FRACTION {
-        Some(format!(
-            "approaching cost budget: cumulative={} budget={}",
-            format_usd(cost),
-            format_usd(limit)
-        ))
-    } else {
-        None
-    }
 }
 
 fn run_resume_command(
@@ -6083,7 +6722,9 @@ fn run_resume_command(
                 DEFAULT_MODEL,
                 None,
                 default_permission_mode(),
-                false,
+                CollaborationMode::Build,
+                None,
+                FastMode::Off,
                 false,
             );
             Ok(ResumeCommandOutcome {
@@ -6101,25 +6742,11 @@ fn run_resume_command(
                     state.permission_mode.as_str(),
                     provider_label_for_service_model(state.service, &state.model).as_deref(),
                     state.proxy_tool_calls,
-                    state.thinking_enabled,
-                    None,
+                    state.collaboration_mode,
+                    effective_reasoning_effort(state.collaboration_mode, state.reasoning_effort),
+                    state.fast_mode,
                     &McpCatalog::default(),
                     &status_context(Some(session_path))?,
-                )),
-            })
-        }
-        SlashCommand::Cost => {
-            let model = session
-                .metadata
-                .as_ref()
-                .map(|metadata| metadata.model.as_str())
-                .unwrap_or(DEFAULT_MODEL);
-            Ok(ResumeCommandOutcome {
-                session: session.clone(),
-                message: Some(format_cost_report(
-                    model,
-                    UsageTracker::from_session(session).cumulative_usage(),
-                    None,
                 )),
             })
         }
@@ -6137,7 +6764,9 @@ fn run_resume_command(
                 DEFAULT_MODEL,
                 None,
                 default_permission_mode(),
-                false,
+                CollaborationMode::Build,
+                None,
+                FastMode::Off,
                 false,
             );
             let (report, warning) =
@@ -6175,9 +6804,12 @@ fn run_resume_command(
         }
         SlashCommand::Resume { .. }
         | SlashCommand::Model { .. }
+        | SlashCommand::Logout { .. }
         | SlashCommand::Mcp { .. }
         | SlashCommand::Permissions { .. }
-        | SlashCommand::Thinking { .. }
+        | SlashCommand::Reasoning { .. }
+        | SlashCommand::Fast { .. }
+        | SlashCommand::Mode { .. }
         | SlashCommand::Session { .. }
         | SlashCommand::Sessions
         | SlashCommand::Branch { .. }
@@ -6194,15 +6826,16 @@ fn print_help() {
     println!();
     println!("Usage");
     println!(
-        "  pebble [--model MODEL] [--permission-mode MODE] [--max-cost USD] [--thinking] [--allowedTools TOOL[,TOOL...]]"
+        "  pebble [--model MODEL] [--permission-mode MODE] [--mode MODE] [--reasoning LEVEL] [--fast] [--allowedTools TOOL[,TOOL...]]"
     );
     println!("                                               Start interactive REPL");
     println!(
-        "  pebble login [SERVICE] [--api-key KEY]    Save credentials for NanoGPT, Synthetic, OpenCode Go, or Exa"
+        "  pebble login [SERVICE] [--api-key KEY]    Save credentials for NanoGPT, Synthetic, OpenAI Codex, OpenCode Go, or Exa"
     );
     println!(
-        "                                               Services: nanogpt, synthetic, opencode-go, exa"
+        "                                               Services: nanogpt, synthetic, openai-codex, opencode-go, exa"
     );
+    println!("  pebble logout [SERVICE]                   Remove saved credentials for a service");
     println!("  pebble model [MODEL_ID]                   Choose or persist a default model");
     println!("  pebble provider [PROVIDER_ID|default]     Choose a provider for the active model");
     println!("  pebble proxy [on|off|status]              Toggle XML tool-call proxy mode");
@@ -6222,13 +6855,13 @@ fn print_help() {
     println!("  pebble --resume [SESSION_ID_OR_PATH] [/status] [/compact] [...]");
     println!("                                               Resume a saved session and optionally run slash commands");
     println!(
-        "  pebble prompt [--model MODEL] [--permission-mode MODE] [--max-cost USD] [--thinking] [--output-format text|json] TEXT"
+        "  pebble prompt [--model MODEL] [--permission-mode MODE] [--mode MODE] [--reasoning LEVEL] [--fast] [--output-format text|json] TEXT"
     );
     println!(
         "                                               Send one prompt and stream the response"
     );
     println!(
-        "  pebble [--model MODEL] [--permission-mode MODE] [--max-cost USD] [--thinking] [--output-format text|json] TEXT"
+        "  pebble [--model MODEL] [--permission-mode MODE] [--mode MODE] [--reasoning LEVEL] [--fast] [--output-format text|json] TEXT"
     );
     println!(
         "                                               Shorthand non-interactive prompt mode"
@@ -6240,11 +6873,15 @@ fn print_help() {
     println!(
         "  --permission-mode MODE                     read-only, workspace-write, or danger-full-access"
     );
+    println!("  --mode MODE                               build or plan");
     println!(
-        "  --max-cost USD                             Warn at 80% of budget and stop at/exceeding the budget"
+        "  --reasoning LEVEL                         default, minimal, low, medium, high, or xhigh"
     );
     println!(
-        "  --thinking                                 Enable extended thinking with the default budget"
+        "  --fast                                     Enable ChatGPT fast mode for OpenAI Codex"
+    );
+    println!(
+        "  --thinking                                 Compatibility alias for --reasoning medium"
     );
     println!(
         "  --output-format FORMAT                     Non-interactive output format: text or json"
@@ -6305,11 +6942,11 @@ fn generate_pebble_md(
         tools: None,
         tool_choice: None,
         thinking: None,
+        reasoning_effort: None,
+        fast_mode: false,
         stream: false,
     };
-    let mut client = NanoGptClient::new(resolve_api_key_for(service)?)
-        .with_service(service)
-        .with_base_url(resolve_base_url_for(service));
+    let mut client = NanoGptClient::from_service_env(service)?;
     if service == ApiService::NanoGpt {
         client = client.with_provider(provider_for_model(model));
     }
@@ -7085,6 +7722,8 @@ fn check_api_key_validity() -> DiagnosticCheck {
         tools: None,
         tool_choice: None,
         thinking: None,
+        reasoning_effort: None,
+        fast_mode: false,
         stream: false,
     };
 
@@ -7449,16 +8088,18 @@ mod tests {
     use super::{
         append_proxy_text_events, available_runtime_tool_specs, build_system_prompt,
         extract_first_json_object, filter_runtime_tool_specs, format_status_report,
-        format_web_tools_status, normalize_generated_pebble_md, parse_args, parse_auth_command,
-        parse_checksum_for_asset, parse_mcp_command, parse_model_command,
-        parse_permissions_command, parse_provider_command, parse_proxy_command,
-        parse_tool_input_value, prompt_to_content_blocks, proxy_response_to_events,
-        push_output_block, render_streamed_tool_call_start, render_tool_result_block,
-        render_update_report, resolve_model_alias, response_to_events,
-        should_retry_proxy_tool_prompt, strip_markdown_code_fence, tuned_tool_description,
-        AssistantEvent, AuthService, CliAction, CliOutputFormat, GitHubRelease, GitHubReleaseAsset,
-        LoginCommand, McpCatalog, McpCommand, RuntimeToolSpec, StatusContext, StatusUsage,
-        DEFAULT_MODEL,
+        format_web_tools_status, login_model_guidance, normalize_generated_pebble_md, parse_args,
+        parse_auth_command, parse_checksum_for_asset, parse_logout_command, parse_mcp_command,
+        parse_model_command, parse_permissions_command, parse_provider_command,
+        parse_proxy_command, parse_tool_input_value, prompt_to_content_blocks,
+        proxy_response_to_events, push_output_block, remove_saved_credentials,
+        render_streamed_tool_call_start, render_tool_result_block, render_update_report,
+        resolve_model_alias, response_to_events, should_ignore_stale_secret_submit,
+        should_retry_proxy_tool_prompt, strip_markdown_code_fence, trim_trailing_line_endings,
+        tuned_tool_description, AssistantEvent, AuthService, CliAction, CliOutputFormat,
+        CollaborationMode, CredentialRemovalOutcome, FastMode, GitHubRelease, GitHubReleaseAsset,
+        LoginCommand, LogoutCommand, McpCatalog, McpCommand, PebbleRuntimeClient, RuntimeToolSpec,
+        StatusContext, StatusUsage, DEFAULT_MODEL,
     };
     use crate::proxy::ProxyCommand;
     use api::{ApiService, InputContentBlock, MessageResponse, OutputContentBlock, Usage};
@@ -7466,7 +8107,7 @@ mod tests {
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tools::current_tool_registry;
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -7509,10 +8150,76 @@ mod tests {
                     model: DEFAULT_MODEL.to_string(),
                     allowed_tools: None,
                     permission_mode: PermissionMode::WorkspaceWrite,
-                    max_cost_usd: None,
-                    thinking: false,
+                    collaboration_mode: CollaborationMode::Build,
+                    reasoning_effort: None,
+                    fast_mode: FastMode::Off,
                 }
             );
+        });
+    }
+
+    #[test]
+    fn stale_empty_secret_submit_is_ignored_briefly() {
+        assert!(should_ignore_stale_secret_submit(
+            "",
+            Duration::from_millis(25)
+        ));
+        assert!(!should_ignore_stale_secret_submit(
+            "sk-live",
+            Duration::from_millis(25)
+        ));
+        assert!(!should_ignore_stale_secret_submit(
+            "",
+            Duration::from_millis(300)
+        ));
+    }
+
+    #[test]
+    fn trims_trailing_line_endings_from_pasted_secret() {
+        assert_eq!(trim_trailing_line_endings("abc123\r\n"), "abc123");
+        assert_eq!(trim_trailing_line_endings("abc123\n"), "abc123");
+        assert_eq!(trim_trailing_line_endings("abc123"), "abc123");
+    }
+
+    #[test]
+    fn runtime_client_constructor_defers_api_key_lookup() {
+        with_isolated_config_home(|| {
+            let original = std::env::var("NANOGPT_API_KEY").ok();
+            std::env::remove_var("NANOGPT_API_KEY");
+
+            let client = PebbleRuntimeClient::new(
+                ApiService::NanoGpt,
+                DEFAULT_MODEL.to_string(),
+                None,
+                true,
+                false,
+                Vec::new(),
+                CollaborationMode::Build,
+                None,
+                FastMode::Off,
+                false,
+            );
+
+            match original {
+                Some(value) => std::env::set_var("NANOGPT_API_KEY", value),
+                None => std::env::remove_var("NANOGPT_API_KEY"),
+            }
+
+            assert!(
+                client.is_ok(),
+                "runtime client should initialize without credentials"
+            );
+        });
+    }
+
+    #[test]
+    fn synthetic_login_guidance_explains_active_model_mismatch() {
+        with_isolated_config_home(|| {
+            let note = login_model_guidance(AuthService::Synthetic)
+                .expect("synthetic login should show model guidance by default");
+            assert!(note.contains("current model is `zai-org/glm-5.1`"));
+            assert!(note.contains("Logging into Synthetic saves credentials"));
+            assert!(note.contains("prefixed with `hf:`"));
         });
     }
 
@@ -7529,9 +8236,10 @@ mod tests {
 
     #[test]
     fn system_prompt_includes_web_research_guidance() {
-        let prompt = build_system_prompt()
-            .expect("system prompt should build")
-            .join("\n\n");
+        let prompt =
+            build_system_prompt(ApiService::NanoGpt, DEFAULT_MODEL, CollaborationMode::Build)
+                .expect("system prompt should build")
+                .join("\n\n");
         assert!(prompt.contains("# Web Research Guidance"));
         assert!(prompt.contains("WebSearch"));
         assert!(prompt.contains("WebScrape"));
@@ -7570,8 +8278,9 @@ mod tests {
             "workspace-write",
             Some("<platform default>"),
             false,
-            false,
+            CollaborationMode::Build,
             None,
+            FastMode::Off,
             &McpCatalog::default(),
             &StatusContext {
                 cwd: PathBuf::from("."),
@@ -7604,8 +8313,9 @@ mod tests {
                     model: DEFAULT_MODEL.to_string(),
                     allowed_tools: None,
                     permission_mode: PermissionMode::WorkspaceWrite,
-                    max_cost_usd: None,
-                    thinking: false,
+                    collaboration_mode: CollaborationMode::Build,
+                    reasoning_effort: None,
+                    fast_mode: FastMode::Off,
                     output_format: CliOutputFormat::Text,
                 }
             );
@@ -7628,8 +8338,9 @@ mod tests {
                     model: DEFAULT_MODEL.to_string(),
                     allowed_tools: None,
                     permission_mode: PermissionMode::WorkspaceWrite,
-                    max_cost_usd: None,
-                    thinking: false,
+                    collaboration_mode: CollaborationMode::Build,
+                    reasoning_effort: None,
+                    fast_mode: FastMode::Off,
                     output_format: CliOutputFormat::Json,
                 }
             );
@@ -7651,8 +8362,9 @@ mod tests {
                     model: DEFAULT_MODEL.to_string(),
                     allowed_tools: None,
                     permission_mode: PermissionMode::WorkspaceWrite,
-                    max_cost_usd: None,
-                    thinking: false,
+                    collaboration_mode: CollaborationMode::Build,
+                    reasoning_effort: None,
+                    fast_mode: FastMode::Off,
                     output_format: CliOutputFormat::Text,
                 }
             );
@@ -7675,8 +8387,9 @@ mod tests {
                     model: DEFAULT_MODEL.to_string(),
                     allowed_tools: None,
                     permission_mode: PermissionMode::WorkspaceWrite,
-                    max_cost_usd: None,
-                    thinking: false,
+                    collaboration_mode: CollaborationMode::Build,
+                    reasoning_effort: None,
+                    fast_mode: FastMode::Off,
                     output_format: CliOutputFormat::Text,
                 }
             );
@@ -7702,8 +8415,9 @@ mod tests {
                             .collect()
                     ),
                     permission_mode: PermissionMode::WorkspaceWrite,
-                    max_cost_usd: None,
-                    thinking: false,
+                    collaboration_mode: CollaborationMode::Build,
+                    reasoning_effort: None,
+                    fast_mode: FastMode::Off,
                 }
             );
         });
@@ -7719,8 +8433,9 @@ mod tests {
                     model: DEFAULT_MODEL.to_string(),
                     allowed_tools: None,
                     permission_mode: PermissionMode::ReadOnly,
-                    max_cost_usd: None,
-                    thinking: false,
+                    collaboration_mode: CollaborationMode::Build,
+                    reasoning_effort: None,
+                    fast_mode: FastMode::Off,
                 }
             );
         });
@@ -7744,6 +8459,19 @@ mod tests {
                 CliAction::Login {
                     service: None,
                     api_key: Some("nano-key".to_string()),
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn parses_logout_subcommand() {
+        with_isolated_config_home(|| {
+            let args = vec!["logout".to_string(), "openai-codex".to_string()];
+            assert_eq!(
+                parse_args(&args).expect("args should parse"),
+                CliAction::Logout {
+                    service: Some(AuthService::OpenAiCodex),
                 }
             );
         });
@@ -7994,6 +8722,13 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_auth_command("/login openai-codex"),
+            Some(LoginCommand {
+                service: Some(AuthService::OpenAiCodex),
+                api_key: None,
+            })
+        );
+        assert_eq!(
             parse_auth_command("/login opencode-go"),
             Some(LoginCommand {
                 service: Some(AuthService::OpencodeGo),
@@ -8008,6 +8743,64 @@ mod tests {
             })
         );
         assert_eq!(parse_auth_command("/status"), None);
+    }
+
+    #[test]
+    fn parses_logout_slash_command() {
+        assert_eq!(
+            parse_logout_command("/logout"),
+            Some(LogoutCommand { service: None })
+        );
+        assert_eq!(
+            parse_logout_command("/logout openai-codex"),
+            Some(LogoutCommand {
+                service: Some(AuthService::OpenAiCodex),
+            })
+        );
+        assert_eq!(parse_logout_command("/status"), None);
+    }
+
+    #[test]
+    fn removes_saved_credentials_for_selected_service() {
+        with_isolated_config_home(|| {
+            let config_home =
+                std::env::var("PEBBLE_CONFIG_HOME").expect("isolated config home should be set");
+            let credentials_path = PathBuf::from(config_home).join("credentials.json");
+            std::fs::write(
+                &credentials_path,
+                serde_json::json!({
+                    "openai_codex_auth": {
+                        "access_token": "token",
+                        "refresh_token": "refresh"
+                    },
+                    "nanogpt_api_key": "nano-key"
+                })
+                .to_string(),
+            )
+            .expect("credentials should be written");
+
+            let outcome = remove_saved_credentials(AuthService::OpenAiCodex)
+                .expect("logout should remove saved credentials");
+            assert_eq!(
+                outcome,
+                CredentialRemovalOutcome::Removed {
+                    path: credentials_path.clone(),
+                }
+            );
+
+            let parsed: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&credentials_path)
+                    .expect("credentials should remain readable"),
+            )
+            .expect("credentials should remain valid json");
+            assert!(parsed.get("openai_codex_auth").is_none());
+            assert_eq!(
+                parsed
+                    .get("nanogpt_api_key")
+                    .and_then(serde_json::Value::as_str),
+                Some("nano-key")
+            );
+        });
     }
 
     #[test]

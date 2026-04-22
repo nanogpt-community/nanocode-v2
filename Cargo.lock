@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "api"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "platform",
  "reqwest",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "commands"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "platform",
  "runtime",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "compat-harness"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "commands",
  "runtime",
@@ -799,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "pebble"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "api",
  "commands",
@@ -839,7 +839,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "platform"
-version = "0.2.3"
+version = "0.3.0"
 
 [[package]]
 name = "plist"
@@ -856,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1126,7 +1126,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "getrandom 0.3.4",
  "glob",
@@ -1566,7 +1566,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "api",
  "platform",

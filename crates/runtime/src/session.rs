@@ -51,6 +51,9 @@ pub struct SessionMetadata {
     pub last_prompt: Option<String>,
     pub permission_mode: Option<String>,
     pub thinking_enabled: Option<bool>,
+    pub collaboration_mode: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub fast_mode: Option<bool>,
     pub proxy_tool_calls: Option<bool>,
     pub allowed_tools: Option<Vec<String>>,
 }
@@ -201,6 +204,21 @@ impl SessionMetadata {
                 JsonValue::Bool(thinking_enabled),
             );
         }
+        if let Some(collaboration_mode) = &self.collaboration_mode {
+            object.insert(
+                "collaboration_mode".to_string(),
+                JsonValue::String(collaboration_mode.clone()),
+            );
+        }
+        if let Some(reasoning_effort) = &self.reasoning_effort {
+            object.insert(
+                "reasoning_effort".to_string(),
+                JsonValue::String(reasoning_effort.clone()),
+            );
+        }
+        if let Some(fast_mode) = self.fast_mode {
+            object.insert("fast_mode".to_string(), JsonValue::Bool(fast_mode));
+        }
         if let Some(proxy_tool_calls) = self.proxy_tool_calls {
             object.insert(
                 "proxy_tool_calls".to_string(),
@@ -233,6 +251,9 @@ impl SessionMetadata {
             last_prompt: optional_string(object, "last_prompt"),
             permission_mode: optional_string(object, "permission_mode"),
             thinking_enabled: optional_bool(object, "thinking_enabled"),
+            collaboration_mode: optional_string(object, "collaboration_mode"),
+            reasoning_effort: optional_string(object, "reasoning_effort"),
+            fast_mode: optional_bool(object, "fast_mode"),
             proxy_tool_calls: optional_bool(object, "proxy_tool_calls"),
             allowed_tools: optional_string_array(object, "allowed_tools")?,
         })
@@ -540,6 +561,9 @@ mod tests {
             last_prompt: Some("hello".to_string()),
             permission_mode: Some("workspace-write".to_string()),
             thinking_enabled: Some(true),
+            collaboration_mode: Some("plan".to_string()),
+            reasoning_effort: Some("medium".to_string()),
+            fast_mode: Some(true),
             proxy_tool_calls: Some(false),
             allowed_tools: Some(vec!["read_file".to_string(), "glob_search".to_string()]),
         });

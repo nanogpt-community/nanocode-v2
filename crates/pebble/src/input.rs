@@ -1,7 +1,12 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::io::{self, IsTerminal, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
+use crossterm::cursor::MoveToColumn;
+use crossterm::execute;
+use crossterm::terminal::{size, Clear, ClearType};
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{CmdKind, Highlighter};
@@ -18,6 +23,7 @@ pub enum ReadOutcome {
     Submit(String),
     Cancel,
     Exit,
+    ToggleMode,
 }
 
 struct SlashCommandHelper {
@@ -116,6 +122,27 @@ impl ConditionalEventHandler for PasteSafeSubmitHandler {
     }
 }
 
+struct EmptyLineTabHandler {
+    toggled: Arc<AtomicBool>,
+}
+
+impl ConditionalEventHandler for EmptyLineTabHandler {
+    fn handle(
+        &self,
+        _evt: &Event,
+        _n: rustyline::RepeatCount,
+        _positive: bool,
+        ctx: &EventContext,
+    ) -> Option<Cmd> {
+        if ctx.line().is_empty() {
+            self.toggled.store(true, Ordering::SeqCst);
+            Some(Cmd::Interrupt)
+        } else {
+            None
+        }
+    }
+}
+
 fn paste_safe_mode_enabled() -> bool {
     env_flag_enabled("PEBBLE_PASTE_SAFE")
 }
@@ -126,13 +153,19 @@ pub struct LineEditor {
     completions: Vec<String>,
     vim_enabled: bool,
     editor: Editor<SlashCommandHelper, DefaultHistory>,
+    pending_mode_toggle: Arc<AtomicBool>,
 }
 
 impl LineEditor {
     #[must_use]
     pub fn new(prompt: impl Into<String>, completions: Vec<String>) -> Self {
         let vim_enabled = env_flag_enabled("PEBBLE_VIM");
-        let editor = Self::build_editor(completions.clone(), vim_enabled);
+        let pending_mode_toggle = Arc::new(AtomicBool::new(false));
+        let editor = Self::build_editor(
+            completions.clone(),
+            vim_enabled,
+            pending_mode_toggle.clone(),
+        );
 
         Self {
             prompt: prompt.into(),
@@ -140,6 +173,7 @@ impl LineEditor {
             completions,
             vim_enabled,
             editor,
+            pending_mode_toggle,
         }
     }
 
@@ -177,8 +211,10 @@ impl LineEditor {
 
     fn print_status_line(&self) -> io::Result<()> {
         if let Some(status) = self.status_line.as_ref() {
+            let rendered = fit_status_line(status, terminal_status_width());
             let mut stdout = io::stdout();
-            writeln!(stdout, "{status}")?;
+            execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+            writeln!(stdout, "{rendered}")?;
             stdout.flush()?;
         }
         Ok(())
@@ -189,6 +225,7 @@ impl LineEditor {
             if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
                 return self.read_line_fallback();
             }
+            self.pending_mode_toggle.store(false, Ordering::SeqCst);
 
             if let Some(helper) = self.editor.helper_mut() {
                 helper.reset_current_line();
@@ -204,6 +241,10 @@ impl LineEditor {
                     return Ok(ReadOutcome::Submit(line));
                 }
                 Err(ReadlineError::Interrupted) => {
+                    if self.pending_mode_toggle.swap(false, Ordering::SeqCst) {
+                        self.finish_interrupted_read()?;
+                        return Ok(ReadOutcome::ToggleMode);
+                    }
                     let has_input = !self.current_line().is_empty();
                     self.finish_interrupted_read()?;
                     return if has_input {
@@ -224,6 +265,7 @@ impl LineEditor {
     fn build_editor(
         completions: Vec<String>,
         vim_enabled: bool,
+        pending_mode_toggle: Arc<AtomicBool>,
     ) -> Editor<SlashCommandHelper, DefaultHistory> {
         let paste_safe_mode = paste_safe_mode_enabled();
         let config = Config::builder()
@@ -248,6 +290,12 @@ impl LineEditor {
         }
         editor.bind_sequence(KeyEvent(KeyCode::Up, Modifiers::NONE), Cmd::PreviousHistory);
         editor.bind_sequence(KeyEvent(KeyCode::Down, Modifiers::NONE), Cmd::NextHistory);
+        editor.bind_sequence(
+            KeyEvent(KeyCode::Tab, Modifiers::NONE),
+            EventHandler::Conditional(Box::new(EmptyLineTabHandler {
+                toggled: pending_mode_toggle,
+            })),
+        );
         editor
     }
 
@@ -301,7 +349,11 @@ impl LineEditor {
             .collect::<Vec<_>>();
 
         self.vim_enabled = !self.vim_enabled;
-        self.editor = Self::build_editor(self.completions.clone(), self.vim_enabled);
+        self.editor = Self::build_editor(
+            self.completions.clone(),
+            self.vim_enabled,
+            self.pending_mode_toggle.clone(),
+        );
         for entry in history {
             let _ = self.editor.add_history_entry(entry);
         }
@@ -345,6 +397,59 @@ fn read_full_fallback_input(reader: &mut impl Read) -> io::Result<Option<String>
     Ok(Some(buffer))
 }
 
+fn terminal_status_width() -> Option<usize> {
+    size()
+        .ok()
+        .map(|(columns, _)| usize::from(columns).saturating_sub(1))
+        .filter(|width| *width > 0)
+}
+
+fn fit_status_line(status: &str, max_width: Option<usize>) -> String {
+    let status = status.trim_end_matches(['\r', '\n']);
+    let Some(max_width) = max_width else {
+        return status.to_string();
+    };
+    if crate::ui::visible_width(status) <= max_width {
+        return status.to_string();
+    }
+    truncate_ansi_visible_width(status, max_width)
+}
+
+fn truncate_ansi_visible_width(input: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let mut output = String::new();
+    let mut visible = 0usize;
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            output.push(ch);
+            output.push(chars.next().expect("peeked ansi introducer"));
+            for next in chars.by_ref() {
+                output.push(next);
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if visible >= max_width {
+            break;
+        }
+
+        output.push(ch);
+        visible += 1;
+    }
+
+    if output.contains('\u{1b}') {
+        output.push_str("\u{1b}[0m");
+    }
+    output
+}
+
 fn slash_command_prefix(line: &str, pos: usize) -> Option<(usize, &str)> {
     if pos != line.len() {
         return None;
@@ -361,14 +466,14 @@ fn slash_command_prefix(line: &str, pos: usize) -> Option<(usize, &str)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        paste_safe_mode_enabled, read_full_fallback_input, slash_command_prefix, LineEditor,
-        SlashCommandHelper,
+        fit_status_line, paste_safe_mode_enabled, read_full_fallback_input, slash_command_prefix,
+        truncate_ansi_visible_width, LineEditor, SlashCommandHelper,
     };
-    use std::io::Cursor;
     use rustyline::completion::Completer;
     use rustyline::highlight::Highlighter;
     use rustyline::history::{DefaultHistory, History};
     use rustyline::Context;
+    use std::io::Cursor;
 
     #[test]
     fn extracts_only_terminal_slash_command_prefixes() {
@@ -497,6 +602,22 @@ mod tests {
         let result = read_full_fallback_input(&mut input).expect("fallback read should succeed");
 
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn truncates_status_line_by_visible_width() {
+        let status = "\u{1b}[31mabcdef\u{1b}[0m";
+        let rendered = truncate_ansi_visible_width(status, 4);
+
+        assert_eq!(crate::ui::visible_width(&rendered), 4);
+        assert!(rendered.ends_with("\u{1b}[0m"));
+    }
+
+    #[test]
+    fn fit_status_line_leaves_short_lines_unchanged() {
+        let status = "\u{1b}[31mshort\u{1b}[0m";
+
+        assert_eq!(fit_status_line(status, Some(10)), status);
     }
 
     #[test]
