@@ -6630,42 +6630,45 @@ fn run_self_update() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let client = build_self_update_client()?;
-    let binary_bytes = download_bytes(&client, &selected.binary.browser_download_url)?;
-    let checksum_manifest = download_text(&client, &selected.checksum.browser_download_url)?;
-    let expected_checksum = parse_checksum_for_asset(&checksum_manifest, &selected.binary.name)
-        .ok_or_else(|| {
-            format!(
-                "checksum manifest did not contain an entry for {}",
-                selected.binary.name
+    #[cfg(not(windows))]
+    {
+        let client = build_self_update_client()?;
+        let binary_bytes = download_bytes(&client, &selected.binary.browser_download_url)?;
+        let checksum_manifest = download_text(&client, &selected.checksum.browser_download_url)?;
+        let expected_checksum = parse_checksum_for_asset(&checksum_manifest, &selected.binary.name)
+            .ok_or_else(|| {
+                format!(
+                    "checksum manifest did not contain an entry for {}",
+                    selected.binary.name
+                )
+            })?;
+        let actual_checksum = sha256_hex(&binary_bytes);
+        if actual_checksum != expected_checksum {
+            return Err(format!(
+                "downloaded asset checksum mismatch for {} (expected {}, got {})",
+                selected.binary.name, expected_checksum, actual_checksum
             )
-        })?;
-    let actual_checksum = sha256_hex(&binary_bytes);
-    if actual_checksum != expected_checksum {
-        return Err(format!(
-            "downloaded asset checksum mismatch for {} (expected {}, got {})",
-            selected.binary.name, expected_checksum, actual_checksum
-        )
-        .into());
+            .into());
+        }
+
+        replace_current_executable(&binary_bytes)?;
+
+        println!(
+            "{}",
+            render_update_report(
+                "Update installed",
+                Some(VERSION),
+                Some(&latest_version),
+                Some(&format!(
+                    "Installed {} from GitHub release assets for {}.",
+                    selected.binary.name,
+                    current_target()
+                )),
+                Some(&release.body),
+            )
+        );
+        Ok(())
     }
-
-    replace_current_executable(&binary_bytes)?;
-
-    println!(
-        "{}",
-        render_update_report(
-            "Update installed",
-            Some(VERSION),
-            Some(&latest_version),
-            Some(&format!(
-                "Installed {} from GitHub release assets for {}.",
-                selected.binary.name,
-                current_target()
-            )),
-            Some(&release.body),
-        )
-    );
-    Ok(())
 }
 
 fn fetch_latest_release() -> Result<Option<GitHubRelease>, Box<dyn std::error::Error>> {
