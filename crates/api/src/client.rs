@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use platform::pebble_config_home;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -580,10 +581,7 @@ fn service_api_key_env(service: ApiService) -> &'static str {
 }
 
 fn credentials_path() -> Option<PathBuf> {
-    let config_home = std::env::var_os("PEBBLE_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pebble")))?;
-    Some(config_home.join("credentials.json"))
+    Some(pebble_config_home()?.join("credentials.json"))
 }
 
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {

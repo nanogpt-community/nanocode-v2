@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 
 use sha2::{Digest, Sha256};
 
@@ -213,7 +212,8 @@ pub fn loopback_redirect_uri(port: u16) -> String {
 
 fn generate_random_token(bytes: usize) -> io::Result<String> {
     let mut buffer = vec![0_u8; bytes];
-    File::open("/dev/urandom")?.read_exact(&mut buffer)?;
+    getrandom::fill(&mut buffer)
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
     Ok(base64url_encode(&buffer))
 }
 

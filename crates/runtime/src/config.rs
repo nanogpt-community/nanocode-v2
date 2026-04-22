@@ -3,6 +3,8 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use platform::pebble_config_home_or_default;
+
 use crate::json::JsonValue;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 
@@ -435,10 +437,7 @@ impl RuntimePluginConfig {
 
 #[must_use]
 pub fn default_config_home() -> PathBuf {
-    std::env::var_os("PEBBLE_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pebble")))
-        .unwrap_or_else(|| PathBuf::from(".pebble"))
+    pebble_config_home_or_default()
 }
 
 impl McpConfigCollection {

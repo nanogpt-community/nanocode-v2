@@ -69,7 +69,7 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
 
     if input.run_in_background.unwrap_or(false) {
-        let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false);
+        let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false)?;
         let child = child
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -104,7 +104,7 @@ async fn execute_bash_async(
     sandbox_status: SandboxStatus,
     cwd: std::path::PathBuf,
 ) -> io::Result<BashCommandOutput> {
-    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
+    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true)?;
 
     let output_result = if let Some(timeout_ms) = input.timeout {
         match timeout(Duration::from_millis(timeout_ms), command.output()).await {
@@ -184,7 +184,7 @@ fn prepare_command(
     cwd: &std::path::Path,
     sandbox_status: &SandboxStatus,
     create_dirs: bool,
-) -> Command {
+) -> io::Result<Command> {
     if create_dirs {
         prepare_sandbox_dirs(cwd);
     }
@@ -194,16 +194,16 @@ fn prepare_command(
         prepared.args(launcher.args);
         prepared.current_dir(cwd);
         prepared.envs(launcher.env);
-        return prepared;
+        return Ok(prepared);
     }
 
-    let mut prepared = Command::new("sh");
+    let mut prepared = Command::new(default_shell_program()?);
     prepared.arg("-lc").arg(command).current_dir(cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
     }
-    prepared
+    Ok(prepared)
 }
 
 fn prepare_tokio_command(
@@ -211,7 +211,7 @@ fn prepare_tokio_command(
     cwd: &std::path::Path,
     sandbox_status: &SandboxStatus,
     create_dirs: bool,
-) -> TokioCommand {
+) -> io::Result<TokioCommand> {
     if create_dirs {
         prepare_sandbox_dirs(cwd);
     }
@@ -221,21 +221,64 @@ fn prepare_tokio_command(
         prepared.args(launcher.args);
         prepared.current_dir(cwd);
         prepared.envs(launcher.env);
-        return prepared;
+        return Ok(prepared);
     }
 
-    let mut prepared = TokioCommand::new("sh");
+    let mut prepared = TokioCommand::new(default_shell_program()?);
     prepared.arg("-lc").arg(command).current_dir(cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
     }
-    prepared
+    Ok(prepared)
 }
 
 fn prepare_sandbox_dirs(cwd: &std::path::Path) {
     let _ = std::fs::create_dir_all(cwd.join(".sandbox-home"));
     let _ = std::fs::create_dir_all(cwd.join(".sandbox-tmp"));
+}
+
+fn default_shell_program() -> io::Result<&'static str> {
+    #[cfg(windows)]
+    {
+        if command_exists("sh") {
+            return Ok("sh");
+        }
+        if command_exists("bash") {
+            return Ok("bash");
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "bash tool requires a POSIX shell on Windows; install Git Bash/MSYS2 or use the PowerShell tool instead",
+        ));
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok("sh")
+    }
+}
+
+#[cfg(windows)]
+fn command_exists(command: &str) -> bool {
+    let Some(paths) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&paths).any(|path| {
+        shell_command_candidates(command)
+            .iter()
+            .any(|candidate| path.join(candidate).exists())
+    })
+}
+
+#[cfg(windows)]
+fn shell_command_candidates(command: &str) -> Vec<String> {
+    let mut candidates = vec![command.to_string()];
+    candidates.push(format!("{command}.exe"));
+    candidates.push(format!("{command}.cmd"));
+    candidates.push(format!("{command}.bat"));
+    candidates.push(format!("{command}.com"));
+    candidates
 }
 
 #[cfg(test)]

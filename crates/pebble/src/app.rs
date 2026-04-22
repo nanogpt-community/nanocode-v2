@@ -18,6 +18,7 @@ use api::{
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::style::{Color, Stylize};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use platform::pebble_config_home as resolve_pebble_config_home;
 use plugins::{PluginError, PluginManager, PluginSummary};
 use reqwest::blocking::Client as BlockingClient;
 use reqwest::header::{HeaderName, HeaderValue};
@@ -1395,13 +1396,8 @@ fn save_credentials(
 }
 
 fn pebble_config_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    if let Some(path) = env::var_os("PEBBLE_CONFIG_HOME") {
-        return Ok(PathBuf::from(path));
-    }
-    match env::var_os("HOME") {
-        Some(home) => Ok(PathBuf::from(home).join(".pebble")),
-        None => Err("could not resolve PEBBLE_CONFIG_HOME or HOME".into()),
-    }
+    resolve_pebble_config_home()
+        .ok_or_else(|| "could not resolve PEBBLE_CONFIG_HOME, HOME, or USERPROFILE".into())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6615,6 +6611,24 @@ fn run_self_update() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     };
+
+    #[cfg(windows)]
+    {
+        println!(
+            "{}",
+            render_update_report(
+                "Manual install required on Windows",
+                Some(VERSION),
+                Some(&latest_version),
+                Some(&format!(
+                    "Download {} from the latest GitHub release and replace pebble.exe manually. In-place self-update is not supported on Windows yet.",
+                    selected.binary.name
+                )),
+                Some(&release.body),
+            )
+        );
+        return Ok(());
+    }
 
     let client = build_self_update_client()?;
     let binary_bytes = download_bytes(&client, &selected.binary.browser_download_url)?;

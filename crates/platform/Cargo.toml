@@ -1,5 +1,5 @@
 [package]
-name = "commands"
+name = "platform"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,7 +7,3 @@ publish.workspace = true
 
 [lints]
 workspace = true
-
-[dependencies]
-platform = { path = "../platform" }
-runtime = { path = "../runtime" }

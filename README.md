@@ -437,6 +437,9 @@ Binary output:
 ./target/release/pebble
 ```
 
+On Windows, the binary output is `target\\release\\pebble.exe`. Pebble resolves config and
+credentials from `PEBBLE_CONFIG_HOME` first, then `%USERPROFILE%\\.pebble` when `HOME` is not set.
+
 ### Run from source
 
 ```bash

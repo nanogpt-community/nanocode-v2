@@ -139,7 +139,7 @@ impl SystemPromptBuilder {
         }
         sections.push(get_simple_system_section());
         sections.push(get_simple_doing_tasks_section());
-        sections.push(get_actions_section());
+        sections.push(get_actions_section(self.os_name.as_deref()));
         sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
         sections.push(self.environment_section());
         if let Some(project_context) = &self.project_context {
@@ -486,12 +486,17 @@ fn get_simple_doing_tasks_section() -> String {
         .join("\n")
 }
 
-fn get_actions_section() -> String {
-    [
+fn get_actions_section(os_name: Option<&str>) -> String {
+    let mut sections = vec![
         "# Executing actions with care".to_string(),
         "Carefully consider reversibility and blast radius. Local, reversible actions like editing files or running tests are usually fine. Actions that affect shared systems, publish state, delete data, or otherwise have high blast radius should be explicitly authorized by the user or durable workspace instructions.".to_string(),
-    ]
-    .join("\n")
+    ];
+    if os_name.is_some_and(|name| name.eq_ignore_ascii_case("windows")) {
+        sections.push(
+            "On Windows, prefer PowerShell for shell execution unless a POSIX shell is explicitly available.".to_string(),
+        );
+    }
+    sections.join("\n")
 }
 
 #[cfg(test)]
@@ -596,6 +601,14 @@ mod tests {
         assert_eq!(contents, vec!["root memory", "nested memory"]);
         assert!(render_memory_files(&context.memory_files).contains("# Project memory"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn windows_prompt_prefers_powershell() {
+        let prompt = SystemPromptBuilder::new()
+            .with_os("windows", "unknown")
+            .render();
+        assert!(prompt.contains("prefer PowerShell"));
     }
 
     #[test]

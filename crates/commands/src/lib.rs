@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
-use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use platform::pebble_config_home;
 use runtime::{compact_session, CompactionConfig, Session};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -676,7 +676,6 @@ pub fn handle_slash_command(
 enum DefinitionSource {
     Project,
     UserConfigHome,
-    UserHome,
 }
 
 impl DefinitionSource {
@@ -684,7 +683,6 @@ impl DefinitionSource {
         match self {
             Self::Project => "Project (.pebble)",
             Self::UserConfigHome => "User (PEBBLE_CONFIG_HOME)",
-            Self::UserHome => "User (~/.pebble)",
         }
     }
 }
@@ -945,19 +943,11 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
         );
     }
 
-    if let Ok(config_home) = env::var("PEBBLE_CONFIG_HOME") {
+    if let Some(config_home) = pebble_config_home() {
         push_unique_root(
             &mut roots,
             DefinitionSource::UserConfigHome,
-            PathBuf::from(config_home).join(leaf),
-        );
-    }
-
-    if let Some(home) = env::var_os("HOME") {
-        push_unique_root(
-            &mut roots,
-            DefinitionSource::UserHome,
-            PathBuf::from(home).join(".pebble").join(leaf),
+            config_home.join(leaf),
         );
     }
 
@@ -982,8 +972,7 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         );
     }
 
-    if let Ok(config_home) = env::var("PEBBLE_CONFIG_HOME") {
-        let config_home = PathBuf::from(config_home);
+    if let Some(config_home) = pebble_config_home() {
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::UserConfigHome,
@@ -994,22 +983,6 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
             &mut roots,
             DefinitionSource::UserConfigHome,
             config_home.join("commands"),
-            SkillOrigin::LegacyCommandsDir,
-        );
-    }
-
-    if let Some(home) = env::var_os("HOME") {
-        let home = PathBuf::from(home).join(".pebble");
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::UserHome,
-            home.join("skills"),
-            SkillOrigin::SkillsDir,
-        );
-        push_unique_skill_root(
-            &mut roots,
-            DefinitionSource::UserHome,
-            home.join("commands"),
             SkillOrigin::LegacyCommandsDir,
         );
     }

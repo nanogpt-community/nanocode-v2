@@ -9,6 +9,7 @@ use api::{
     ApiService, InputContentBlock, InputMessage, MessageRequest, NanoGptClient, OutputContentBlock,
     ToolChoice, ToolDefinition,
 };
+use platform::pebble_config_home;
 use plugins::{PluginManager, PluginManagerConfig, PluginTool};
 use reqwest::blocking::Client;
 use runtime::{
@@ -1470,10 +1471,7 @@ fn resolve_web_tools_config() -> Result<WebToolsConfig, String> {
 }
 
 fn read_exa_api_key_from_credentials_file() -> Option<String> {
-    let config_home = std::env::var_os("PEBBLE_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pebble")))?;
-    let contents = fs::read_to_string(config_home.join("credentials.json")).ok()?;
+    let contents = fs::read_to_string(pebble_config_home()?.join("credentials.json")).ok()?;
     let parsed = serde_json::from_str::<Value>(&contents).ok()?;
     parsed
         .get("exa_api_key")
@@ -3066,11 +3064,8 @@ fn config_file_for_scope(scope: ConfigScope) -> Result<PathBuf, String> {
 }
 
 fn config_home_dir() -> Result<PathBuf, String> {
-    if let Ok(path) = std::env::var("PEBBLE_CONFIG_HOME") {
-        return Ok(PathBuf::from(path));
-    }
-    let home = std::env::var("HOME").map_err(|_| String::from("HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".pebble"))
+    pebble_config_home()
+        .ok_or_else(|| String::from("PEBBLE_CONFIG_HOME, HOME, or USERPROFILE is not set"))
 }
 
 fn read_json_object(path: &Path) -> Result<serde_json::Map<String, Value>, String> {

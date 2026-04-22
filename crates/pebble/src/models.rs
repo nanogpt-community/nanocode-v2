@@ -1,6 +1,5 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -14,6 +13,7 @@ use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size, Clear, ClearType};
+use platform::pebble_config_home as resolve_pebble_config_home;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_SYNTHETIC_MODELS_URL: &str = "https://api.synthetic.new/openai/v1/models";
@@ -1427,13 +1427,8 @@ fn state_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 fn pebble_config_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    if let Some(path) = env::var_os("PEBBLE_CONFIG_HOME") {
-        return Ok(PathBuf::from(path));
-    }
-    match env::var_os("HOME") {
-        Some(home) => Ok(PathBuf::from(home).join(".pebble")),
-        None => Err("could not resolve PEBBLE_CONFIG_HOME or HOME".into()),
-    }
+    resolve_pebble_config_home()
+        .ok_or_else(|| "could not resolve PEBBLE_CONFIG_HOME, HOME, or USERPROFILE".into())
 }
 
 #[cfg(test)]

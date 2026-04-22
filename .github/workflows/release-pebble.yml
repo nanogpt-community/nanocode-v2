@@ -88,6 +88,9 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             label: macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x64
 
     steps:
       - name: Checkout
@@ -116,11 +119,17 @@ jobs:
       - name: Prepare release binary
         shell: bash
         run: |
-          version="${{ needs.metadata.outputs.version }}"
           target="${{ matrix.target }}"
           binary_name="pebble-${target}"
-          cp "target/${target}/release/pebble" "$binary_name"
-          chmod +x "$binary_name"
+          source_path="target/${target}/release/pebble"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            source_path="${source_path}.exe"
+            binary_name="${binary_name}.exe"
+          fi
+          cp "$source_path" "$binary_name"
+          if [[ "${{ runner.os }}" != "Windows" ]]; then
+            chmod +x "$binary_name"
+          fi
 
       - name: Upload release binary
         uses: actions/upload-artifact@v4

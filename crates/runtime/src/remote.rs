@@ -4,6 +4,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use platform::user_home_dir;
+
 pub const DEFAULT_REMOTE_BASE_URL: &str = "https://api.anthropic.com";
 pub const DEFAULT_SESSION_TOKEN_PATH: &str = "/run/ccr/session_token";
 pub const DEFAULT_SYSTEM_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
@@ -235,8 +237,8 @@ pub fn inherited_upstream_proxy_env(
 }
 
 fn default_ca_bundle_path() -> PathBuf {
-    env::var_os("HOME")
-        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+    user_home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
         .join(".ccr")
         .join("ca-bundle.crt")
 }
