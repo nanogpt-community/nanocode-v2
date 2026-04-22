@@ -274,6 +274,7 @@ where
         let mut tool_results = Vec::new();
         let mut iterations = 0;
         let mut max_turn_input_tokens = 0;
+        let mut auto_compaction_removed_message_count = 0;
 
         loop {
             iterations += 1;
@@ -283,11 +284,27 @@ where
                 ));
             }
 
-            let request = ApiRequest {
-                system_prompt: self.system_prompt.clone(),
-                messages: self.session.messages.clone(),
+            let events = loop {
+                if let Some(event) = self.maybe_auto_compact_by_estimate() {
+                    auto_compaction_removed_message_count += event.removed_message_count;
+                }
+
+                let request = ApiRequest {
+                    system_prompt: self.system_prompt.clone(),
+                    messages: self.session.messages.clone(),
+                };
+
+                match self.api_client.stream(request) {
+                    Ok(events) => break events,
+                    Err(error) if context_length_exceeded_error(&error) => {
+                        let Some(event) = self.force_compact_for_context_overflow() else {
+                            return Err(error);
+                        };
+                        auto_compaction_removed_message_count += event.removed_message_count;
+                    }
+                    Err(error) => return Err(error),
+                }
             };
-            let events = self.api_client.stream(request)?;
             let (assistant_message, usage) = build_assistant_message(events)?;
             if let Some(usage) = usage {
                 max_turn_input_tokens = max_turn_input_tokens.max(usage.input_tokens);
@@ -416,7 +433,13 @@ where
             }
         }
 
-        let auto_compaction = self.maybe_auto_compact(max_turn_input_tokens);
+        if let Some(event) = self.maybe_auto_compact(max_turn_input_tokens) {
+            auto_compaction_removed_message_count += event.removed_message_count;
+        }
+        let auto_compaction =
+            (auto_compaction_removed_message_count > 0).then_some(AutoCompactionEvent {
+                removed_message_count: auto_compaction_removed_message_count,
+            });
 
         Ok(TurnSummary {
             assistant_messages,
@@ -475,6 +498,38 @@ where
             removed_message_count: result.removed_message_count,
         })
     }
+
+    fn maybe_auto_compact_by_estimate(&mut self) -> Option<AutoCompactionEvent> {
+        if self.estimated_tokens()
+            < usize::try_from(self.auto_compaction_input_tokens_threshold).unwrap_or(usize::MAX)
+        {
+            return None;
+        }
+        self.apply_compaction(CompactionConfig {
+            max_estimated_tokens: usize::try_from(self.auto_compaction_input_tokens_threshold)
+                .unwrap_or(usize::MAX),
+            ..CompactionConfig::default()
+        })
+    }
+
+    fn force_compact_for_context_overflow(&mut self) -> Option<AutoCompactionEvent> {
+        self.apply_compaction(CompactionConfig {
+            max_estimated_tokens: 0,
+            ..CompactionConfig::default()
+        })
+    }
+
+    fn apply_compaction(&mut self, config: CompactionConfig) -> Option<AutoCompactionEvent> {
+        let result = compact_session(&self.session, config);
+        if result.removed_message_count == 0 {
+            return None;
+        }
+
+        self.session = result.compacted_session;
+        Some(AutoCompactionEvent {
+            removed_message_count: result.removed_message_count,
+        })
+    }
 }
 
 #[must_use]
@@ -492,6 +547,13 @@ fn parse_auto_compaction_threshold(value: Option<&str>) -> u32 {
         .and_then(|raw| raw.trim().parse::<u32>().ok())
         .filter(|threshold| *threshold > 0)
         .unwrap_or(DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD)
+}
+
+fn context_length_exceeded_error(error: &RuntimeError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("context_length_exceeded")
+        || message.contains("context length exceeded")
+        || message.contains("maximum context length")
 }
 
 fn build_assistant_message(
@@ -1170,6 +1232,124 @@ mod tests {
             summary.auto_compaction,
             Some(AutoCompactionEvent {
                 removed_message_count: 2,
+            })
+        );
+        assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+    }
+
+    #[test]
+    fn preflight_compacts_before_sending_oversized_request() {
+        struct AssertCompactedApi;
+        impl ApiClient for AssertCompactedApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                assert_eq!(
+                    request.messages.first().map(|message| message.role),
+                    Some(MessageRole::System)
+                );
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let session = Session {
+            version: 1,
+            messages: vec![
+                crate::session::ConversationMessage::user_text(&"one ".repeat(80)),
+                crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "two ".repeat(80),
+                }]),
+                crate::session::ConversationMessage::user_text(&"three ".repeat(80)),
+                crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "four ".repeat(80),
+                }]),
+            ],
+            metadata: None,
+        };
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            AssertCompactedApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(1);
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+
+        assert_eq!(
+            summary.auto_compaction,
+            Some(AutoCompactionEvent {
+                removed_message_count: 1,
+            })
+        );
+        assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+    }
+
+    #[test]
+    fn retries_after_context_length_exceeded_by_compacting_session() {
+        struct OverflowThenSuccessApi {
+            calls: usize,
+        }
+
+        impl ApiClient for OverflowThenSuccessApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Err(RuntimeError::new(
+                        "api stream returned context_length_exceeded",
+                    )),
+                    2 => {
+                        assert_eq!(
+                            request.messages.first().map(|message| message.role),
+                            Some(MessageRole::System)
+                        );
+                        Ok(vec![
+                            AssistantEvent::TextDelta("done".to_string()),
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => Err(RuntimeError::new("unexpected extra API call")),
+                }
+            }
+        }
+
+        let session = Session {
+            version: 1,
+            messages: vec![
+                crate::session::ConversationMessage::user_text("one"),
+                crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "two".to_string(),
+                }]),
+                crate::session::ConversationMessage::user_text("three"),
+                crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "four".to_string(),
+                }]),
+            ],
+            metadata: None,
+        };
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            OverflowThenSuccessApi { calls: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000);
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed after compaction retry");
+
+        assert_eq!(
+            summary.auto_compaction,
+            Some(AutoCompactionEvent {
+                removed_message_count: 1,
             })
         );
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);

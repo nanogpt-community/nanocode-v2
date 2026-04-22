@@ -2954,7 +2954,7 @@ fn supported_config_setting(setting: &str) -> Option<ConfigSettingSpec> {
             scope: ConfigScope::Global,
             kind: ConfigKind::String,
             path: &["editorMode"],
-            options: Some(&["default", "vim", "emacs"]),
+            options: Some(&["default", "emacs"]),
         },
         "verbose" => ConfigSettingSpec {
             scope: ConfigScope::Global,

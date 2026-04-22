@@ -74,7 +74,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         summary: "Show available slash commands",
         argument_hint: None,
         category: SlashCommandCategory::Core,
-        detail: "Use `/help <topic>` for focused guidance on auth, sessions, extensions, web tools, or vim mode.",
+        detail: "Use `/help <topic>` for focused guidance on auth, sessions, extensions, or web tools.",
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -308,7 +308,7 @@ const HELP_TOPICS: &[HelpTopic] = &[
     HelpTopic {
         name: "help",
         summary: "Understand command help and topic help",
-        detail: "Run `/help` for the full command guide or `/help <topic>` for focused help. Supported topics: help, auth, sessions, extensions, web, vim.",
+        detail: "Run `/help` for the full command guide or `/help <topic>` for focused help. Supported topics: help, auth, sessions, extensions, web.",
     },
     HelpTopic {
         name: "auth",
@@ -329,11 +329,6 @@ const HELP_TOPICS: &[HelpTopic] = &[
         name: "web",
         summary: "Provider-agnostic web search and scrape",
         detail: "Pebble always uses Exa for `WebSearch` and `WebScrape`. Configure `EXA_API_KEY` or store Exa credentials through `/login exa`.",
-    },
-    HelpTopic {
-        name: "vim",
-        summary: "Rustyline vi editing mode",
-        detail: "`/vim` toggles rustyline's vi keybindings for the REPL input editor. It does not change the rest of the terminal UI or command semantics.",
     },
 ];
 

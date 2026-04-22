@@ -39,6 +39,8 @@ pub struct ModelState {
     pub proxy_tool_calls: bool,
     #[serde(default)]
     pub max_output_tokens_by_model: BTreeMap<String, u32>,
+    #[serde(default)]
+    pub context_length_by_model: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,7 +162,7 @@ pub fn max_output_tokens_for_model_or(model: &str, fallback: u32) -> u32 {
     };
 
     let mut state = load_model_state().unwrap_or_default();
-    update_output_token_cache(
+    update_model_metadata_cache(
         &mut state,
         &models
             .iter()
@@ -177,6 +179,31 @@ pub fn max_output_tokens_for_model_or(model: &str, fallback: u32) -> u32 {
     resolved
 }
 
+pub fn context_length_for_model(model: &str) -> Option<u64> {
+    if let Ok(state) = load_model_state() {
+        if let Some(value) = state.context_length_by_model.get(model).copied() {
+            return Some(value.max(1));
+        }
+    }
+
+    let models = fetch_service_models(infer_service_for_model(model)).ok()?;
+    let mut state = load_model_state().unwrap_or_default();
+    update_model_metadata_cache(
+        &mut state,
+        &models
+            .iter()
+            .map(|model| model.info.clone())
+            .collect::<Vec<_>>(),
+    );
+    let resolved = state
+        .context_length_by_model
+        .get(model)
+        .copied()
+        .filter(|value| *value > 0);
+    let _ = save_model_state(&state);
+    resolved
+}
+
 pub fn persist_proxy_tool_calls(enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut state = load_model_state()?;
     state.proxy_tool_calls = enabled;
@@ -186,7 +213,7 @@ pub fn persist_proxy_tool_calls(enabled: bool) -> Result<(), Box<dyn std::error:
 pub fn open_model_picker() -> Result<ModelSelection, Box<dyn std::error::Error>> {
     let mut state = load_model_state()?;
     let models = fetch_all_sorted_models(&state)?;
-    update_output_token_cache(
+    update_model_metadata_cache(
         &mut state,
         &models
             .iter()
@@ -297,19 +324,65 @@ fn fetch_service_models(
     service: ApiService,
 ) -> Result<Vec<CatalogModel>, Box<dyn std::error::Error>> {
     match service {
-        ApiService::NanoGpt => {
-            let client = build_catalog_client();
-            let runtime = tokio::runtime::Runtime::new()?;
-            let response = runtime.block_on(client.fetch_models(true))?;
-            Ok(response
-                .data
-                .into_iter()
-                .map(|info| CatalogModel { service, info })
-                .collect())
-        }
+        ApiService::NanoGpt => fetch_service_models_via_api(service),
         ApiService::Synthetic => fetch_synthetic_models(),
-        ApiService::OpenAiCodex => Ok(openai_codex_models()),
-        ApiService::OpencodeGo => Ok(opencode_go_models()),
+        ApiService::OpenAiCodex => {
+            fetch_service_models_via_api(service).or_else(|_| Ok(openai_codex_models()))
+        }
+        ApiService::OpencodeGo => {
+            fetch_service_models_via_api(service).or_else(|_| Ok(opencode_go_models()))
+        }
+    }
+}
+
+fn fetch_service_models_via_api(
+    service: ApiService,
+) -> Result<Vec<CatalogModel>, Box<dyn std::error::Error>> {
+    let client = match service {
+        ApiService::NanoGpt => build_catalog_client(),
+        ApiService::Synthetic => {
+            return Err("synthetic model catalog uses a dedicated endpoint".into());
+        }
+        ApiService::OpenAiCodex | ApiService::OpencodeGo => {
+            NanoGptClient::from_service_env(service)?.with_base_url(resolve_base_url_for(service))
+        }
+    };
+    let runtime = tokio::runtime::Runtime::new()?;
+    let response = runtime.block_on(client.fetch_models(true))?;
+    let models = response
+        .data
+        .into_iter()
+        .map(|info| CatalogModel {
+            service,
+            info: canonicalize_model_info(service, info),
+        })
+        .collect::<Vec<_>>();
+
+    if models.is_empty() {
+        Err(format!("no models returned for {}", service.display_name()).into())
+    } else {
+        Ok(models)
+    }
+}
+
+fn canonicalize_model_info(service: ApiService, mut info: ModelInfo) -> ModelInfo {
+    info.id = canonical_model_id(service, &info.id);
+    info
+}
+
+fn canonical_model_id(service: ApiService, model_id: &str) -> String {
+    let trimmed = model_id.trim();
+    match service {
+        ApiService::OpenAiCodex if !trimmed.starts_with("openai-codex/") => {
+            format!("openai-codex/{trimmed}")
+        }
+        ApiService::OpencodeGo if !trimmed.starts_with("opencode-go/") => {
+            format!("opencode-go/{trimmed}")
+        }
+        ApiService::NanoGpt
+        | ApiService::Synthetic
+        | ApiService::OpenAiCodex
+        | ApiService::OpencodeGo => trimmed.to_string(),
     }
 }
 
@@ -478,7 +551,7 @@ fn openai_codex_models() -> Vec<CatalogModel> {
     .collect()
 }
 
-fn update_output_token_cache(state: &mut ModelState, models: &[ModelInfo]) {
+fn update_model_metadata_cache(state: &mut ModelState, models: &[ModelInfo]) {
     for model in models {
         if let Some(max_output_tokens) = model
             .max_output_tokens
@@ -488,6 +561,11 @@ fn update_output_token_cache(state: &mut ModelState, models: &[ModelInfo]) {
             state
                 .max_output_tokens_by_model
                 .insert(model.id.clone(), max_output_tokens);
+        }
+        if let Some(context_length) = model.context_length.filter(|value| *value > 0) {
+            state
+                .context_length_by_model
+                .insert(model.id.clone(), context_length);
         }
     }
 }
@@ -1433,7 +1511,7 @@ mod tests {
 
     use super::{
         filtered_model_indices, infer_service_for_model, toggle_favorite,
-        update_output_token_cache, CatalogModel, ModelState,
+        update_model_metadata_cache, CatalogModel, ModelState,
     };
 
     #[test]
@@ -1498,11 +1576,29 @@ mod tests {
         let mut models = vec![model("zai-org/glm-5.1", Some("GLM 5.1"), Some("More"))];
         models[0].max_output_tokens = Some(131_072);
 
-        update_output_token_cache(&mut state, &models);
+        update_model_metadata_cache(&mut state, &models);
 
         assert_eq!(
             state.max_output_tokens_by_model.get("zai-org/glm-5.1"),
             Some(&131_072)
+        );
+    }
+
+    #[test]
+    fn caches_context_length_from_catalog_models() {
+        let mut state = ModelState::default();
+        let mut models = vec![model(
+            "openai-codex/gpt-5.4",
+            Some("GPT-5.4"),
+            Some("Flagship"),
+        )];
+        models[0].context_length = Some(393_216);
+
+        update_model_metadata_cache(&mut state, &models);
+
+        assert_eq!(
+            state.context_length_by_model.get("openai-codex/gpt-5.4"),
+            Some(&393_216)
         );
     }
 

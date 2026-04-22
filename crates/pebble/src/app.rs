@@ -34,10 +34,11 @@ use sha2::{Digest, Sha256};
 use crate::init::{initialize_repo, initialize_repo_with_pebble_md, render_init_pebble_md};
 use crate::input;
 use crate::models::{
-    current_service_or_default, default_model_or, infer_service_for_model, load_model_state,
-    max_output_tokens_for_model_or, open_model_picker, open_provider_picker, persist_current_model,
-    persist_provider_for_model, persist_proxy_tool_calls, provider_for_model,
-    proxy_tool_calls_enabled, validate_provider_for_model,
+    context_length_for_model, current_service_or_default, default_model_or,
+    infer_service_for_model, load_model_state, max_output_tokens_for_model_or, open_model_picker,
+    open_provider_picker, persist_current_model, persist_provider_for_model,
+    persist_proxy_tool_calls, provider_for_model, proxy_tool_calls_enabled,
+    validate_provider_for_model,
 };
 use crate::proxy::{
     build_proxy_system_prompt, convert_messages_for_proxy, parse_proxy_response, parse_proxy_value,
@@ -52,15 +53,15 @@ use commands::{
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use runtime::{
-    load_system_prompt_with_model_family, mcp_tool_name, resolve_sandbox_status,
-    spawn_mcp_stdio_process, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
-    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, JsonRpcId,
-    JsonRpcRequest, JsonRpcResponse, McpClientAuth, McpClientBootstrap, McpClientTransport,
-    McpInitializeClientInfo, McpInitializeParams, McpListToolsParams, McpListToolsResult,
-    McpToolCallParams, McpToolCallResult, McpTransport, MessageRole, PermissionMode,
-    PermissionPolicy, PermissionPromptDecision, PermissionPrompter, PermissionRequest,
-    RuntimeError, ScopedMcpServerConfig, Session, SessionMetadata, TokenUsage, ToolError,
-    ToolExecutor, UsageTracker,
+    auto_compaction_threshold_from_env, load_system_prompt_with_model_family, mcp_tool_name,
+    resolve_sandbox_status, spawn_mcp_stdio_process, ApiClient, ApiRequest, AssistantEvent,
+    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
+    ConversationRuntime, JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpClientAuth,
+    McpClientBootstrap, McpClientTransport, McpInitializeClientInfo, McpInitializeParams,
+    McpListToolsParams, McpListToolsResult, McpToolCallParams, McpToolCallResult, McpTransport,
+    MessageRole, PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
+    PermissionRequest, RuntimeError, ScopedMcpServerConfig, Session, SessionMetadata, TokenUsage,
+    ToolError, ToolExecutor, UsageTracker,
 };
 use tools::{
     build_plugin_manager, current_tool_registry, set_active_backend_service, GlobalToolRegistry,
@@ -85,6 +86,8 @@ const MAX_INIT_CONTEXT_CHARS: usize = 1_200;
 const MAX_INIT_CONTEXT_FILES: usize = 6;
 const MAX_INIT_TOP_LEVEL_ENTRIES: usize = 40;
 const MCP_DISCOVERY_TIMEOUT_SECS: u64 = 30;
+const AUTO_COMPACTION_CONTEXT_UTILIZATION_PERCENT: u64 = 85;
+const AUTO_COMPACTION_CONTEXT_SAFETY_MARGIN_TOKENS: u64 = 8_192;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("PEBBLE_BUILD_TARGET");
 const IMAGE_REF_PREFIX: &str = "@";
@@ -3879,9 +3882,6 @@ fn render_repl_help() -> String {
             ui::PanelRow::Line(
                 "• /provider is only available for NanoGPT-backed models".to_string(),
             ),
-            ui::PanelRow::Line(
-                "• /vim toggles rustyline vi keybindings for the input editor only".to_string(),
-            ),
         ],
     );
     format!("{intro}\n\n{}", render_slash_command_help())
@@ -3894,7 +3894,7 @@ fn repl_completion_candidates(cli: &LiveCli) -> Vec<String> {
         candidates.insert(candidate);
     }
 
-    for topic in ["help", "auth", "sessions", "extensions", "web", "vim"] {
+    for topic in ["help", "auth", "sessions", "extensions", "web"] {
         candidates.insert(format!("/help {topic}"));
     }
 
@@ -5139,11 +5139,17 @@ fn build_runtime(
         permission_mode,
         &available_runtime_tool_specs(&tool_registry, &mcp_catalog),
     );
+    let max_output_tokens = max_output_tokens_for_model_or(&model, DEFAULT_MAX_TOKENS);
+    let auto_compaction_threshold = configured_auto_compaction_threshold().unwrap_or_else(|| {
+        derive_auto_compaction_threshold(&model, max_output_tokens)
+            .unwrap_or_else(auto_compaction_threshold_from_env)
+    });
     Ok(ConversationRuntime::new_with_features(
         session,
         PebbleRuntimeClient::new(
             service,
             model.clone(),
+            max_output_tokens,
             provider_for_model(&model),
             enable_tools,
             proxy_tool_calls,
@@ -5164,7 +5170,29 @@ fn build_runtime(
         permission_policy,
         runtime_prompt,
         build_runtime_feature_config()?,
-    ))
+    )
+    .with_auto_compaction_input_tokens_threshold(auto_compaction_threshold))
+}
+
+fn configured_auto_compaction_threshold() -> Option<u32> {
+    std::env::var("PEBBLE_AUTO_COMPACT_INPUT_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|threshold| *threshold > 0)
+}
+
+fn derive_auto_compaction_threshold(model: &str, max_output_tokens: u32) -> Option<u32> {
+    let context_length = context_length_for_model(model)?;
+    let reserved_output_tokens =
+        u64::from(max_output_tokens).saturating_add(AUTO_COMPACTION_CONTEXT_SAFETY_MARGIN_TOKENS);
+    let available_input_tokens = context_length.saturating_sub(reserved_output_tokens);
+    if available_input_tokens == 0 {
+        return None;
+    }
+
+    let threshold =
+        available_input_tokens.saturating_mul(AUTO_COMPACTION_CONTEXT_UTILIZATION_PERCENT) / 100;
+    u32::try_from(threshold.max(1).min(u64::from(u32::MAX))).ok()
 }
 
 struct PebbleRuntimeClient {
@@ -5186,6 +5214,7 @@ impl PebbleRuntimeClient {
     fn new(
         service: ApiService,
         model: String,
+        max_output_tokens: u32,
         provider: Option<String>,
         enable_tools: bool,
         proxy_tool_calls: bool,
@@ -5195,7 +5224,6 @@ impl PebbleRuntimeClient {
         fast_mode: FastMode,
         render_output: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let max_output_tokens = max_output_tokens_for_model_or(&model, DEFAULT_MAX_TOKENS);
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             service,
@@ -8099,7 +8127,7 @@ mod tests {
         tuned_tool_description, AssistantEvent, AuthService, CliAction, CliOutputFormat,
         CollaborationMode, CredentialRemovalOutcome, FastMode, GitHubRelease, GitHubReleaseAsset,
         LoginCommand, LogoutCommand, McpCatalog, McpCommand, PebbleRuntimeClient, RuntimeToolSpec,
-        StatusContext, StatusUsage, DEFAULT_MODEL,
+        StatusContext, StatusUsage, DEFAULT_MAX_TOKENS, DEFAULT_MODEL,
     };
     use crate::proxy::ProxyCommand;
     use api::{ApiService, InputContentBlock, MessageResponse, OutputContentBlock, Usage};
@@ -8190,6 +8218,7 @@ mod tests {
             let client = PebbleRuntimeClient::new(
                 ApiService::NanoGpt,
                 DEFAULT_MODEL.to_string(),
+                DEFAULT_MAX_TOKENS,
                 None,
                 true,
                 false,

@@ -167,7 +167,6 @@ Notes:
 
 - `/provider` only applies to NanoGPT-backed models.
 - `Shift+Enter` and `Ctrl+J` insert a newline in the input editor.
-- `/vim` only changes rustyline keybindings for the input editor. It does not change the rest of the UI.
 
 ## Authentication and config
 
@@ -209,7 +208,6 @@ Useful environment variables:
 - `OPENCODE_GO_BASE_URL`
 - `EXA_BASE_URL`
 - `PEBBLE_CONFIG_HOME`
-- `PEBBLE_VIM=1`
 
 `EXA_BASE_URL` defaults to `https://api.exa.ai`.
 `OPENAI_CODEX_BASE_URL` defaults to `https://chatgpt.com/backend-api/codex`.
@@ -380,30 +378,6 @@ Pebble can run in XML proxy tool-call mode:
 ```
 
 When proxy mode is enabled, tool use is expected through XML `<tool_call>` blocks rather than native tool schemas.
-
-## Vim mode
-
-Toggle vi bindings in the REPL input editor:
-
-```text
-/vim
-```
-
-Or enable it from the shell before launch:
-
-```bash
-export PEBBLE_VIM=1
-```
-
-What it does:
-
-- switches the input editor between emacs and vi bindings
-- preserves history across toggles
-
-What it does not do:
-
-- change the rest of the terminal UI
-- add modal navigation outside the input editor
 
 ## Troubleshooting
 
