@@ -328,6 +328,9 @@ impl McpServerManager {
         let mut unsupported_servers = Vec::new();
 
         for (server_name, server_config) in servers {
+            if !server_config.is_enabled() {
+                continue;
+            }
             if server_config.transport() == McpTransport::Stdio {
                 let bootstrap = McpClientBootstrap::from_scoped_config(server_name, server_config);
                 managed_servers.insert(server_name.clone(), ManagedMcpServer::new(bootstrap));
@@ -1171,6 +1174,7 @@ mod tests {
     fn sample_bootstrap(script_path: &Path) -> McpClientBootstrap {
         let config = ScopedMcpServerConfig {
             scope: ConfigSource::Local,
+            enabled: true,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
                 command: script_path.to_string_lossy().into_owned(),
                 args: Vec::new(),
@@ -1202,6 +1206,7 @@ mod tests {
     ) -> ScopedMcpServerConfig {
         ScopedMcpServerConfig {
             scope: ConfigSource::Local,
+            enabled: true,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
                 command: "python3".to_string(),
                 args: vec![script_path.to_string_lossy().into_owned()],
@@ -1250,6 +1255,7 @@ mod tests {
     fn rejects_non_stdio_bootstrap() {
         let config = ScopedMcpServerConfig {
             scope: ConfigSource::Local,
+            enabled: true,
             config: McpServerConfig::Sdk(crate::config::McpSdkServerConfig {
                 name: "sdk-server".to_string(),
             }),
@@ -1647,6 +1653,7 @@ mod tests {
                 "http".to_string(),
                 ScopedMcpServerConfig {
                     scope: ConfigSource::Local,
+                    enabled: true,
                     config: McpServerConfig::Http(McpRemoteServerConfig {
                         url: "https://example.test/mcp".to_string(),
                         headers: BTreeMap::new(),
@@ -1659,6 +1666,7 @@ mod tests {
                 "sdk".to_string(),
                 ScopedMcpServerConfig {
                     scope: ConfigSource::Local,
+                    enabled: true,
                     config: McpServerConfig::Sdk(McpSdkServerConfig {
                         name: "sdk-server".to_string(),
                     }),
@@ -1668,6 +1676,7 @@ mod tests {
                 "ws".to_string(),
                 ScopedMcpServerConfig {
                     scope: ConfigSource::Local,
+                    enabled: true,
                     config: McpServerConfig::Ws(McpWebSocketServerConfig {
                         url: "wss://example.test/mcp".to_string(),
                         headers: BTreeMap::new(),

@@ -2,3 +2,10 @@ target/
 .omx/
 .clawd-agents/
 .nanocode
+# Pebble local artifacts
+.pebble/settings.local.json
+.pebble/sessions/
+.pebble/agents/
+.pebble/mcp/
+.pebble/
+.sandbox*

@@ -208,9 +208,9 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
     let mut files = Vec::new();
     for dir in directories {
         for candidate in [
-            dir.join("NANOCODE.md"),
-            dir.join("NANOCODE.local.md"),
-            dir.join(".nanocode").join("NANOCODE.md"),
+            dir.join("PEBBLE.md"),
+            dir.join("PEBBLE.local.md"),
+            dir.join(".pebble").join("PEBBLE.md"),
             dir.join("CLAUDE.md"),
             dir.join("CLAUDE.local.md"),
         ] {
@@ -223,7 +223,7 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
 fn discover_memory_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
     let mut files = Vec::new();
     for dir in discover_context_directories(cwd) {
-        let memory_dir = dir.join(".nanocode").join("memory");
+        let memory_dir = dir.join(".pebble").join("memory");
         let Ok(entries) = fs::read_dir(&memory_dir) else {
             continue;
         };
@@ -278,7 +278,7 @@ fn render_project_context(project_context: &ProjectContext) -> String {
     ];
     if !project_context.instruction_files.is_empty() {
         bullets.push(format!(
-            "NanoCode instruction files discovered: {}.",
+            "Pebble instruction files discovered: {}.",
             project_context.instruction_files.len()
         ));
     }
@@ -298,7 +298,7 @@ fn render_project_context(project_context: &ProjectContext) -> String {
 }
 
 fn render_instruction_files(files: &[ContextFile]) -> String {
-    render_context_file_section("# NanoCode instructions", files)
+    render_context_file_section("# Pebble instructions", files)
 }
 
 fn render_memory_files(files: &[ContextFile]) -> String {
@@ -426,7 +426,7 @@ fn render_config_section(config: &RuntimeConfig) -> String {
     let mut lines = vec!["# Runtime config".to_string()];
     if config.loaded_entries().is_empty() {
         lines.extend(prepend_bullets(vec![
-            "No NanoCode settings files loaded.".to_string()
+            "No Pebble settings files loaded.".to_string()
         ]));
         return lines.join("\n");
     }
@@ -519,16 +519,16 @@ mod tests {
     fn discovers_instruction_files_from_ancestor_chain() {
         let root = temp_dir();
         let nested = root.join("apps").join("api");
-        fs::create_dir_all(nested.join(".nanocode")).expect("nested nanocode dir");
-        fs::write(root.join("NANOCODE.md"), "root instructions").expect("write root instructions");
-        fs::write(root.join("NANOCODE.local.md"), "local instructions")
+        fs::create_dir_all(nested.join(".pebble")).expect("nested pebble dir");
+        fs::write(root.join("PEBBLE.md"), "root instructions").expect("write root instructions");
+        fs::write(root.join("PEBBLE.local.md"), "local instructions")
             .expect("write local instructions");
         fs::create_dir_all(root.join("apps")).expect("apps dir");
-        fs::write(root.join("apps").join("NANOCODE.md"), "apps instructions")
+        fs::write(root.join("apps").join("PEBBLE.md"), "apps instructions")
             .expect("write apps instructions");
         fs::write(root.join("apps").join("CLAUDE.md"), "compat instructions")
             .expect("write compat instructions");
-        fs::write(nested.join(".nanocode").join("NANOCODE.md"), "nested rules")
+        fs::write(nested.join(".pebble").join("PEBBLE.md"), "nested rules")
             .expect("write nested rules");
 
         let context = ProjectContext::discover(&nested, "2026-03-31").expect("context should load");
@@ -556,8 +556,8 @@ mod tests {
         let root = temp_dir();
         let nested = root.join("apps").join("api");
         fs::create_dir_all(&nested).expect("nested dir");
-        fs::write(root.join("NANOCODE.md"), "same rules\n\n").expect("write root");
-        fs::write(nested.join("NANOCODE.md"), "same rules\n").expect("write nested");
+        fs::write(root.join("PEBBLE.md"), "same rules\n\n").expect("write root");
+        fs::write(nested.join("PEBBLE.md"), "same rules\n").expect("write nested");
 
         let context = ProjectContext::discover(&nested, "2026-03-31").expect("context should load");
         assert_eq!(context.instruction_files.len(), 1);
@@ -573,18 +573,15 @@ mod tests {
         let _guard = test_env_lock();
         let root = temp_dir();
         let nested = root.join("apps").join("api");
-        fs::create_dir_all(root.join(".nanocode").join("memory")).expect("root memory dir");
-        fs::create_dir_all(nested.join(".nanocode").join("memory")).expect("nested memory dir");
+        fs::create_dir_all(root.join(".pebble").join("memory")).expect("root memory dir");
+        fs::create_dir_all(nested.join(".pebble").join("memory")).expect("nested memory dir");
         fs::write(
-            root.join(".nanocode").join("memory").join("2026-03-30.md"),
+            root.join(".pebble").join("memory").join("2026-03-30.md"),
             "root memory",
         )
         .expect("write root memory");
         fs::write(
-            nested
-                .join(".nanocode")
-                .join("memory")
-                .join("2026-03-31.md"),
+            nested.join(".pebble").join("memory").join("2026-03-31.md"),
             "nested memory",
         )
         .expect("write nested memory");
@@ -618,8 +615,8 @@ mod tests {
     #[test]
     fn displays_context_paths_compactly() {
         assert_eq!(
-            display_context_path(Path::new("/tmp/project/.nanocode/NANOCODE.md")),
-            "NANOCODE.md"
+            display_context_path(Path::new("/tmp/project/.pebble/PEBBLE.md")),
+            "PEBBLE.md"
         );
     }
 
@@ -632,7 +629,7 @@ mod tests {
             .current_dir(&root)
             .status()
             .expect("git init should run");
-        fs::write(root.join("NANOCODE.md"), "rules").expect("write instructions");
+        fs::write(root.join("PEBBLE.md"), "rules").expect("write instructions");
         fs::write(root.join("tracked.txt"), "hello").expect("write tracked file");
 
         let context =
@@ -640,40 +637,40 @@ mod tests {
 
         let status = context.git_status.expect("git status should be present");
         assert!(status.contains("## No commits yet on") || status.contains("## "));
-        assert!(status.contains("?? NANOCODE.md"));
+        assert!(status.contains("?? PEBBLE.md"));
         assert!(status.contains("?? tracked.txt"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
-    fn load_system_prompt_reads_nanocode_files_and_config() {
+    fn load_system_prompt_reads_pebble_files_and_config() {
         let _guard = test_env_lock();
         let root = temp_dir();
-        fs::create_dir_all(root.join(".nanocode")).expect("nanocode dir");
+        fs::create_dir_all(root.join(".pebble")).expect("pebble dir");
         let home = root.join("home");
-        let nanocode_home = home.join(".nanocode");
-        fs::create_dir_all(&nanocode_home).expect("nanocode home");
-        fs::write(root.join("NANOCODE.md"), "Project rules").expect("write instructions");
+        let pebble_home = home.join(".pebble");
+        fs::create_dir_all(&pebble_home).expect("pebble home");
+        fs::write(root.join("PEBBLE.md"), "Project rules").expect("write instructions");
         fs::write(root.join("CLAUDE.md"), "Compat instructions")
             .expect("write compat instructions");
         fs::write(
-            root.join(".nanocode").join("settings.json"),
+            root.join(".pebble").join("settings.json"),
             r#"{"permissionMode":"acceptEdits"}"#,
         )
         .expect("write settings");
         fs::write(
-            nanocode_home.join("settings.json"),
+            pebble_home.join("settings.json"),
             r#"{"model":"zai-org/glm-5.1"}"#,
         )
         .expect("write home settings");
 
         let previous = std::env::current_dir().expect("cwd");
         let previous_home = std::env::var_os("HOME");
-        let previous_nanocode_home = std::env::var_os("NANOCODE_CONFIG_HOME");
+        let previous_pebble_home = std::env::var_os("PEBBLE_CONFIG_HOME");
         std::env::set_current_dir(&root).expect("change cwd");
         std::env::set_var("HOME", &home);
-        std::env::remove_var("NANOCODE_CONFIG_HOME");
+        std::env::remove_var("PEBBLE_CONFIG_HOME");
         let prompt = super::load_system_prompt(&root, "2026-03-31", "linux", "6.8")
             .expect("system prompt should load")
             .join(
@@ -687,10 +684,10 @@ mod tests {
         } else {
             std::env::remove_var("HOME");
         }
-        if let Some(value) = previous_nanocode_home {
-            std::env::set_var("NANOCODE_CONFIG_HOME", value);
+        if let Some(value) = previous_pebble_home {
+            std::env::set_var("PEBBLE_CONFIG_HOME", value);
         } else {
-            std::env::remove_var("NANOCODE_CONFIG_HOME");
+            std::env::remove_var("PEBBLE_CONFIG_HOME");
         }
 
         assert!(prompt.contains("Project rules"));
@@ -701,12 +698,12 @@ mod tests {
     }
 
     #[test]
-    fn renders_nanocode_style_sections_with_project_context() {
+    fn renders_pebble_style_sections_with_project_context() {
         let root = temp_dir();
-        fs::create_dir_all(root.join(".nanocode")).expect("nanocode dir");
-        fs::write(root.join("NANOCODE.md"), "Project rules").expect("write NANOCODE.md");
+        fs::create_dir_all(root.join(".pebble")).expect("pebble dir");
+        fs::write(root.join("PEBBLE.md"), "Project rules").expect("write PEBBLE.md");
         fs::write(
-            root.join(".nanocode").join("settings.json"),
+            root.join(".pebble").join("settings.json"),
             r#"{"permissionMode":"acceptEdits"}"#,
         )
         .expect("write settings");
@@ -725,7 +722,7 @@ mod tests {
 
         assert!(prompt.contains("# System"));
         assert!(prompt.contains("# Project context"));
-        assert!(prompt.contains("# NanoCode instructions"));
+        assert!(prompt.contains("# Pebble instructions"));
         assert!(prompt.contains("Project rules"));
         assert!(prompt.contains("permissionMode"));
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
@@ -744,10 +741,10 @@ mod tests {
     #[test]
     fn renders_instruction_file_metadata() {
         let rendered = render_instruction_files(&[ContextFile {
-            path: PathBuf::from("/tmp/project/NANOCODE.md"),
+            path: PathBuf::from("/tmp/project/PEBBLE.md"),
             content: "Project rules".to_string(),
         }]);
-        assert!(rendered.contains("# NanoCode instructions"));
+        assert!(rendered.contains("# Pebble instructions"));
         assert!(rendered.contains("scope: /tmp/project"));
         assert!(rendered.contains("Project rules"));
     }

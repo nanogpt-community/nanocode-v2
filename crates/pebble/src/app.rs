@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use api::{
@@ -25,10 +25,10 @@ use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
-use crate::init::initialize_repo;
+use crate::init::{initialize_repo, initialize_repo_with_pebble_md, render_init_pebble_md};
 use crate::input;
 use crate::models::{
-    current_service_or_default, default_model_or, infer_service_for_model,
+    current_service_or_default, default_model_or, infer_service_for_model, load_model_state,
     max_output_tokens_for_model_or, open_model_picker, open_provider_picker, persist_current_model,
     persist_provider_for_model, persist_proxy_tool_calls, provider_for_model,
     proxy_tool_calls_enabled, validate_provider_for_model,
@@ -39,8 +39,9 @@ use crate::proxy::{
 };
 use crate::render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use commands::{
-    handle_agents_slash_command, handle_branch_slash_command, handle_skills_slash_command,
-    handle_worktree_slash_command, render_slash_command_help, slash_command_specs, SlashCommand,
+    command_names_and_aliases, handle_agents_slash_command, handle_branch_slash_command,
+    handle_skills_slash_command, handle_worktree_slash_command, render_help_topics_overview,
+    render_slash_command_help, render_slash_command_help_topic, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use runtime::{
@@ -61,18 +62,22 @@ use tools::{
 const DEFAULT_MODEL: &str = "zai-org/glm-5.1";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 const DEFAULT_THINKING_BUDGET_TOKENS: u32 = 2_048;
+const INIT_PEBBLE_MD_MAX_TOKENS: u32 = 2_048;
 const DEFAULT_DATE: &str = "2026-03-31";
 const MAX_TOOL_PREVIEW_CHARS: usize = 4_000;
 const MAX_TOOL_PREVIEW_LINES: usize = 48;
+const MAX_INIT_CONTEXT_CHARS: usize = 1_200;
+const MAX_INIT_CONTEXT_FILES: usize = 6;
+const MAX_INIT_TOP_LEVEL_ENTRIES: usize = 40;
 const MCP_DISCOVERY_TIMEOUT_SECS: u64 = 30;
 const COST_WARNING_FRACTION: f64 = 0.8;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const BUILD_TARGET: Option<&str> = option_env!("NANOCODE_BUILD_TARGET");
+const BUILD_TARGET: Option<&str> = option_env!("PEBBLE_BUILD_TARGET");
 const IMAGE_REF_PREFIX: &str = "@";
-const SELF_UPDATE_REPOSITORY: &str = "nanogpt-community/nanocode-v2";
+const SELF_UPDATE_REPOSITORY: &str = "nanogpt-community/pebble";
 const SELF_UPDATE_LATEST_RELEASE_URL: &str =
-    "https://api.github.com/repos/nanogpt-community/nanocode-v2/releases/latest";
-const SELF_UPDATE_USER_AGENT: &str = "nanocode-self-update";
+    "https://api.github.com/repos/nanogpt-community/pebble/releases/latest";
+const SELF_UPDATE_USER_AGENT: &str = "pebble-self-update";
 const OLD_SESSION_COMPACTION_AGE_SECS: u64 = 60 * 60 * 24;
 const CHECKSUM_ASSET_CANDIDATES: &[&str] = &[
     "SHA256SUMS",
@@ -231,7 +236,7 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Login {
-        service: ApiService,
+        service: Option<AuthService>,
         api_key: Option<String>,
     },
     Repl {
@@ -264,16 +269,61 @@ impl CliOutputFormat {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthService {
+    NanoGpt,
+    Synthetic,
+    OpencodeGo,
+    Exa,
+}
+
+impl AuthService {
+    const fn display_name(self) -> &'static str {
+        match self {
+            Self::NanoGpt => "NanoGPT",
+            Self::Synthetic => "Synthetic",
+            Self::OpencodeGo => "OpenCode Go",
+            Self::Exa => "Exa",
+        }
+    }
+
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::NanoGpt => "nanogpt",
+            Self::Synthetic => "synthetic",
+            Self::OpencodeGo => "opencode-go",
+            Self::Exa => "exa",
+        }
+    }
+
+    const fn credential_key(self) -> &'static str {
+        match self {
+            Self::NanoGpt => "nanogpt_api_key",
+            Self::Synthetic => "synthetic_api_key",
+            Self::OpencodeGo => "opencode_go_api_key",
+            Self::Exa => "exa_api_key",
+        }
+    }
+
+    const fn all() -> &'static [AuthService] {
+        &[Self::NanoGpt, Self::Synthetic, Self::OpencodeGo, Self::Exa]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum McpCommand {
     Status,
     Tools,
     Reload,
+    Add { name: String },
+    Enable { name: String },
+    Disable { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct McpServerStatus {
     server_name: String,
     scope: ConfigSource,
+    enabled: bool,
     transport: McpTransport,
     loaded: bool,
     tool_count: usize,
@@ -311,6 +361,16 @@ struct ManagedSessionSummary {
     model: Option<String>,
     started_at: Option<String>,
     last_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionRuntimeState {
+    model: String,
+    service: ApiService,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    thinking_enabled: bool,
+    proxy_tool_calls: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
@@ -512,7 +572,7 @@ fn resolve_model_alias(model: &str) -> &str {
 fn parse_direct_slash_cli_action(rest: &[String]) -> Result<CliAction, String> {
     let raw = rest.join(" ");
     match SlashCommand::parse(&raw) {
-        Some(SlashCommand::Help) => Ok(CliAction::Help),
+        Some(SlashCommand::Help { .. }) => Ok(CliAction::Help),
         Some(SlashCommand::Agents { args }) => Ok(CliAction::Agents { args }),
         Some(SlashCommand::Skills { args }) => Ok(CliAction::Skills { args }),
         Some(command) => Err(format!(
@@ -591,7 +651,7 @@ fn parse_login_args(args: &[String]) -> Result<CliAction, String> {
 }
 
 fn parse_login_tokens(tokens: Vec<&str>) -> Result<LoginCommand, String> {
-    let mut service = ApiService::NanoGpt;
+    let mut service = None;
     let mut api_key = None;
     let mut index = 0;
 
@@ -601,11 +661,11 @@ fn parse_login_tokens(tokens: Vec<&str>) -> Result<LoginCommand, String> {
                 let value = tokens
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --service".to_string())?;
-                service = parse_login_service(value)?;
+                service = Some(parse_login_service(value)?);
                 index += 2;
             }
             flag if flag.starts_with("--service=") => {
-                service = parse_login_service(&flag[10..])?;
+                service = Some(parse_login_service(&flag[10..])?);
                 index += 1;
             }
             "--api-key" => {
@@ -622,10 +682,17 @@ fn parse_login_tokens(tokens: Vec<&str>) -> Result<LoginCommand, String> {
             value
                 if matches!(
                     value,
-                    "nanogpt" | "nano-gpt" | "nano" | "synthetic" | "synthetic.new"
+                    "nanogpt"
+                        | "nano-gpt"
+                        | "nano"
+                        | "synthetic"
+                        | "synthetic.new"
+                        | "opencode-go"
+                        | "opencodego"
+                        | "exa"
                 ) && api_key.is_none() =>
             {
-                service = parse_login_service(value)?;
+                service = Some(parse_login_service(value)?);
                 index += 1;
             }
             value if api_key.is_none() => {
@@ -639,12 +706,14 @@ fn parse_login_tokens(tokens: Vec<&str>) -> Result<LoginCommand, String> {
     Ok(LoginCommand { service, api_key })
 }
 
-fn parse_login_service(value: &str) -> Result<ApiService, String> {
+fn parse_login_service(value: &str) -> Result<AuthService, String> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "nanogpt" | "nano-gpt" | "nano" => Ok(ApiService::NanoGpt),
-        "synthetic" | "synthetic.new" => Ok(ApiService::Synthetic),
+        "nanogpt" | "nano-gpt" | "nano" => Ok(AuthService::NanoGpt),
+        "synthetic" | "synthetic.new" => Ok(AuthService::Synthetic),
+        "opencode-go" | "opencodego" => Ok(AuthService::OpencodeGo),
+        "exa" => Ok(AuthService::Exa),
         other => Err(format!(
-            "unsupported login service `{other}`; expected nanogpt or synthetic"
+            "unsupported login service `{other}`; expected nanogpt, synthetic, opencode-go, or exa"
         )),
     }
 }
@@ -659,19 +728,52 @@ fn parse_proxy_args(args: &[String]) -> Result<CliAction, String> {
 }
 
 fn parse_mcp_args(args: &[String]) -> Result<CliAction, String> {
-    if args.len() > 1 {
-        return Err("mcp accepts at most one optional argument".to_string());
-    }
     let action = match args.first().map(String::as_str) {
         None | Some("status") => McpCommand::Status,
         Some("tools") => McpCommand::Tools,
         Some("reload") => McpCommand::Reload,
+        Some("add") => {
+            let name = args
+                .get(1)
+                .ok_or_else(|| "mcp add requires a server name".to_string())?;
+            if args.len() > 2 {
+                return Err("mcp add accepts exactly one server name".to_string());
+            }
+            McpCommand::Add { name: name.clone() }
+        }
+        Some("enable") => {
+            let name = args
+                .get(1)
+                .ok_or_else(|| "mcp enable requires a server name".to_string())?;
+            if args.len() > 2 {
+                return Err("mcp enable accepts exactly one server name".to_string());
+            }
+            McpCommand::Enable { name: name.clone() }
+        }
+        Some("disable") => {
+            let name = args
+                .get(1)
+                .ok_or_else(|| "mcp disable requires a server name".to_string())?;
+            if args.len() > 2 {
+                return Err("mcp disable accepts exactly one server name".to_string());
+            }
+            McpCommand::Disable { name: name.clone() }
+        }
         Some(other) => {
             return Err(format!(
-                "mcp accepts one optional argument: status, tools, or reload (got {other})"
+                "mcp accepts status, tools, reload, add <name>, enable <name>, or disable <name> (got {other})"
             ));
         }
     };
+    if !matches!(
+        action,
+        McpCommand::Add { .. } | McpCommand::Enable { .. } | McpCommand::Disable { .. }
+    ) && args.len() > 1
+    {
+        return Err(
+            "mcp accepts at most one optional argument unless using add <name>, enable <name>, or disable <name>".to_string(),
+        );
+    }
     Ok(CliAction::Mcp { action })
 }
 
@@ -712,7 +814,7 @@ fn dump_manifests() {
 }
 
 fn print_bootstrap_plan() {
-    for phase in runtime::BootstrapPlan::nanocode_default().phases() {
+    for phase in runtime::BootstrapPlan::pebble_default().phases() {
         println!("- {phase:?}");
     }
 }
@@ -820,6 +922,8 @@ fn prompt_for_session_selection(
     for (index, session) in sessions.iter().enumerate() {
         let marker = if active_session_id == Some(session.id.as_str()) {
             "current"
+        } else if index == 0 {
+            "last"
         } else {
             "saved"
         };
@@ -885,8 +989,49 @@ fn fuzzy_session_match(haystack: &str, query: &str) -> bool {
     false
 }
 
-fn login(service: ApiService, api_key: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let api_key = resolve_api_key(service, api_key)?;
+fn prompt_for_auth_service_selection() -> Result<Option<AuthService>, Box<dyn std::error::Error>> {
+    println!("Auth services");
+    for (index, service) in AuthService::all().iter().enumerate() {
+        println!(
+            "  {:>2}. {} ({})",
+            index + 1,
+            service.display_name(),
+            service.slug()
+        );
+    }
+    println!();
+    print!(
+        "Select a service [1-{}] or press Enter to cancel: ",
+        AuthService::all().len()
+    );
+    io::stdout().flush()?;
+    let mut buffer = String::new();
+    io::stdin().read_line(&mut buffer)?;
+    let selection = buffer.trim();
+    if selection.is_empty() {
+        return Ok(None);
+    }
+    let index = selection
+        .parse::<usize>()
+        .map_err(|_| format!("invalid selection: {selection}"))?;
+    let Some(service) = AuthService::all().get(index.saturating_sub(1)) else {
+        return Err(format!("selection out of range: {selection}").into());
+    };
+    Ok(Some(*service))
+}
+
+fn login(
+    service: Option<AuthService>,
+    api_key: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let service = match service {
+        Some(service) => service,
+        None => match prompt_for_auth_service_selection()? {
+            Some(service) => service,
+            None => return Ok(()),
+        },
+    };
+    let api_key = resolve_auth_api_key(service, api_key)?;
     let credentials_path = save_credentials(service, &api_key)?;
     println!(
         "Saved {} credentials to {}",
@@ -945,6 +1090,11 @@ fn handle_provider_action(provider: Option<String>) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+fn provider_label_for_service_model(service: ApiService, model: &str) -> Option<String> {
+    (service == ApiService::NanoGpt)
+        .then(|| provider_for_model(model).unwrap_or_else(|| "<platform default>".to_string()))
+}
+
 fn handle_proxy_action(mode: ProxyCommand) -> Result<(), Box<dyn std::error::Error>> {
     let current = proxy_tool_calls_enabled();
     let next = match mode {
@@ -970,21 +1120,232 @@ fn handle_proxy_action(mode: ProxyCommand) -> Result<(), Box<dyn std::error::Err
 
 fn handle_mcp_action(action: McpCommand) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let catalog = load_mcp_catalog(&cwd)?;
     match action {
         McpCommand::Status | McpCommand::Reload => {
+            let catalog = load_mcp_catalog(&cwd)?;
             if matches!(action, McpCommand::Reload) {
                 println!("Reloaded MCP config from {}", cwd.display());
             }
             print_mcp_status(&catalog);
         }
-        McpCommand::Tools => print_mcp_tools(&catalog),
+        McpCommand::Tools => {
+            let catalog = load_mcp_catalog(&cwd)?;
+            print_mcp_tools(&catalog);
+        }
+        McpCommand::Add { name } => println!("{}", add_mcp_server_interactive(&cwd, &name)?),
+        McpCommand::Enable { name } => println!("{}", set_mcp_server_enabled(&cwd, &name, true)?),
+        McpCommand::Disable { name } => {
+            println!("{}", set_mcp_server_enabled(&cwd, &name, false)?)
+        }
     }
     Ok(())
 }
 
-fn resolve_api_key(
-    service: ApiService,
+fn add_mcp_server_interactive(
+    cwd: &Path,
+    name: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if name.trim().is_empty() {
+        return Err("mcp server name cannot be empty".into());
+    }
+    let normalized_name = name.trim();
+    println!("Add MCP server: {normalized_name}");
+    print!("Transport [stdio/http] (default: stdio): ");
+    io::stdout().flush()?;
+    let mut transport = String::new();
+    io::stdin().read_line(&mut transport)?;
+    let transport = match transport.trim().to_ascii_lowercase().as_str() {
+        "" | "stdio" => "stdio",
+        "http" => "http",
+        other => return Err(format!("unsupported transport: {other}").into()),
+    };
+
+    let server_config = if transport == "stdio" {
+        let command = prompt_text("Command: ")?;
+        if command.trim().is_empty() {
+            return Err("stdio MCP command cannot be empty".into());
+        }
+        let args = prompt_text("Args (space-separated, optional): ")?;
+        let args = args
+            .split_whitespace()
+            .map(|value| JsonValue::String(value.to_string()))
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "type": "stdio",
+            "command": command.trim(),
+            "args": args,
+        })
+    } else {
+        let url = prompt_text("URL: ")?;
+        if url.trim().is_empty() {
+            return Err("http MCP url cannot be empty".into());
+        }
+        serde_json::json!({
+            "type": "http",
+            "url": url.trim(),
+        })
+    };
+
+    let settings_dir = cwd.join(".pebble");
+    fs::create_dir_all(&settings_dir)?;
+    let settings_path = settings_dir.join("settings.json");
+    let mut root = match fs::read_to_string(&settings_path) {
+        Ok(contents) => serde_json::from_str::<serde_json::Value>(&contents)
+            .unwrap_or_else(|_| serde_json::json!({})),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => return Err(Box::new(error)),
+    };
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    let Some(root_object) = root.as_object_mut() else {
+        return Err("settings root must be an object".into());
+    };
+    let mcp_servers = root_object
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+    if !mcp_servers.is_object() {
+        *mcp_servers = serde_json::json!({});
+    }
+    let Some(servers_object) = mcp_servers.as_object_mut() else {
+        return Err("mcpServers must be an object".into());
+    };
+    servers_object.insert(normalized_name.to_string(), server_config);
+    fs::write(&settings_path, serde_json::to_string_pretty(&root)?)?;
+
+    Ok(format!(
+        "MCP\n  result:  added\n  server:  {normalized_name}\n  file:    {}\n  next:    run /mcp reload",
+        settings_path.display()
+    ))
+}
+
+fn set_mcp_server_enabled(
+    cwd: &Path,
+    name: &str,
+    enabled: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let normalized_name = name.trim();
+    if normalized_name.is_empty() {
+        return Err("mcp server name cannot be empty".into());
+    }
+
+    let config = ConfigLoader::default_for(cwd).load()?;
+    let scoped = config
+        .mcp()
+        .get(normalized_name)
+        .ok_or_else(|| format!("unknown MCP server: {normalized_name}"))?;
+
+    let settings_dir = cwd.join(".pebble");
+    fs::create_dir_all(&settings_dir)?;
+    let settings_path = settings_dir.join("settings.local.json");
+    let mut root = match fs::read_to_string(&settings_path) {
+        Ok(contents) => serde_json::from_str::<serde_json::Value>(&contents)
+            .unwrap_or_else(|_| serde_json::json!({})),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(error) => return Err(Box::new(error)),
+    };
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    let Some(root_object) = root.as_object_mut() else {
+        return Err("settings root must be an object".into());
+    };
+    let mcp_servers = root_object
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+    if !mcp_servers.is_object() {
+        *mcp_servers = serde_json::json!({});
+    }
+    let Some(servers_object) = mcp_servers.as_object_mut() else {
+        return Err("mcpServers must be an object".into());
+    };
+    servers_object.insert(
+        normalized_name.to_string(),
+        mcp_server_config_to_json(&scoped.config, enabled),
+    );
+    fs::write(&settings_path, serde_json::to_string_pretty(&root)?)?;
+
+    Ok(format!(
+        "MCP\n  result:  {}\n  server:  {normalized_name}\n  file:    {}\n  next:    run /mcp reload",
+        if enabled { "enabled" } else { "disabled" },
+        settings_path.display()
+    ))
+}
+
+fn mcp_server_config_to_json(
+    config: &runtime::McpServerConfig,
+    enabled: bool,
+) -> serde_json::Value {
+    match config {
+        runtime::McpServerConfig::Stdio(config) => serde_json::json!({
+            "type": "stdio",
+            "command": config.command,
+            "args": config.args,
+            "env": config.env,
+            "stderr": match config.stderr {
+                runtime::McpStdioStderrMode::Inherit => "inherit",
+                runtime::McpStdioStderrMode::Null => "null",
+            },
+            "enabled": enabled,
+        }),
+        runtime::McpServerConfig::Sse(config) => serde_json::json!({
+            "type": "sse",
+            "url": config.url,
+            "headers": config.headers,
+            "headersHelper": config.headers_helper,
+            "oauth": mcp_oauth_to_json(config.oauth.as_ref()),
+            "enabled": enabled,
+        }),
+        runtime::McpServerConfig::Http(config) => serde_json::json!({
+            "type": "http",
+            "url": config.url,
+            "headers": config.headers,
+            "headersHelper": config.headers_helper,
+            "oauth": mcp_oauth_to_json(config.oauth.as_ref()),
+            "enabled": enabled,
+        }),
+        runtime::McpServerConfig::Ws(config) => serde_json::json!({
+            "type": "ws",
+            "url": config.url,
+            "headers": config.headers,
+            "headersHelper": config.headers_helper,
+            "enabled": enabled,
+        }),
+        runtime::McpServerConfig::Sdk(config) => serde_json::json!({
+            "type": "sdk",
+            "name": config.name,
+            "enabled": enabled,
+        }),
+        runtime::McpServerConfig::ClaudeAiProxy(config) => serde_json::json!({
+            "type": "claudeai-proxy",
+            "url": config.url,
+            "id": config.id,
+            "enabled": enabled,
+        }),
+    }
+}
+
+fn mcp_oauth_to_json(oauth: Option<&runtime::McpOAuthConfig>) -> serde_json::Value {
+    oauth.map_or(serde_json::Value::Null, |oauth| {
+        serde_json::json!({
+            "clientId": oauth.client_id,
+            "callbackPort": oauth.callback_port,
+            "authServerMetadataUrl": oauth.auth_server_metadata_url,
+            "xaa": oauth.xaa,
+        })
+    })
+}
+
+fn prompt_text(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut buffer = String::new();
+    io::stdin().read_line(&mut buffer)?;
+    Ok(buffer.trim().to_string())
+}
+
+fn resolve_auth_api_key(
+    service: AuthService,
     api_key: Option<String>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     match api_key {
@@ -1001,10 +1362,10 @@ fn resolve_api_key(
 }
 
 fn save_credentials(
-    service: ApiService,
+    service: AuthService,
     api_key: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let config_home = nanocode_config_home()?;
+    let config_home = pebble_config_home()?;
     fs::create_dir_all(&config_home)?;
     let credentials_path = config_home.join("credentials.json");
     let mut parsed = match fs::read_to_string(&credentials_path) {
@@ -1016,10 +1377,7 @@ fn save_credentials(
     if !parsed.is_object() {
         parsed = serde_json::json!({});
     }
-    let key_name = match service {
-        ApiService::NanoGpt => "nanogpt_api_key",
-        ApiService::Synthetic => "synthetic_api_key",
-    };
+    let key_name = service.credential_key();
     parsed[key_name] = serde_json::Value::String(api_key.to_string());
     fs::write(&credentials_path, serde_json::to_string_pretty(&parsed)?)?;
     #[cfg(unix)]
@@ -1030,19 +1388,19 @@ fn save_credentials(
     Ok(credentials_path)
 }
 
-fn nanocode_config_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    if let Some(path) = env::var_os("NANOCODE_CONFIG_HOME") {
+fn pebble_config_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(path) = env::var_os("PEBBLE_CONFIG_HOME") {
         return Ok(PathBuf::from(path));
     }
     match env::var_os("HOME") {
-        Some(home) => Ok(PathBuf::from(home).join(".nanocode")),
-        None => Err("could not resolve NANOCODE_CONFIG_HOME or HOME".into()),
+        Some(home) => Ok(PathBuf::from(home).join(".pebble")),
+        None => Err("could not resolve PEBBLE_CONFIG_HOME or HOME".into()),
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LoginCommand {
-    service: ApiService,
+    service: Option<AuthService>,
     api_key: Option<String>,
 }
 
@@ -1124,13 +1482,22 @@ fn parse_mcp_command(input: &str) -> Option<Result<McpCommand, String>> {
         return None;
     }
 
-    let remainder = parts.collect::<Vec<_>>().join(" ");
-    Some(match remainder.trim() {
-        "" | "status" => Ok(McpCommand::Status),
-        "tools" => Ok(McpCommand::Tools),
-        "reload" => Ok(McpCommand::Reload),
-        other => Err(format!(
-            "/mcp accepts one optional argument: status, tools, or reload (got {other})"
+    let args = parts.collect::<Vec<_>>();
+    Some(match args.as_slice() {
+        [] | ["status"] => Ok(McpCommand::Status),
+        ["tools"] => Ok(McpCommand::Tools),
+        ["reload"] => Ok(McpCommand::Reload),
+        ["add", name] => Ok(McpCommand::Add {
+            name: (*name).to_string(),
+        }),
+        ["enable", name] => Ok(McpCommand::Enable {
+            name: (*name).to_string(),
+        }),
+        ["disable", name] => Ok(McpCommand::Disable {
+            name: (*name).to_string(),
+        }),
+        [other, ..] => Err(format!(
+            "/mcp accepts status, tools, reload, add <name>, enable <name>, or disable <name> (got {other})"
         )),
     })
 }
@@ -1138,6 +1505,13 @@ fn parse_mcp_command(input: &str) -> Option<Result<McpCommand, String>> {
 fn parse_permissions_command(input: &str) -> Option<Result<Option<PermissionMode>, String>> {
     let mut parts = input.split_whitespace();
     let command = parts.next()?;
+    if command == "/bypass" {
+        let remainder = parts.collect::<Vec<_>>().join(" ");
+        if !remainder.trim().is_empty() {
+            return Some(Err("/bypass does not accept arguments".to_string()));
+        }
+        return Some(Ok(Some(PermissionMode::DangerFullAccess)));
+    }
     if command != "/permissions" {
         return None;
     }
@@ -1192,7 +1566,7 @@ fn parse_max_cost_arg(value: &str) -> Result<f64, String> {
 }
 
 fn default_permission_mode() -> PermissionMode {
-    env::var("NANOCODE_PERMISSION_MODE")
+    env::var("PEBBLE_PERMISSION_MODE")
         .ok()
         .as_deref()
         .and_then(normalize_permission_mode)
@@ -1324,11 +1698,18 @@ fn load_mcp_catalog(cwd: &Path) -> Result<McpCatalog, Box<dyn std::error::Error>
         let mut status = McpServerStatus {
             server_name: server_name.clone(),
             scope: scoped.scope,
+            enabled: scoped.enabled,
             transport: scoped.transport(),
             loaded: false,
             tool_count: 0,
             note: String::new(),
         };
+
+        if !scoped.is_enabled() {
+            status.note = "disabled in config".to_string();
+            catalog.servers.push(status);
+            continue;
+        }
 
         match scoped.transport() {
             McpTransport::Stdio => match load_stdio_mcp_tools(&server_name, &scoped) {
@@ -1355,7 +1736,7 @@ fn load_mcp_catalog(cwd: &Path) -> Result<McpCatalog, Box<dyn std::error::Error>
             },
             other => {
                 status.note = format!(
-                    "{:?} transport is configured but not executable in NanoCode yet",
+                    "{:?} transport is configured but not executable in Pebble yet",
                     other
                 );
             }
@@ -1384,142 +1765,8 @@ fn configured_mcp_servers(
         .map(|(name, scoped)| (name.clone(), scoped.clone()))
         .collect::<Vec<_>>();
 
-    if !config.mcp().servers().contains_key("nanogpt") {
-        if let Some(server) = built_in_nanogpt_mcp_server()? {
-            servers.push(("nanogpt".to_string(), server));
-        }
-    }
-
     servers.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(servers)
-}
-
-fn built_in_nanogpt_mcp_server() -> Result<Option<ScopedMcpServerConfig>, Box<dyn std::error::Error>>
-{
-    let api_key = match resolve_nanogpt_api_key() {
-        Ok(api_key) => api_key,
-        Err(ApiError::MissingApiKey) => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-
-    let (command, args) = ensure_nanogpt_mcp_launcher()?;
-
-    let mut env = std::collections::BTreeMap::from([("NANOGPT_API_KEY".to_string(), api_key)]);
-    env.entry("NANOGPT_LOG_LEVEL".to_string())
-        .or_insert_with(|| "error".to_string());
-    for key in [
-        "NANOGPT_TIMEOUT_MS",
-        "NANOGPT_DEFAULT_MODEL",
-        "NANOGPT_BASE_URL",
-        "NANOGPT_AUTH_MODE",
-        "NANOGPT_MAX_RETRIES",
-    ] {
-        if let Ok(value) = env::var(key) {
-            if !value.is_empty() {
-                env.insert(key.to_string(), value);
-            }
-        }
-    }
-
-    let config = runtime::McpServerConfig::Stdio(runtime::McpStdioServerConfig {
-        command,
-        args,
-        env,
-        stderr: runtime::McpStdioStderrMode::Null,
-    });
-
-    Ok(Some(ScopedMcpServerConfig {
-        scope: ConfigSource::User,
-        config,
-    }))
-}
-
-fn ensure_nanogpt_mcp_launcher() -> Result<(String, Vec<String>), Box<dyn std::error::Error>> {
-    if let Some(path) = find_path_executable("nanogpt-mcp") {
-        return Ok(command_for_binary(&path));
-    }
-
-    let install_root = managed_nanogpt_mcp_root()?;
-    let binary = managed_nanogpt_mcp_binary_path(&install_root);
-    if !binary.exists() {
-        install_managed_nanogpt_mcp(&install_root)?;
-    }
-    if !binary.exists() {
-        return Err(format!(
-            "NanoGPT MCP launcher was not installed at {}",
-            binary.display()
-        )
-        .into());
-    }
-    Ok(command_for_binary(&binary))
-}
-
-fn managed_nanogpt_mcp_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let preferred = nanocode_config_home()?.join("mcp").join("nanogpt");
-    if fs::create_dir_all(&preferred).is_ok() {
-        return Ok(preferred);
-    }
-
-    let fallback = std::env::temp_dir().join("nanocode-mcp").join("nanogpt");
-    fs::create_dir_all(&fallback)?;
-    Ok(fallback)
-}
-
-fn managed_nanogpt_mcp_binary_path(root: &Path) -> PathBuf {
-    let binary_name = if cfg!(windows) {
-        "nanogpt-mcp.cmd"
-    } else {
-        "nanogpt-mcp"
-    };
-    root.join("node_modules").join(".bin").join(binary_name)
-}
-
-fn install_managed_nanogpt_mcp(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let npm_cache =
-        std::env::temp_dir().join(format!("nanocode-npm-cache-install-{}", std::process::id()));
-    fs::create_dir_all(&npm_cache)?;
-
-    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
-    let output = Command::new(npm)
-        .arg("install")
-        .arg("--prefix")
-        .arg(root)
-        .arg("@nanogpt/mcp")
-        .env("npm_config_cache", &npm_cache)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let detail = stderr.trim();
-    if detail.is_empty() {
-        Err(format!("failed to install @nanogpt/mcp into {}", root.display()).into())
-    } else {
-        Err(format!("failed to install @nanogpt/mcp: {detail}").into())
-    }
-}
-
-fn find_path_executable(name: &str) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
-}
-
-fn command_for_binary(binary: &Path) -> (String, Vec<String>) {
-    if cfg!(windows) {
-        (
-            "cmd".to_string(),
-            vec!["/c".to_string(), binary.to_string_lossy().into_owned()],
-        )
-    } else {
-        (binary.to_string_lossy().into_owned(), Vec::new())
-    }
 }
 
 fn load_stdio_mcp_tools(
@@ -1540,7 +1787,7 @@ fn load_stdio_mcp_tools(
                             protocol_version: "2025-03-26".to_string(),
                             capabilities: serde_json::json!({"roots": {}}),
                             client_info: McpInitializeClientInfo {
-                                name: "nanocode".to_string(),
+                                name: "pebble".to_string(),
                                 version: VERSION.to_string(),
                             },
                         },
@@ -1639,7 +1886,7 @@ fn load_http_mcp_tools(
             Some(serde_json::json!({
                 "protocolVersion": "2025-03-26",
                 "capabilities": {"roots": {}},
-                "clientInfo": {"name": "nanocode", "version": VERSION}
+                "clientInfo": {"name": "pebble", "version": VERSION}
             })),
         )
         .await?;
@@ -1706,11 +1953,7 @@ fn call_mcp_tool(
     match binding.config.transport() {
         McpTransport::Stdio => call_stdio_mcp_tool(binding, input),
         McpTransport::Http => call_http_mcp_tool(binding, input),
-        other => Err(format!(
-            "MCP transport {:?} is not executable in NanoCode yet",
-            other
-        )
-        .into()),
+        other => Err(format!("MCP transport {:?} is not executable in Pebble yet", other).into()),
     }
 }
 
@@ -1729,7 +1972,7 @@ fn call_stdio_mcp_tool(
                     protocol_version: "2025-03-26".to_string(),
                     capabilities: serde_json::json!({"roots": {}}),
                     client_info: McpInitializeClientInfo {
-                        name: "nanocode".to_string(),
+                        name: "pebble".to_string(),
                         version: VERSION.to_string(),
                     },
                 },
@@ -1790,7 +2033,7 @@ fn call_http_mcp_tool(
             Some(serde_json::json!({
                 "protocolVersion": "2025-03-26",
                 "capabilities": {"roots": {}},
-                "clientInfo": {"name": "nanocode", "version": VERSION}
+                "clientInfo": {"name": "pebble", "version": VERSION}
             })),
         )
         .await?;
@@ -1831,7 +2074,10 @@ async fn http_jsonrpc_request<TResult: serde::de::DeserializeOwned>(
     params: Option<JsonValue>,
 ) -> Result<JsonRpcResponse<TResult>, Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    let mut request = client.post(url).header("content-type", "application/json");
+    let mut request = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
     for (key, value) in headers {
         request = request.header(
             HeaderName::from_bytes(key.as_bytes())?,
@@ -1852,7 +2098,10 @@ async fn http_jsonrpc_notification(
     params: Option<JsonValue>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    let mut request = client.post(url).header("content-type", "application/json");
+    let mut request = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream");
     for (key, value) in headers {
         request = request.header(
             HeaderName::from_bytes(key.as_bytes())?,
@@ -1896,7 +2145,7 @@ fn print_mcp_status(catalog: &McpCatalog) {
         println!("  {} {}", report_label("servers:"), 0);
         println!("  {} {}", report_label("tools:"), 0);
         println!(
-            "  {} add `mcpServers` to `.nanocode/settings.json` to expose MCP tools",
+            "  {} add `mcpServers` to `.pebble/settings.json` to expose MCP tools",
             report_label("hint:")
         );
         return;
@@ -1917,7 +2166,9 @@ fn print_mcp_status(catalog: &McpCatalog) {
             report_label("tools"),
             server.tool_count,
             report_label("status"),
-            if server.loaded {
+            if !server.enabled {
+                "disabled"
+            } else if server.loaded {
                 "ready"
             } else {
                 "unavailable"
@@ -2055,24 +2306,32 @@ fn format_status_report(
     model: &str,
     usage: StatusUsage,
     permission_mode: &str,
-    provider: &str,
+    provider: Option<&str>,
     proxy_tool_calls: bool,
     thinking_enabled: bool,
     max_cost_usd: Option<f64>,
     mcp_catalog: &McpCatalog,
     context: &StatusContext,
 ) -> String {
+    let provider_line = provider
+        .map(|provider| {
+            format!(
+                "\n    {} {}",
+                report_label("provider"),
+                report_value(provider)
+            )
+        })
+        .unwrap_or_default();
     [
         format!(
-            "{}\n  {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}",
-            report_title("NanoCode Status"),
+            "{}\n  {}\n    {} {}\n    {} {}{}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}",
+            report_title("Pebble Status"),
             report_section("Session"),
             report_label("service"),
             report_value(service.display_name()),
             report_label("model"),
             report_value(model),
-            report_label("provider"),
-            report_value(provider),
+            provider_line,
             report_label("permission_mode"),
             report_value(permission_mode),
             report_label("proxy_tools"),
@@ -2145,9 +2404,8 @@ fn format_status_report(
 }
 
 fn format_web_tools_status() -> String {
-    let service = current_service_or_default();
-    let api_key_configured = resolve_api_key_for(service).is_ok();
-    let base_url = resolve_base_url_for(service);
+    let api_key_configured = resolve_exa_api_key().is_ok();
+    let base_url = resolve_exa_base_url();
     let (web_search_available, web_scrape_available) = current_tool_registry()
         .map(|registry| {
             let mut has_search = false;
@@ -2165,8 +2423,7 @@ fn format_web_tools_status() -> String {
         .unwrap_or((false, false));
 
     format!(
-        "service={}\nbase_url={base_url}\napi_key={}\nweb_search={}\nweb_scrape={}",
-        service.display_name(),
+        "service=Exa\nbase_url={base_url}\napi_key={}\nweb_search={}\nweb_scrape={}",
         if api_key_configured {
             "configured"
         } else {
@@ -2183,6 +2440,29 @@ fn format_web_tools_status() -> String {
             "missing"
         },
     )
+}
+
+fn resolve_exa_base_url() -> String {
+    env::var("EXA_BASE_URL").unwrap_or_else(|_| "https://api.exa.ai".to_string())
+}
+
+fn resolve_exa_api_key() -> Result<String, Box<dyn std::error::Error>> {
+    match env::var("EXA_API_KEY") {
+        Ok(value) if !value.trim().is_empty() => Ok(value),
+        Ok(_) => Err("EXA_API_KEY is empty".into()),
+        Err(env::VarError::NotPresent) => {
+            let path = pebble_config_home()?.join("credentials.json");
+            let contents = fs::read_to_string(path)?;
+            let parsed = serde_json::from_str::<serde_json::Value>(&contents)?;
+            parsed
+                .get("exa_api_key")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| "missing exa_api_key".into())
+        }
+        Err(error) => Err(Box::new(error)),
+    }
 }
 
 fn format_resume_report(session_path: &str, message_count: usize, turns: u32) -> String {
@@ -2235,7 +2515,7 @@ fn format_auto_compaction_notice(removed: usize) -> String {
 
 fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let path = cwd.join(".nanocode").join("sessions");
+    let path = cwd.join(".pebble").join("sessions");
     fs::create_dir_all(&path)?;
     Ok(path)
 }
@@ -2255,6 +2535,15 @@ fn generate_session_id() -> String {
 }
 
 fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn std::error::Error>> {
+    if reference.trim().eq_ignore_ascii_case("last") {
+        let Some(session) = list_managed_sessions()?.into_iter().next() else {
+            return Err("no saved sessions available".into());
+        };
+        return Ok(SessionHandle {
+            id: session.id,
+            path: session.path,
+        });
+    }
     let direct = PathBuf::from(reference);
     let cwd_relative = env::current_dir()?.join(reference);
     let path = if direct.exists() {
@@ -2397,7 +2686,14 @@ fn last_prompt_from_session(session: &Session) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-fn derive_session_metadata(session: &Session, model: &str) -> SessionMetadata {
+fn derive_session_metadata(
+    session: &Session,
+    model: &str,
+    allowed_tools: Option<&AllowedToolSet>,
+    permission_mode: PermissionMode,
+    thinking_enabled: bool,
+    proxy_tool_calls: bool,
+) -> SessionMetadata {
     let started_at = session
         .metadata
         .as_ref()
@@ -2409,6 +2705,48 @@ fn derive_session_metadata(session: &Session, model: &str) -> SessionMetadata {
         model: model.to_string(),
         message_count: session.messages.len().try_into().unwrap_or(u32::MAX),
         last_prompt: last_prompt_from_session(session),
+        permission_mode: Some(permission_mode.as_str().to_string()),
+        thinking_enabled: Some(thinking_enabled),
+        proxy_tool_calls: Some(proxy_tool_calls),
+        allowed_tools: allowed_tools.map(|allowed| allowed.iter().cloned().collect()),
+    }
+}
+
+fn session_runtime_state(
+    session: &Session,
+    fallback_model: &str,
+    fallback_allowed_tools: Option<&AllowedToolSet>,
+    fallback_permission_mode: PermissionMode,
+    fallback_thinking_enabled: bool,
+    fallback_proxy_tool_calls: bool,
+) -> SessionRuntimeState {
+    let metadata = session.metadata.as_ref();
+    let model = metadata
+        .map(|metadata| metadata.model.clone())
+        .unwrap_or_else(|| fallback_model.to_string());
+    let service = infer_service_for_model(&model);
+    let allowed_tools = metadata
+        .and_then(|metadata| metadata.allowed_tools.as_ref())
+        .map(|tools| tools.iter().cloned().collect::<AllowedToolSet>())
+        .or_else(|| fallback_allowed_tools.cloned());
+    let permission_mode = metadata
+        .and_then(|metadata| metadata.permission_mode.as_deref())
+        .and_then(|value| parse_permission_mode_arg(value).ok())
+        .unwrap_or(fallback_permission_mode);
+    let thinking_enabled = metadata
+        .and_then(|metadata| metadata.thinking_enabled)
+        .unwrap_or(fallback_thinking_enabled);
+    let proxy_tool_calls = metadata
+        .and_then(|metadata| metadata.proxy_tool_calls)
+        .unwrap_or(fallback_proxy_tool_calls);
+
+    SessionRuntimeState {
+        model,
+        service,
+        allowed_tools,
+        permission_mode,
+        thinking_enabled,
+        proxy_tool_calls,
     }
 }
 
@@ -2438,7 +2776,22 @@ fn auto_compact_inactive_sessions(
             || DEFAULT_MODEL.to_string(),
             |metadata| metadata.model.clone(),
         );
-        compacted.metadata = Some(derive_session_metadata(&compacted, &model));
+        let state = session_runtime_state(
+            &compacted,
+            &model,
+            None,
+            default_permission_mode(),
+            false,
+            false,
+        );
+        compacted.metadata = Some(derive_session_metadata(
+            &compacted,
+            &model,
+            state.allowed_tools.as_ref(),
+            state.permission_mode,
+            state.thinking_enabled,
+            state.proxy_tool_calls,
+        ));
         compacted.save_to_path(&path)?;
     }
     Ok(())
@@ -2596,6 +2949,16 @@ fn handle_plugins_command(
     let mut manager = current_plugin_manager()?;
     match action {
         None | Some("list") => Ok(render_plugins_report(&manager.list_installed_plugins()?)),
+        Some("help") => Ok([
+            "Plugins".to_string(),
+            "  Usage            /plugins [list|help|install <path>|enable <id>|disable <id>|uninstall <id>|update <id>]".to_string(),
+            "  Install          Point at a local plugin root that contains `.codex-plugin/plugin.json`.".to_string(),
+            "  Example          /plugins install ./plugins/my-plugin".to_string(),
+            "  Enable           /plugins enable <id>".to_string(),
+            "  Disable          /plugins disable <id>".to_string(),
+            "  Layout           Local plugins typically store skills, optional MCP manifests, and plugin metadata under the plugin root.".to_string(),
+        ]
+        .join("\n")),
         Some("install") => {
             let Some(target) = target else {
                 return Ok("Plugins\n  error: missing install target\n  usage: /plugins install <path>".to_string());
@@ -2721,7 +3084,7 @@ fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
 
     lines.push("Memory files".to_string());
     if project_context.memory_files.is_empty() {
-        lines.push("  No `.nanocode/memory` files discovered.".to_string());
+        lines.push("  No `.pebble/memory` files discovered.".to_string());
     } else {
         for (index, file) in project_context.memory_files.iter().enumerate() {
             let preview = file.content.lines().next().unwrap_or("").trim();
@@ -2891,48 +3254,141 @@ fn resolve_export_path(
 }
 
 fn render_repl_help() -> String {
-    let mut lines = vec![
-        "NanoCode REPL".to_string(),
-        "  Core".to_string(),
-        "    /help                Show command help".to_string(),
-        "    /status              Show session, workspace, and usage state".to_string(),
-        "    /model [model]       Show or switch the active model".to_string(),
-        "    /provider [provider] Set provider override for current model".to_string(),
-        "    /thinking [on|off]   Toggle extended thinking".to_string(),
-        "    /cost                Show cumulative token and cost usage".to_string(),
-        "    /permissions [mode]  Switch permission mode".to_string(),
-        "    /proxy [on|off|status] Toggle XML proxy tool calling".to_string(),
-        "    /mcp [status|tools|reload] Inspect MCP state".to_string(),
+    [
+        "Pebble REPL".to_string(),
+        "  /login and /auth open a service picker when no service is provided.".to_string(),
+        "  Supported auth services: nanogpt, synthetic, opencode-go, exa.".to_string(),
+        "  /provider is only available for NanoGPT-backed models.".to_string(),
+        "  /vim toggles rustyline vi keybindings for the input editor only.".to_string(),
         String::new(),
-        "  Session".to_string(),
-        "    /compact             Compact the current conversation".to_string(),
-        "    /clear [--confirm]   Start a fresh session".to_string(),
-        "    /resume [session]    Load a saved session or open the picker".to_string(),
-        "    /session ...         Manage saved sessions".to_string(),
-        "    /sessions            List recent sessions".to_string(),
-        "    /export [file]       Export the current transcript".to_string(),
-        String::new(),
-        "  Workspace".to_string(),
-        "    /diff                Show git diff".to_string(),
-        "    /branch ...          List, create, or switch branches".to_string(),
-        "    /worktree ...        Manage git worktrees".to_string(),
-        "    /agents              List configured NanoCode agents".to_string(),
-        "    /skills              List available NanoCode skills".to_string(),
-        "    /plugins ...         Manage NanoCode plugins".to_string(),
-        "    /memory              Inspect loaded memory files".to_string(),
-        "    /config [section]    Inspect merged config".to_string(),
-        "    /init                Create starter project files".to_string(),
-        String::new(),
-        "  REPL".to_string(),
-        "    /login [service]     Save a NanoGPT or Synthetic API key".to_string(),
-        "    /auth [service]      Alias for /login".to_string(),
-        "    /vim                 Toggle vi keybindings for this REPL".to_string(),
-        "    /exit                Quit".to_string(),
-        "    /quit                Quit".to_string(),
-    ];
-    lines.push(String::new());
-    lines.push(render_slash_command_help());
-    lines.join("\n")
+        render_slash_command_help(),
+    ]
+    .join("\n")
+}
+
+fn repl_completion_candidates(cli: &LiveCli) -> Vec<String> {
+    let mut candidates = BTreeSet::new();
+
+    for candidate in command_names_and_aliases() {
+        candidates.insert(candidate);
+    }
+
+    for topic in ["help", "auth", "sessions", "extensions", "web", "vim"] {
+        candidates.insert(format!("/help {topic}"));
+    }
+
+    for service in ["nanogpt", "synthetic", "opencode-go", "exa"] {
+        candidates.insert(format!("/login {service}"));
+        candidates.insert(format!("/auth {service}"));
+    }
+
+    for mode in ["read-only", "workspace-write", "danger-full-access"] {
+        candidates.insert(format!("/permissions {mode}"));
+    }
+    candidates.insert("/bypass".to_string());
+
+    for value in ["on", "off"] {
+        candidates.insert(format!("/thinking {value}"));
+        candidates.insert(format!("/proxy {value}"));
+    }
+    candidates.insert("/proxy status".to_string());
+
+    candidates.insert("/mcp status".to_string());
+    candidates.insert("/mcp tools".to_string());
+    candidates.insert("/mcp reload".to_string());
+    candidates.insert("/mcp add".to_string());
+    candidates.insert("/mcp enable".to_string());
+    candidates.insert("/mcp disable".to_string());
+
+    candidates.insert("/branch list".to_string());
+    candidates.insert("/branch create".to_string());
+    candidates.insert("/branch switch".to_string());
+
+    candidates.insert("/worktree list".to_string());
+    candidates.insert("/worktree add".to_string());
+    candidates.insert("/worktree remove".to_string());
+    candidates.insert("/worktree prune".to_string());
+
+    candidates.insert("/plugins help".to_string());
+    candidates.insert("/plugins list".to_string());
+    candidates.insert("/plugins install".to_string());
+    candidates.insert("/plugins enable".to_string());
+    candidates.insert("/plugins disable".to_string());
+    candidates.insert("/plugins uninstall".to_string());
+    candidates.insert("/plugins update".to_string());
+
+    candidates.insert("/skills list".to_string());
+    candidates.insert("/skills help".to_string());
+    candidates.insert("/skills init".to_string());
+    candidates.insert("/agents list".to_string());
+    candidates.insert("/agents help".to_string());
+    candidates.insert("/session list".to_string());
+    candidates.insert("/session switch".to_string());
+    candidates.insert("/resume last".to_string());
+
+    for model in model_completion_candidates(&cli.model) {
+        candidates.insert(format!("/model {model}"));
+    }
+
+    if cli.service == ApiService::NanoGpt {
+        candidates.insert("/provider default".to_string());
+        if let Some(provider) = provider_for_model(&cli.model) {
+            candidates.insert(format!("/provider {provider}"));
+        }
+    }
+
+    if let Ok(sessions) = list_managed_sessions() {
+        for session in sessions {
+            candidates.insert(format!("/resume {}", session.id));
+            candidates.insert(format!("/resume {}", session.path.display()));
+            candidates.insert(format!("/session switch {}", session.id));
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(env::current_dir().unwrap_or_else(|_| PathBuf::from("."))) {
+        for entry in entries.flatten().take(64) {
+            let path = entry.path();
+            let display = path.display().to_string();
+            candidates.insert(format!("/export {display}"));
+            candidates.insert(format!("/plugins install {display}"));
+            if path.is_dir() {
+                candidates.insert(format!("/worktree add {display}"));
+                candidates.insert(format!("/worktree remove {display}"));
+            }
+        }
+    }
+
+    candidates.into_iter().collect()
+}
+
+fn model_completion_candidates(current_model: &str) -> Vec<String> {
+    let mut candidates = BTreeSet::new();
+    for alias in [
+        "default",
+        "glm",
+        "glm5",
+        "glm-5",
+        "glm5.1",
+        "glm-5.1",
+        "zai-org/glm-5",
+        "zai-org/glm-5.1",
+    ] {
+        candidates.insert(alias.to_string());
+    }
+
+    candidates.insert(DEFAULT_MODEL.to_string());
+    candidates.insert(current_model.to_string());
+
+    if let Ok(state) = load_model_state() {
+        if let Some(model) = state.current_model {
+            candidates.insert(model);
+        }
+        for favorite in state.favorite_models {
+            candidates.insert(favorite);
+        }
+    }
+
+    candidates.into_iter().collect()
 }
 
 impl McpCatalog {
@@ -2998,39 +3454,13 @@ fn run_repl_from_session(
 }
 
 fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
-    let completions = slash_command_specs()
-        .iter()
-        .map(|spec| format!("/{}", spec.name))
-        .chain(
-            slash_command_specs()
-                .iter()
-                .flat_map(|spec| spec.aliases.iter().map(|alias| format!("/{alias}"))),
-        )
-        .chain(
-            [
-                "/login",
-                "/auth",
-                "/provider",
-                "/proxy",
-                "/vim",
-                "/exit",
-                "/quit",
-            ]
-            .map(str::to_string),
-        )
-        .collect();
-    let mut editor = input::LineEditor::new("> ", completions);
-    println!("NanoCode");
+    let mut editor = input::LineEditor::new("> ", repl_completion_candidates(cli));
+    println!("Pebble");
     println!("  service: {}", cli.service.display_name());
     println!("  model: {}", cli.model);
-    println!(
-        "  provider: {}",
-        if cli.service == ApiService::NanoGpt {
-            provider_for_model(&cli.model).unwrap_or_else(|| "<platform default>".to_string())
-        } else {
-            "<not applicable on Synthetic>".to_string()
-        }
-    );
+    if let Some(provider) = provider_label_for_service_model(cli.service, &cli.model) {
+        println!("  provider: {provider}");
+    }
     println!(
         "  prompt: {}",
         "Shift+Enter/Ctrl+J newline, /vim toggles vi mode, /help for commands"
@@ -3038,6 +3468,7 @@ fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     loop {
+        editor.set_completions(repl_completion_candidates(cli));
         let input = match editor.read_line()? {
             input::ReadOutcome::Submit(input) => input,
             input::ReadOutcome::Cancel => continue,
@@ -3097,7 +3528,12 @@ fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 };
                 match command {
-                    SlashCommand::Help => println!("{}", render_repl_help()),
+                    SlashCommand::Help { topic } => println!(
+                        "{}",
+                        topic.as_deref().map_or_else(render_repl_help, |topic| {
+                            render_slash_command_help_topic(Some(topic))
+                        },)
+                    ),
                     SlashCommand::Status => cli.print_status(),
                     SlashCommand::Compact => cli.compact()?,
                     SlashCommand::Thinking { enabled } => cli.set_thinking(enabled)?,
@@ -3111,7 +3547,7 @@ fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                         println!("{}", render_config_report(section.as_deref())?)
                     }
                     SlashCommand::Memory => println!("{}", render_memory_report()?),
-                    SlashCommand::Init => run_init()?,
+                    SlashCommand::Init => run_init_with_model(cli.service, &cli.model)?,
                     SlashCommand::Diff => println!("{}", render_diff_report()?),
                     SlashCommand::Version => print_version(),
                     SlashCommand::Branch { action, target } => println!(
@@ -3174,7 +3610,7 @@ struct LiveCli {
     system_prompt: Vec<String>,
     proxy_tool_calls: bool,
     mcp_catalog: McpCatalog,
-    runtime: ConversationRuntime<NanoCodeRuntimeClient, CliToolExecutor>,
+    runtime: ConversationRuntime<PebbleRuntimeClient, CliToolExecutor>,
     session: SessionHandle,
     render_model_output: bool,
 }
@@ -3236,32 +3672,38 @@ impl LiveCli {
         thinking_enabled: bool,
         render_model_output: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let service = infer_service_for_model(&model);
         let system_prompt = build_system_prompt()?;
-        let proxy_tool_calls = proxy_tool_calls_enabled();
+        let restored = session_runtime_state(
+            &session,
+            &model,
+            allowed_tools.as_ref(),
+            permission_mode,
+            thinking_enabled,
+            proxy_tool_calls_enabled(),
+        );
         let mcp_catalog = load_mcp_catalog(&env::current_dir()?)?;
         let runtime = build_runtime(
             session,
-            service,
-            model.clone(),
+            restored.service,
+            restored.model.clone(),
             system_prompt.clone(),
             true,
-            proxy_tool_calls,
+            restored.proxy_tool_calls,
             mcp_catalog.clone(),
-            allowed_tools.clone(),
-            permission_mode,
-            thinking_enabled,
+            restored.allowed_tools.clone(),
+            restored.permission_mode,
+            restored.thinking_enabled,
             render_model_output,
         )?;
         Ok(Self {
-            service,
-            model,
-            allowed_tools,
-            permission_mode,
+            service: restored.service,
+            model: restored.model,
+            allowed_tools: restored.allowed_tools,
+            permission_mode: restored.permission_mode,
             max_cost_usd,
-            thinking_enabled,
+            thinking_enabled: restored.thinking_enabled,
             system_prompt,
-            proxy_tool_calls,
+            proxy_tool_calls: restored.proxy_tool_calls,
             mcp_catalog,
             runtime,
             session: session_handle,
@@ -3285,7 +3727,7 @@ impl LiveCli {
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
-            "Waiting for NanoCode",
+            "Waiting for Pebble",
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
@@ -3294,7 +3736,7 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 spinner.finish(
-                    "NanoCode response complete",
+                    "Pebble response complete",
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
@@ -3311,7 +3753,7 @@ impl LiveCli {
             }
             Err(error) => {
                 spinner.fail(
-                    "NanoCode request failed",
+                    "Pebble request failed",
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
@@ -3351,8 +3793,6 @@ impl LiveCli {
     }
 
     fn print_status(&self) {
-        let provider =
-            provider_for_model(&self.model).unwrap_or_else(|| "<platform default>".to_string());
         let cumulative = self.runtime.usage().cumulative_usage();
         let latest = self.runtime.usage().current_turn_usage();
         let context = status_context(Some(&self.session.path)).expect("status context should load");
@@ -3369,7 +3809,7 @@ impl LiveCli {
                     estimated_tokens: self.runtime.estimated_tokens(),
                 },
                 self.permission_mode.as_str(),
-                &provider,
+                provider_label_for_service_model(self.service, &self.model).as_deref(),
                 self.proxy_tool_calls,
                 self.thinking_enabled,
                 self.max_cost_usd,
@@ -3430,14 +3870,11 @@ impl LiveCli {
         self.service = service;
         self.model = model.clone();
         self.persist_session()?;
-        let provider = if self.service == ApiService::NanoGpt {
-            provider_for_model(&self.model).unwrap_or_else(|| "<platform default>".to_string())
-        } else {
-            "<not applicable on Synthetic>".to_string()
-        };
         println!("Switched to service: {}", self.service.display_name());
         println!("Switched to model: {model}");
-        println!("Provider override for current model: {provider}");
+        if let Some(provider) = provider_label_for_service_model(self.service, &self.model) {
+            println!("Provider override for current model: {provider}");
+        }
         Ok(())
     }
 
@@ -3721,27 +4158,7 @@ impl LiveCli {
     fn resume_handle(&mut self, handle: SessionHandle) -> Result<(), Box<dyn std::error::Error>> {
         let session = Session::load_from_path(&handle.path)?;
         let message_count = session.messages.len();
-        if let Some(model) = session
-            .metadata
-            .as_ref()
-            .map(|metadata| metadata.model.clone())
-        {
-            self.model = model;
-            self.service = infer_service_for_model(&self.model);
-        }
-        self.runtime = build_runtime(
-            session,
-            self.service,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            self.proxy_tool_calls,
-            self.mcp_catalog.clone(),
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            self.thinking_enabled,
-            self.render_model_output,
-        )?;
+        self.restore_session_runtime(handle.clone(), session)?;
         self.session = handle;
         self.persist_session()?;
         println!(
@@ -3784,27 +4201,7 @@ impl LiveCli {
                 let handle = resolve_session_reference(target)?;
                 let session = Session::load_from_path(&handle.path)?;
                 let message_count = session.messages.len();
-                if let Some(model) = session
-                    .metadata
-                    .as_ref()
-                    .map(|metadata| metadata.model.clone())
-                {
-                    self.model = model;
-                    self.service = infer_service_for_model(&self.model);
-                }
-                self.runtime = build_runtime(
-                    session,
-                    self.service,
-                    self.model.clone(),
-                    self.system_prompt.clone(),
-                    true,
-                    self.proxy_tool_calls,
-                    self.mcp_catalog.clone(),
-                    self.allowed_tools.clone(),
-                    self.permission_mode,
-                    self.thinking_enabled,
-                    self.render_model_output,
-                )?;
+                self.restore_session_runtime(handle.clone(), session)?;
                 self.session = handle;
                 self.persist_session()?;
                 println!(
@@ -3821,9 +4218,53 @@ impl LiveCli {
         Ok(())
     }
 
+    fn restore_session_runtime(
+        &mut self,
+        handle: SessionHandle,
+        session: Session,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let state = session_runtime_state(
+            &session,
+            &self.model,
+            self.allowed_tools.as_ref(),
+            self.permission_mode,
+            self.thinking_enabled,
+            self.proxy_tool_calls,
+        );
+        self.model = state.model;
+        self.service = state.service;
+        self.allowed_tools = state.allowed_tools;
+        self.permission_mode = state.permission_mode;
+        self.thinking_enabled = state.thinking_enabled;
+        self.proxy_tool_calls = state.proxy_tool_calls;
+        self.mcp_catalog = load_mcp_catalog(&env::current_dir()?)?;
+        self.runtime = build_runtime(
+            session,
+            self.service,
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            self.proxy_tool_calls,
+            self.mcp_catalog.clone(),
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            self.thinking_enabled,
+            self.render_model_output,
+        )?;
+        self.session = handle;
+        Ok(())
+    }
+
     fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
         let mut session = self.runtime.session().clone();
-        session.metadata = Some(derive_session_metadata(&session, &self.model));
+        session.metadata = Some(derive_session_metadata(
+            &session,
+            &self.model,
+            self.allowed_tools.as_ref(),
+            self.permission_mode,
+            self.thinking_enabled,
+            self.proxy_tool_calls,
+        ));
         session.save_to_path(&self.session.path)?;
         auto_compact_inactive_sessions(&self.session.id)?;
         Ok(())
@@ -3866,6 +4307,27 @@ fn handle_mcp_runtime_command(
             Ok(())
         }
         McpCommand::Reload => cli.reload_mcp(),
+        McpCommand::Add { name } => {
+            println!(
+                "{}",
+                add_mcp_server_interactive(&env::current_dir()?, &name)?
+            );
+            cli.reload_mcp()
+        }
+        McpCommand::Enable { name } => {
+            println!(
+                "{}",
+                set_mcp_server_enabled(&env::current_dir()?, &name, true)?
+            );
+            cli.reload_mcp()
+        }
+        McpCommand::Disable { name } => {
+            println!(
+                "{}",
+                set_mcp_server_enabled(&env::current_dir()?, &name, false)?
+            );
+            cli.reload_mcp()
+        }
     }
 }
 
@@ -3975,8 +4437,7 @@ fn build_runtime(
     permission_mode: PermissionMode,
     thinking_enabled: bool,
     render_model_output: bool,
-) -> Result<ConversationRuntime<NanoCodeRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
-{
+) -> Result<ConversationRuntime<PebbleRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>> {
     let tool_registry = current_tool_registry()
         .map_err(|error| io::Error::other(format!("failed to load tool registry: {error}")))?;
     let tool_specs = if enable_tools {
@@ -3997,7 +4458,7 @@ fn build_runtime(
     );
     Ok(ConversationRuntime::new_with_features(
         session,
-        NanoCodeRuntimeClient::new(
+        PebbleRuntimeClient::new(
             service,
             model.clone(),
             provider_for_model(&model),
@@ -4021,9 +4482,10 @@ fn build_runtime(
     ))
 }
 
-struct NanoCodeRuntimeClient {
+struct PebbleRuntimeClient {
     runtime: tokio::runtime::Runtime,
     client: NanoGptClient,
+    service: ApiService,
     model: String,
     max_output_tokens: u32,
     enable_tools: bool,
@@ -4033,7 +4495,7 @@ struct NanoCodeRuntimeClient {
     render_output: bool,
 }
 
-impl NanoCodeRuntimeClient {
+impl PebbleRuntimeClient {
     fn new(
         service: ApiService,
         model: String,
@@ -4053,6 +4515,7 @@ impl NanoCodeRuntimeClient {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
+            service,
             max_output_tokens: max_output_tokens_for_model_or(&model, DEFAULT_MAX_TOKENS),
             model,
             enable_tools,
@@ -4064,7 +4527,7 @@ impl NanoCodeRuntimeClient {
     }
 }
 
-impl ApiClient for NanoCodeRuntimeClient {
+impl ApiClient for PebbleRuntimeClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         if self.proxy_tool_calls {
             return self.stream_via_proxy(request);
@@ -4073,7 +4536,7 @@ impl ApiClient for NanoCodeRuntimeClient {
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: self.max_output_tokens,
-            messages: convert_messages(&request.messages)?,
+            messages: convert_messages(&request.messages, self.service)?,
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: self.enable_tools.then(|| {
                 self.tool_specs
@@ -4120,7 +4583,7 @@ impl ApiClient for NanoCodeRuntimeClient {
                         ..
                     }) if error_type == "invalid_response_error" => {
                         eprintln!(
-                            "[nanocode] streaming failed with invalid_response_error{}; retrying non-streaming",
+                            "[pebble] streaming failed with invalid_response_error{}; retrying non-streaming",
                             message
                                 .as_deref()
                                 .map(|message| format!(": {message}"))
@@ -4243,7 +4706,7 @@ impl ApiClient for NanoCodeRuntimeClient {
     }
 }
 
-impl NanoCodeRuntimeClient {
+impl PebbleRuntimeClient {
     fn stream_via_proxy(
         &mut self,
         request: ApiRequest,
@@ -4407,7 +4870,7 @@ fn render_streamed_tool_call_start(
     name: &str,
     input: &str,
 ) -> Result<(), RuntimeError> {
-    writeln!(out, "\n{}", format_tool_call_start(name, input))
+    writeln!(out, "{}", format_tool_call_start(name, input))
         .and_then(|_| out.flush())
         .map_err(|error| RuntimeError::new(error.to_string()))
 }
@@ -4470,7 +4933,7 @@ fn render_thinking_block_summary(
     text: &str,
     out: &mut (impl Write + ?Sized),
 ) -> Result<(), RuntimeError> {
-    writeln!(out, "\n▶ Thinking ({} chars hidden)", text.chars().count())
+    writeln!(out, "▶ Thinking ({} chars hidden)", text.chars().count())
         .and_then(|_| out.flush())
         .map_err(|error| RuntimeError::new(error.to_string()))
 }
@@ -4588,9 +5051,15 @@ fn should_render_proxy_text_segment(text: &str, has_tool_use: bool) -> bool {
             "let me",
             "i'll",
             "i will",
+            "first, i'll",
+            "first i will",
+            "first i'll",
             "creating",
             "writing",
             "saving",
+            "updating",
+            "reading",
+            "editing",
         ];
         if boilerplate
             .iter()
@@ -4715,6 +5184,7 @@ fn render_structured_tool_preview(tool_name: &str, output: &str) -> Option<Strin
         "glob_search" => render_glob_search_preview(&value),
         "grep_search" => render_grep_search_preview(&value),
         "bash" => render_bash_preview(&value),
+        "write_file" | "edit_file" => render_write_edit_preview(tool_name, &value),
         _ => None,
     }
 }
@@ -4816,6 +5286,31 @@ fn render_bash_preview(value: &serde_json::Value) -> Option<String> {
         return None;
     }
     Some(format!("#### bash\n\n{}\n", sections.join("\n\n")))
+}
+
+fn render_write_edit_preview(tool_name: &str, value: &serde_json::Value) -> Option<String> {
+    let path = value
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("filePath").and_then(serde_json::Value::as_str))
+        .unwrap_or("unknown");
+    let message = value
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let lines = value
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .map(|content| content.lines().count());
+    let mut body = format!("#### {tool_name}\n\n- Path: `{path}`");
+    if let Some(lines) = lines {
+        let _ = write!(body, "\n- Content: {lines} lines");
+    }
+    if !message.trim().is_empty() {
+        let _ = write!(body, "\n- Result: {}", message.trim());
+    }
+    body.push('\n');
+    Some(body)
 }
 
 fn truncate_tool_text(input: &str, max_lines: usize, max_chars: usize) -> String {
@@ -4965,7 +5460,10 @@ fn permission_policy(mode: PermissionMode, tool_specs: &[RuntimeToolSpec]) -> Pe
         })
 }
 
-fn convert_messages(messages: &[ConversationMessage]) -> Result<Vec<InputMessage>, RuntimeError> {
+fn convert_messages(
+    messages: &[ConversationMessage],
+    service: ApiService,
+) -> Result<Vec<InputMessage>, RuntimeError> {
     let cwd = env::current_dir().map_err(|error| {
         RuntimeError::new(format!("failed to resolve current directory: {error}"))
     })?;
@@ -5015,10 +5513,29 @@ fn convert_messages(messages: &[ConversationMessage]) -> Result<Vec<InputMessage
                     }
                     Ok::<_, RuntimeError>(acc)
                 });
+            let reasoning_content =
+                if service == ApiService::OpencodeGo && message.role == MessageRole::Assistant {
+                    let reasoning = message
+                        .blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Thinking { text, .. } if !text.is_empty() => {
+                                Some(text.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    (!reasoning.is_empty()).then_some(reasoning)
+                } else {
+                    None
+                };
             match content {
                 Ok(content) if !content.is_empty() => Some(Ok(InputMessage {
                     role: role.to_string(),
                     content,
+                    reasoning_content: reasoning_content.clone(),
+                    reasoning: reasoning_content,
                 })),
                 Ok(_) => None,
                 Err(error) => Some(Err(error)),
@@ -5254,6 +5771,8 @@ fn convert_proxy_messages_to_input_messages(messages: Vec<ProxyMessage>) -> Vec<
             content: vec![InputContentBlock::Text {
                 text: message.content,
             }],
+            reasoning_content: None,
+            reasoning: None,
         })
         .collect()
 }
@@ -5386,9 +5905,11 @@ fn run_resume_command(
     command: &SlashCommand,
 ) -> Result<ResumeCommandOutcome, Box<dyn std::error::Error>> {
     match command {
-        SlashCommand::Help => Ok(ResumeCommandOutcome {
+        SlashCommand::Help { topic } => Ok(ResumeCommandOutcome {
             session: session.clone(),
-            message: Some(render_repl_help()),
+            message: Some(topic.as_deref().map_or_else(render_repl_help, |topic| {
+                render_slash_command_help_topic(Some(topic))
+            })),
         }),
         SlashCommand::Compact => {
             let result = runtime::compact_session(
@@ -5435,19 +5956,19 @@ fn run_resume_command(
         SlashCommand::Status => {
             let tracker = UsageTracker::from_session(session);
             let usage = tracker.cumulative_usage();
+            let state = session_runtime_state(
+                session,
+                DEFAULT_MODEL,
+                None,
+                default_permission_mode(),
+                false,
+                false,
+            );
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format_status_report(
-                    session
-                        .metadata
-                        .as_ref()
-                        .map(|metadata| infer_service_for_model(&metadata.model))
-                        .unwrap_or(ApiService::NanoGpt),
-                    session
-                        .metadata
-                        .as_ref()
-                        .map(|metadata| metadata.model.as_str())
-                        .unwrap_or("restored-session"),
+                    state.service,
+                    &state.model,
                     StatusUsage {
                         message_count: session.messages.len(),
                         turns: tracker.turns(),
@@ -5455,10 +5976,10 @@ fn run_resume_command(
                         cumulative: usage,
                         estimated_tokens: 0,
                     },
-                    default_permission_mode().as_str(),
-                    "<platform default>",
-                    false,
-                    false,
+                    state.permission_mode.as_str(),
+                    provider_label_for_service_model(state.service, &state.model).as_deref(),
+                    state.proxy_tool_calls,
+                    state.thinking_enabled,
                     None,
                     &McpCatalog::default(),
                     &status_context(Some(session_path))?,
@@ -5488,10 +6009,28 @@ fn run_resume_command(
             session: session.clone(),
             message: Some(render_memory_report()?),
         }),
-        SlashCommand::Init => Ok(ResumeCommandOutcome {
-            session: session.clone(),
-            message: Some(initialize_repo(&env::current_dir()?)?.render()),
-        }),
+        SlashCommand::Init => {
+            let state = session_runtime_state(
+                session,
+                DEFAULT_MODEL,
+                None,
+                default_permission_mode(),
+                false,
+                false,
+            );
+            let (report, warning) =
+                initialize_repo_for_model(&env::current_dir()?, state.service, &state.model)?;
+            let mut message = String::new();
+            if let Some(warning) = warning {
+                writeln!(&mut message, "{warning}")?;
+                writeln!(&mut message)?;
+            }
+            message.push_str(&report.render());
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message),
+            })
+        }
         SlashCommand::Diff => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_diff_report()?),
@@ -5529,50 +6068,53 @@ fn run_resume_command(
 }
 
 fn print_help() {
-    println!("NanoCode");
+    println!("Pebble");
     println!();
     println!("Usage");
     println!(
-        "  nanocode [--model MODEL] [--permission-mode MODE] [--max-cost USD] [--thinking] [--allowedTools TOOL[,TOOL...]]"
+        "  pebble [--model MODEL] [--permission-mode MODE] [--max-cost USD] [--thinking] [--allowedTools TOOL[,TOOL...]]"
     );
     println!("                                               Start interactive REPL");
-    println!("  nanocode login [SERVICE] [--api-key KEY]    Save a NanoGPT or Synthetic API key");
-    println!("  nanocode model [MODEL_ID]                   Choose or persist a default model");
     println!(
-        "  nanocode provider [PROVIDER_ID|default]     Choose a provider for the active model"
+        "  pebble login [SERVICE] [--api-key KEY]    Save credentials for NanoGPT, Synthetic, OpenCode Go, or Exa"
     );
-    println!("  nanocode proxy [on|off|status]              Toggle XML tool-call proxy mode");
     println!(
-        "  nanocode mcp [status|tools|reload]          Inspect configured MCP servers and tools"
+        "                                               Services: nanogpt, synthetic, opencode-go, exa"
     );
-    println!("  nanocode plugins [list|install|enable|disable|uninstall|update] [TARGET]");
-    println!("  nanocode branch [list|create|switch] [ARG]  Inspect or change git branches");
-    println!("  nanocode worktree [list|add|remove|prune]   Inspect or manage git worktrees");
-    println!("  nanocode agents [list|help]                 List configured NanoCode agents");
-    println!("  nanocode skills [list|help]                 List available NanoCode skills");
-    println!("  nanocode init                               Create starter NanoCode project files");
-    println!("  nanocode doctor                             Run local environment diagnostics");
-    println!("  nanocode self-update                        Update from GitHub releases");
-    println!("  nanocode resume [SESSION_ID_OR_PATH]");
+    println!("  pebble model [MODEL_ID]                   Choose or persist a default model");
+    println!("  pebble provider [PROVIDER_ID|default]     Choose a provider for the active model");
+    println!("  pebble proxy [on|off|status]              Toggle XML tool-call proxy mode");
+    println!(
+        "  pebble mcp [status|tools|reload|add <name>|enable <name>|disable <name>] Inspect configured MCP servers and tools"
+    );
+    println!("  pebble plugins [list|help|install|enable|disable|uninstall|update] [TARGET]");
+    println!("  pebble branch [list|create|switch] [ARG]  Inspect or change git branches");
+    println!("  pebble worktree [list|add|remove|prune]   Inspect or manage git worktrees");
+    println!("  pebble agents [list|help]                 List configured Pebble agents");
+    println!("  pebble skills [list|help|init <name>]     List or scaffold Pebble skills");
+    println!("  pebble init                               Create starter Pebble project files");
+    println!("  pebble doctor                             Run local environment diagnostics");
+    println!("  pebble self-update                        Update from GitHub releases");
+    println!("  pebble resume [SESSION_ID_OR_PATH]");
     println!("                                               Resume a saved session, or pick one and enter the REPL");
-    println!("  nanocode --resume [SESSION_ID_OR_PATH] [/status] [/compact] [...]");
+    println!("  pebble --resume [SESSION_ID_OR_PATH] [/status] [/compact] [...]");
     println!("                                               Resume a saved session and optionally run slash commands");
     println!(
-        "  nanocode prompt [--model MODEL] [--permission-mode MODE] [--max-cost USD] [--thinking] [--output-format text|json] TEXT"
+        "  pebble prompt [--model MODEL] [--permission-mode MODE] [--max-cost USD] [--thinking] [--output-format text|json] TEXT"
     );
     println!(
         "                                               Send one prompt and stream the response"
     );
     println!(
-        "  nanocode [--model MODEL] [--permission-mode MODE] [--max-cost USD] [--thinking] [--output-format text|json] TEXT"
+        "  pebble [--model MODEL] [--permission-mode MODE] [--max-cost USD] [--thinking] [--output-format text|json] TEXT"
     );
     println!(
         "                                               Shorthand non-interactive prompt mode"
     );
-    println!("  nanocode dump-manifests");
-    println!("  nanocode bootstrap-plan");
-    println!("  nanocode system-prompt [--cwd PATH] [--date YYYY-MM-DD]");
-    println!("  nanocode --version");
+    println!("  pebble dump-manifests");
+    println!("  pebble bootstrap-plan");
+    println!("  pebble system-prompt [--cwd PATH] [--date YYYY-MM-DD]");
+    println!("  pebble --version");
     println!(
         "  --permission-mode MODE                     read-only, workspace-write, or danger-full-access"
     );
@@ -5586,9 +6128,9 @@ fn print_help() {
         "  --output-format FORMAT                     Non-interactive output format: text or json"
     );
     println!();
-    println!("REPL");
-    println!("  /help                                      Show the interactive command guide");
-    println!("  /vim                                       Toggle vi keybindings for this REPL");
+    println!("{}", render_repl_help());
+    println!();
+    println!("{}", render_help_topics_overview());
 }
 
 fn print_version() {
@@ -5596,9 +6138,288 @@ fn print_version() {
 }
 
 fn run_init() -> Result<(), Box<dyn std::error::Error>> {
+    let model = default_model_or(DEFAULT_MODEL);
+    run_init_with_model(infer_service_for_model(&model), &model)
+}
+
+fn run_init_with_model(service: ApiService, model: &str) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    println!("{}", initialize_repo(&cwd)?.render());
+    let (report, warning) = initialize_repo_for_model(&cwd, service, model)?;
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+    println!("{}", report.render());
     Ok(())
+}
+
+fn initialize_repo_for_model(
+    cwd: &Path,
+    service: ApiService,
+    model: &str,
+) -> Result<(crate::init::InitReport, Option<String>), Box<dyn std::error::Error>> {
+    if cwd.join("PEBBLE.md").exists() {
+        return Ok((initialize_repo(cwd)?, None));
+    }
+
+    match generate_pebble_md(cwd, service, model) {
+        Ok(content) => Ok((initialize_repo_with_pebble_md(cwd, &content)?, None)),
+        Err(error) => Ok((
+            initialize_repo(cwd)?,
+            Some(format_init_generation_warning(service, model, &*error)),
+        )),
+    }
+}
+
+fn generate_pebble_md(
+    cwd: &Path,
+    service: ApiService,
+    model: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let request = MessageRequest {
+        model: model.to_string(),
+        max_tokens: INIT_PEBBLE_MD_MAX_TOKENS,
+        messages: vec![InputMessage::user_text(build_init_generation_prompt(cwd)?)],
+        system: Some(init_generation_system_prompt().to_string()),
+        tools: None,
+        tool_choice: None,
+        thinking: None,
+        stream: false,
+    };
+    let mut client = NanoGptClient::new(resolve_api_key_for(service)?)
+        .with_service(service)
+        .with_base_url(resolve_base_url_for(service));
+    if service == ApiService::NanoGpt {
+        client = client.with_provider(provider_for_model(model));
+    }
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let response = runtime.block_on(async { client.send_message(&request).await })?;
+    extract_generated_pebble_md(response)
+}
+
+fn init_generation_system_prompt() -> &'static str {
+    "You write repo-specific PEBBLE.md files for a coding assistant. Return only markdown for the file with no code fences or prefatory text. Stay concrete, concise, and factual. Do not invent commands, directories, workflows, or architecture details. If a detail is uncertain from the provided context, say to verify it or omit it."
+}
+
+fn build_init_generation_prompt(cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let project_context = runtime::ProjectContext::discover_with_git(cwd, DEFAULT_DATE)?;
+    let mut prompt = String::new();
+    writeln!(
+        &mut prompt,
+        "Create a project-specific `PEBBLE.md` for this repository."
+    )?;
+    writeln!(
+        &mut prompt,
+        "Use the supplied repository context to replace the generic starter template with concrete guidance."
+    )?;
+    writeln!(&mut prompt)?;
+    writeln!(&mut prompt, "Required output shape:")?;
+    writeln!(&mut prompt, "- `# PEBBLE.md`")?;
+    writeln!(&mut prompt, "- `## Project Overview`")?;
+    writeln!(&mut prompt, "- `## Repository Shape`")?;
+    writeln!(&mut prompt, "- `## Commands`")?;
+    writeln!(&mut prompt, "- `## Working Agreement`")?;
+    writeln!(&mut prompt)?;
+    writeln!(&mut prompt, "Instructions:")?;
+    writeln!(
+        &mut prompt,
+        "- Keep it concise, actionable, and specific to this repo."
+    )?;
+    writeln!(
+        &mut prompt,
+        "- Prefer bullet lists for commands and operational guidance."
+    )?;
+    writeln!(
+        &mut prompt,
+        "- Mention verification commands only when supported by the provided files."
+    )?;
+    writeln!(
+        &mut prompt,
+        "- If the context is incomplete, say what to verify instead of guessing."
+    )?;
+    writeln!(&mut prompt)?;
+    writeln!(&mut prompt, "Repository context")?;
+    writeln!(&mut prompt, "Working directory: {}", cwd.display())?;
+    writeln!(
+        &mut prompt,
+        "Top-level entries:\n{}",
+        render_init_top_level_entries(cwd)?
+    )?;
+
+    if let Some(git_status) = project_context.git_status.as_deref() {
+        let trimmed = git_status.trim();
+        if !trimmed.is_empty() {
+            writeln!(&mut prompt)?;
+            writeln!(&mut prompt, "Git status:")?;
+            writeln!(&mut prompt, "```text")?;
+            writeln!(&mut prompt, "{trimmed}")?;
+            writeln!(&mut prompt, "```")?;
+        }
+    }
+
+    let context_files = collect_init_context_files(cwd, &project_context);
+    if !context_files.is_empty() {
+        writeln!(&mut prompt)?;
+        writeln!(&mut prompt, "Key file excerpts:")?;
+        for path in context_files {
+            if let Some(snippet) = read_init_context_file(&path) {
+                writeln!(&mut prompt, "### {}", display_init_context_path(cwd, &path))?;
+                writeln!(&mut prompt, "```text")?;
+                writeln!(&mut prompt, "{snippet}")?;
+                writeln!(&mut prompt, "```")?;
+            }
+        }
+    }
+
+    writeln!(&mut prompt)?;
+    writeln!(&mut prompt, "Starter template to improve:")?;
+    writeln!(&mut prompt, "```markdown")?;
+    writeln!(&mut prompt, "{}", render_init_pebble_md(cwd))?;
+    writeln!(&mut prompt, "```")?;
+
+    Ok(prompt)
+}
+
+fn render_init_top_level_entries(cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let mut entries = fs::read_dir(cwd)?
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            let mut name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_dir() {
+                name.push('/');
+            }
+            name
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+
+    let remaining = entries.len().saturating_sub(MAX_INIT_TOP_LEVEL_ENTRIES);
+    entries.truncate(MAX_INIT_TOP_LEVEL_ENTRIES);
+    if remaining > 0 {
+        entries.push(format!("... and {remaining} more"));
+    }
+
+    Ok(entries
+        .into_iter()
+        .map(|entry| format!("- {entry}"))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn collect_init_context_files(
+    cwd: &Path,
+    project_context: &runtime::ProjectContext,
+) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for path in [
+        cwd.join("README.md"),
+        cwd.join("Cargo.toml"),
+        cwd.join("package.json"),
+        cwd.join("pyproject.toml"),
+        cwd.join("go.mod"),
+        cwd.join("Makefile"),
+        cwd.join("justfile"),
+        cwd.join("Justfile"),
+    ] {
+        if path.is_file() && seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    }
+    for file in &project_context.instruction_files {
+        if let Some(name) = file.path.file_name().and_then(|name| name.to_str()) {
+            if name.eq_ignore_ascii_case("PEBBLE.md") {
+                continue;
+            }
+        }
+        if file.path.is_file() && seen.insert(file.path.clone()) {
+            paths.push(file.path.clone());
+        }
+    }
+    paths.truncate(MAX_INIT_CONTEXT_FILES);
+    paths
+}
+
+fn read_init_context_file(path: &Path) -> Option<String> {
+    let contents = fs::read_to_string(path).ok()?;
+    let normalized = contents.replace("\r\n", "\n");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(trimmed, MAX_INIT_CONTEXT_CHARS))
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut truncated = text.chars().take(max_chars).collect::<String>();
+    if text.chars().count() > max_chars {
+        truncated.push_str("\n... [truncated]");
+    }
+    truncated
+}
+
+fn display_init_context_path(cwd: &Path, path: &Path) -> String {
+    path.strip_prefix(cwd).unwrap_or(path).display().to_string()
+}
+
+fn extract_generated_pebble_md(
+    response: MessageResponse,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut text = String::new();
+    for block in response.content {
+        if let OutputContentBlock::Text { text: block_text } = block {
+            text.push_str(&block_text);
+        }
+    }
+
+    normalize_generated_pebble_md(&text)
+        .ok_or_else(|| "model returned no markdown content for PEBBLE.md".into())
+}
+
+fn normalize_generated_pebble_md(raw: &str) -> Option<String> {
+    let normalized = raw.replace("\r\n", "\n");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let unfenced = strip_markdown_code_fence(trimmed).unwrap_or(trimmed).trim();
+    if unfenced.is_empty() {
+        return None;
+    }
+
+    let mut content = unfenced.find("# PEBBLE.md").map_or_else(
+        || unfenced.to_string(),
+        |index| unfenced[index..].to_string(),
+    );
+    if !content.starts_with("# PEBBLE.md") {
+        content = format!("# PEBBLE.md\n\n{content}");
+    }
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    Some(content)
+}
+
+fn strip_markdown_code_fence(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("```")?;
+    let newline = rest.find('\n')?;
+    let body = &rest[newline + 1..];
+    body.strip_suffix("\n```")
+        .or_else(|| body.strip_suffix("```"))
+}
+
+fn format_init_generation_warning(
+    service: ApiService,
+    model: &str,
+    error: &dyn std::fmt::Display,
+) -> String {
+    format!(
+        "warning: failed to generate a repo-specific PEBBLE.md with {}/{}; used the starter template instead: {error}",
+        service.display_name(),
+        model
+    )
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -5630,7 +6451,7 @@ fn run_self_update() -> Result<(), Box<dyn std::error::Error>> {
                 "No published release available",
                 Some(VERSION),
                 None,
-                Some("GitHub latest release endpoint returned no published release for nanogpt-community/nanocode-v2."),
+                Some("GitHub latest release endpoint returned no published release for nanogpt-community/pebble."),
                 None,
             )
         );
@@ -5809,17 +6630,17 @@ fn release_asset_candidates() -> Vec<String> {
     let mut candidates = target_name_candidates()
         .into_iter()
         .flat_map(|target| {
-            let mut names = vec![format!("nanocode-{target}")];
+            let mut names = vec![format!("pebble-{target}")];
             if env::consts::OS == "windows" {
-                names.push(format!("nanocode-{target}.exe"));
+                names.push(format!("pebble-{target}.exe"));
             }
             names
         })
         .collect::<Vec<_>>();
     if env::consts::OS == "windows" {
-        candidates.push("nanocode.exe".to_string());
+        candidates.push("pebble.exe".to_string());
     }
-    candidates.push("nanocode".to_string());
+    candidates.push("pebble".to_string());
     candidates.sort();
     candidates.dedup();
     candidates
@@ -6485,14 +7306,16 @@ mod tests {
     use super::{
         append_proxy_text_events, available_runtime_tool_specs, build_system_prompt,
         extract_first_json_object, filter_runtime_tool_specs, format_status_report,
-        format_web_tools_status, parse_args, parse_auth_command, parse_checksum_for_asset,
-        parse_mcp_command, parse_model_command, parse_provider_command, parse_proxy_command,
+        format_web_tools_status, normalize_generated_pebble_md, parse_args, parse_auth_command,
+        parse_checksum_for_asset, parse_mcp_command, parse_model_command,
+        parse_permissions_command, parse_provider_command, parse_proxy_command,
         parse_tool_input_value, prompt_to_content_blocks, proxy_response_to_events,
         push_output_block, render_streamed_tool_call_start, render_tool_result_markdown,
         render_update_report, resolve_model_alias, response_to_events,
-        should_retry_proxy_tool_prompt, tuned_tool_description, AssistantEvent, CliAction,
-        CliOutputFormat, GitHubRelease, GitHubReleaseAsset, LoginCommand, McpCatalog, McpCommand,
-        RuntimeToolSpec, StatusContext, StatusUsage, DEFAULT_MODEL,
+        should_retry_proxy_tool_prompt, strip_markdown_code_fence, tuned_tool_description,
+        AssistantEvent, AuthService, CliAction, CliOutputFormat, GitHubRelease, GitHubReleaseAsset,
+        LoginCommand, McpCatalog, McpCommand, RuntimeToolSpec, StatusContext, StatusUsage,
+        DEFAULT_MODEL,
     };
     use crate::proxy::ProxyCommand;
     use api::{ApiService, InputContentBlock, MessageResponse, OutputContentBlock, Usage};
@@ -6513,16 +7336,16 @@ mod tests {
     fn with_isolated_config_home<T>(run: impl FnOnce() -> T) -> T {
         let _guard = env_lock();
         let root = std::env::temp_dir().join(format!(
-            "nanocode-main-test-{}",
+            "pebble-main-test-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("time should be after epoch")
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).expect("config dir should exist");
-        std::env::set_var("NANOCODE_CONFIG_HOME", &root);
+        std::env::set_var("PEBBLE_CONFIG_HOME", &root);
         let output = run();
-        std::env::remove_var("NANOCODE_CONFIG_HOME");
+        std::env::remove_var("PEBBLE_CONFIG_HOME");
         std::fs::remove_dir_all(root).expect("temp config dir should be removed");
         output
     }
@@ -6602,7 +7425,7 @@ mod tests {
                 estimated_tokens: 0,
             },
             "workspace-write",
-            "<platform default>",
+            Some("<platform default>"),
             false,
             false,
             None,
@@ -6776,7 +7599,7 @@ mod tests {
             assert_eq!(
                 parse_args(&args).expect("args should parse"),
                 CliAction::Login {
-                    service: ApiService::NanoGpt,
+                    service: None,
                     api_key: Some("nano-key".to_string()),
                 }
             );
@@ -6830,6 +7653,19 @@ mod tests {
                 parse_args(&args).expect("args should parse"),
                 CliAction::Mcp {
                     action: McpCommand::Tools,
+                }
+            );
+            let args = vec![
+                "mcp".to_string(),
+                "disable".to_string(),
+                "context7".to_string(),
+            ];
+            assert_eq!(
+                parse_args(&args).expect("args should parse"),
+                CliAction::Mcp {
+                    action: McpCommand::Disable {
+                        name: "context7".to_string(),
+                    },
                 }
             );
         });
@@ -6929,9 +7765,9 @@ mod tests {
 
     #[test]
     fn parses_checksum_manifest_for_named_asset() {
-        let manifest = "abc123 *nanocode-aarch64-apple-darwin\ndef456 other-file\n";
+        let manifest = "abc123 *pebble-aarch64-apple-darwin\ndef456 other-file\n";
         assert_eq!(
-            parse_checksum_for_asset(manifest, "nanocode-aarch64-apple-darwin"),
+            parse_checksum_for_asset(manifest, "pebble-aarch64-apple-darwin"),
             Some("abc123".to_string())
         );
     }
@@ -6947,7 +7783,7 @@ mod tests {
             body: String::new(),
             assets: vec![GitHubReleaseAsset {
                 name: asset_name,
-                browser_download_url: "https://example.invalid/nanocode".to_string(),
+                browser_download_url: "https://example.invalid/pebble".to_string(),
             }],
         };
 
@@ -6968,7 +7804,7 @@ mod tests {
         assert!(report.contains("Self-update"));
         assert!(report.contains("Changelog"));
         assert!(report.contains("- Added self-update"));
-        assert!(report.contains("nanogpt-community/nanocode-v2"));
+        assert!(report.contains("nanogpt-community/pebble"));
     }
 
     #[test]
@@ -6996,25 +7832,51 @@ mod tests {
         assert_eq!(
             parse_auth_command("/login"),
             Some(LoginCommand {
-                service: ApiService::NanoGpt,
+                service: None,
                 api_key: None,
             })
         );
         assert_eq!(
             parse_auth_command("/auth nano-key"),
             Some(LoginCommand {
-                service: ApiService::NanoGpt,
+                service: None,
                 api_key: Some("nano-key".to_string()),
             })
         );
         assert_eq!(
             parse_auth_command("/login synthetic"),
             Some(LoginCommand {
-                service: ApiService::Synthetic,
+                service: Some(AuthService::Synthetic),
+                api_key: None,
+            })
+        );
+        assert_eq!(
+            parse_auth_command("/login opencode-go"),
+            Some(LoginCommand {
+                service: Some(AuthService::OpencodeGo),
+                api_key: None,
+            })
+        );
+        assert_eq!(
+            parse_auth_command("/login exa"),
+            Some(LoginCommand {
+                service: Some(AuthService::Exa),
                 api_key: None,
             })
         );
         assert_eq!(parse_auth_command("/status"), None);
+    }
+
+    #[test]
+    fn parses_bypass_as_danger_full_access() {
+        assert!(matches!(
+            parse_permissions_command("/bypass"),
+            Some(Ok(Some(PermissionMode::DangerFullAccess)))
+        ));
+        assert!(matches!(
+            parse_permissions_command("/bypass now"),
+            Some(Err(message)) if message == "/bypass does not accept arguments"
+        ));
     }
 
     #[test]
@@ -7028,7 +7890,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_known_nanocode_model_aliases() {
+    fn resolves_known_pebble_model_aliases() {
         assert_eq!(resolve_model_alias("default"), "zai-org/glm-5.1");
         assert_eq!(resolve_model_alias("glm"), "zai-org/glm-5.1");
         assert_eq!(resolve_model_alias("glm5"), "zai-org/glm-5");
@@ -7064,6 +7926,12 @@ mod tests {
         assert_eq!(
             parse_mcp_command("/mcp tools").expect("mcp command should parse"),
             Ok(McpCommand::Tools)
+        );
+        assert_eq!(
+            parse_mcp_command("/mcp enable context7").expect("mcp enable should parse"),
+            Ok(McpCommand::Enable {
+                name: "context7".to_string(),
+            })
         );
         assert_eq!(
             parse_mcp_command("/mcp").expect("mcp default should parse"),
@@ -7116,7 +7984,8 @@ mod tests {
             },
         ];
 
-        let converted = super::convert_messages(&messages).expect("messages should convert");
+        let converted = super::convert_messages(&messages, ApiService::NanoGpt)
+            .expect("messages should convert");
         assert_eq!(converted.len(), 3);
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
@@ -7136,7 +8005,8 @@ mod tests {
             }]),
         ];
 
-        let converted = super::convert_messages(&messages).expect("messages should convert");
+        let converted = super::convert_messages(&messages, ApiService::NanoGpt)
+            .expect("messages should convert");
         assert_eq!(converted.len(), 2);
         assert_eq!(converted[0].role, "user");
         assert_eq!(converted[1].role, "assistant");
@@ -7153,13 +8023,41 @@ mod tests {
             ConversationMessage::tool_result("tool-missing", "bash", "ok", false),
         ];
 
-        let converted = super::convert_messages(&messages).expect("messages should convert");
+        let converted = super::convert_messages(&messages, ApiService::NanoGpt)
+            .expect("messages should convert");
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "user");
         assert!(matches!(
             &converted[0].content[0],
             InputContentBlock::Text { text } if text == "hello"
         ));
+    }
+
+    #[test]
+    fn convert_messages_preserves_reasoning_for_opencode_go_assistant_messages() {
+        let messages = vec![
+            ConversationMessage::assistant(vec![
+                ContentBlock::Thinking {
+                    text: "reasoning trail".to_string(),
+                    signature: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "bash".to_string(),
+                    input: "{\"command\":\"pwd\"}".to_string(),
+                },
+            ]),
+            ConversationMessage::tool_result("tool-1", "bash", "ok", false),
+        ];
+
+        let converted = super::convert_messages(&messages, ApiService::OpencodeGo)
+            .expect("messages should convert");
+        assert_eq!(converted.len(), 2);
+        assert_eq!(
+            converted[0].reasoning_content.as_deref(),
+            Some("reasoning trail")
+        );
+        assert_eq!(converted[0].reasoning.as_deref(), Some("reasoning trail"));
     }
 
     #[test]
@@ -7241,7 +8139,8 @@ mod tests {
             image_path.display()
         ))];
 
-        let converted = super::convert_messages(&messages).expect("messages should convert");
+        let converted = super::convert_messages(&messages, ApiService::NanoGpt)
+            .expect("messages should convert");
 
         assert_eq!(converted.len(), 1);
         assert!(matches!(
@@ -7256,7 +8155,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should advance")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("nanocode-{label}-{unique}"));
+        let path = std::env::temp_dir().join(format!("pebble-{label}-{unique}"));
         std::fs::create_dir_all(&path).expect("temp dir should exist");
         path
     }
@@ -7509,5 +8408,31 @@ mod tests {
             event,
             AssistantEvent::ThinkingDelta(_) | AssistantEvent::ThinkingSignature(_)
         )));
+    }
+
+    #[test]
+    fn strip_markdown_code_fence_removes_wrapping_block() {
+        let stripped = strip_markdown_code_fence("```markdown\n# PEBBLE.md\n\nRules\n```")
+            .expect("code fence should be removed");
+
+        assert_eq!(stripped, "# PEBBLE.md\n\nRules");
+    }
+
+    #[test]
+    fn normalize_generated_pebble_md_adds_heading_when_missing() {
+        let normalized = normalize_generated_pebble_md("Repository guidance")
+            .expect("markdown should normalize");
+
+        assert_eq!(normalized, "# PEBBLE.md\n\nRepository guidance\n");
+    }
+
+    #[test]
+    fn normalize_generated_pebble_md_prefers_embedded_pebble_heading() {
+        let normalized = normalize_generated_pebble_md(
+            "Here is the file you requested:\n\n# PEBBLE.md\n\nProject rules",
+        )
+        .expect("markdown should normalize");
+
+        assert_eq!(normalized, "# PEBBLE.md\n\nProject rules\n");
     }
 }

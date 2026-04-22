@@ -880,7 +880,7 @@ mod tests {
 
     #[test]
     fn recovers_multiple_tool_calls_with_unicode_close_tag() {
-        let text = "<tool_call name=\"read_file\" id=\"proxy-tool-2\">\n  <arg name=\"path\">Cargo.toml</arg>\n</tool_call〉 <tool_call name=\"read_file\" id=\"proxy-tool-3\">\n  <arg name=\"path\">crates/nanocode/src/main.rs</arg>\n</tool_call〉";
+        let text = "<tool_call name=\"read_file\" id=\"proxy-tool-2\">\n  <arg name=\"path\">Cargo.toml</arg>\n</tool_call〉 <tool_call name=\"read_file\" id=\"proxy-tool-3\">\n  <arg name=\"path\">crates/pebble/src/main.rs</arg>\n</tool_call〉";
         let segments = parse_proxy_response(text, &specs()).expect("proxy response should parse");
         assert_eq!(
             segments,
@@ -893,7 +893,7 @@ mod tests {
                 ProxySegment::ToolUse {
                     id: "proxy-tool-3".to_string(),
                     name: "read_file".to_string(),
-                    input: json!({"path":"crates/nanocode/src/main.rs"}).to_string(),
+                    input: json!({"path":"crates/pebble/src/main.rs"}).to_string(),
                 },
             ]
         );
@@ -915,7 +915,7 @@ mod tests {
 
     #[test]
     fn recovers_multiple_tool_calls_when_separator_noise_replaces_close_tag() {
-        let text = "<tool_call name=\"read_file\" id=\"proxy-tool-10\">\n  <arg name=\"limit\" type=\"integer\">50</arg>\n  <arg name=\"offset\" type=\"integer\">80</arg>\n  <arg name=\"path\">crates/nanocode/src/main.rs</arg>\n()>\n<tool_call name=\"glob_search\" id=\"proxy-tool-11\">\n  <arg name=\"pattern\">crates/api/src/**/*.rs</arg>\n()>";
+        let text = "<tool_call name=\"read_file\" id=\"proxy-tool-10\">\n  <arg name=\"limit\" type=\"integer\">50</arg>\n  <arg name=\"offset\" type=\"integer\">80</arg>\n  <arg name=\"path\">crates/pebble/src/main.rs</arg>\n()>\n<tool_call name=\"glob_search\" id=\"proxy-tool-11\">\n  <arg name=\"pattern\">crates/api/src/**/*.rs</arg>\n()>";
         let segments = parse_proxy_response(text, &specs()).expect("proxy response should parse");
         assert_eq!(
             segments,
@@ -926,7 +926,7 @@ mod tests {
                     input: json!({
                         "limit": 50,
                         "offset": 80,
-                        "path": "crates/nanocode/src/main.rs"
+                        "path": "crates/pebble/src/main.rs"
                     })
                     .to_string(),
                 },
@@ -941,7 +941,7 @@ mod tests {
 
     #[test]
     fn ignores_orphan_arg_closers_inside_tool_call_body() {
-        let text = "<tool_call name=\"write_file\">\n  <arg name=\"path\">nanocode-project-summary.md</arg>\n  <arg name=\"content\">hello</arg>\n</arg>\n</tool_call>";
+        let text = "<tool_call name=\"write_file\">\n  <arg name=\"path\">pebble-project-summary.md</arg>\n  <arg name=\"content\">hello</arg>\n</arg>\n</tool_call>";
         let segments = parse_proxy_response(text, &specs()).expect("proxy response should parse");
         assert_eq!(
             segments,
@@ -949,7 +949,7 @@ mod tests {
                 id: "proxy-tool-1".to_string(),
                 name: "write_file".to_string(),
                 input: json!({
-                    "path": "nanocode-project-summary.md",
+                    "path": "pebble-project-summary.md",
                     "content": "hello"
                 })
                 .to_string(),

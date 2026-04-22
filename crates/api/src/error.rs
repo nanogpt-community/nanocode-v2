@@ -56,11 +56,11 @@ impl Display for ApiError {
             Self::MissingApiKey => {
                 write!(
                     f,
-                    "NANOGPT_API_KEY is not set; export it before calling the NanoGPT API"
+                    "required API key is not configured; set the service environment variable or save credentials first"
                 )
             }
             Self::InvalidApiKeyEnv(error) => {
-                write!(f, "failed to read NANOGPT_API_KEY: {error}")
+                write!(f, "failed to read API key environment variable: {error}")
             }
             Self::Http(error) => write!(f, "http error: {error}"),
             Self::Io(error) => write!(f, "io error: {error}"),
@@ -73,9 +73,9 @@ impl Display for ApiError {
                 ..
             } => match (error_type, message) {
                 (Some(error_type), Some(message)) => {
-                    write!(f, "nanogpt api returned {status} ({error_type}): {message}")
+                    write!(f, "api returned {status} ({error_type}): {message}")
                 }
-                _ => write!(f, "nanogpt api returned {status}: {body}"),
+                _ => write!(f, "api returned {status}: {body}"),
             },
             Self::StreamApi {
                 error_type,
@@ -83,17 +83,14 @@ impl Display for ApiError {
                 body,
             } => match (error_type, message) {
                 (Some(error_type), Some(message)) => {
-                    write!(f, "nanogpt stream returned {error_type}: {message}")
+                    write!(f, "api stream returned {error_type}: {message}")
                 }
-                _ => write!(f, "nanogpt stream returned error: {body}"),
+                _ => write!(f, "api stream returned error: {body}"),
             },
             Self::RetriesExhausted {
                 attempts,
                 last_error,
-            } => write!(
-                f,
-                "nanogpt api failed after {attempts} attempts: {last_error}"
-            ),
+            } => write!(f, "api failed after {attempts} attempts: {last_error}"),
             Self::InvalidSseFrame(message) => write!(f, "invalid sse frame: {message}"),
             Self::BackoffOverflow {
                 attempt,

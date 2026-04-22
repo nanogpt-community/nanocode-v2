@@ -18,6 +18,11 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_SYNTHETIC_MODELS_URL: &str = "https://api.synthetic.new/openai/v1/models";
 const DEFAULT_VISIBLE_ROWS: usize = 14;
+const AVAILABLE_SERVICES: [ApiService; 3] = [
+    ApiService::NanoGpt,
+    ApiService::Synthetic,
+    ApiService::OpencodeGo,
+];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelState {
@@ -63,7 +68,7 @@ pub fn load_model_state() -> Result<ModelState, Box<dyn std::error::Error>> {
 }
 
 pub fn save_model_state(state: &ModelState) -> Result<(), Box<dyn std::error::Error>> {
-    let config_home = nanocode_config_home()?;
+    let config_home = pebble_config_home()?;
     fs::create_dir_all(&config_home)?;
     let path = state_path()?;
     fs::write(&path, serde_json::to_string_pretty(state)?)?;
@@ -94,8 +99,11 @@ pub fn current_service_or_default() -> ApiService {
 }
 
 pub fn infer_service_for_model(model: &str) -> ApiService {
-    if model.trim().starts_with("hf:") {
+    let trimmed = model.trim();
+    if trimmed.starts_with("hf:") {
         ApiService::Synthetic
+    } else if trimmed.starts_with("opencode-go/") {
+        ApiService::OpencodeGo
     } else {
         ApiService::NanoGpt
     }
@@ -183,7 +191,7 @@ pub fn open_model_picker() -> Result<ModelSelection, Box<dyn std::error::Error>>
             .collect::<Vec<_>>(),
     );
     if models.is_empty() {
-        return Err("no models were returned by NanoCode providers".into());
+        return Err("no models were returned by Pebble providers".into());
     }
 
     let selection = interactive_model_picker(&models, &mut state)?;
@@ -276,6 +284,7 @@ fn fetch_all_sorted_models(
 ) -> Result<Vec<CatalogModel>, Box<dyn std::error::Error>> {
     let mut models = fetch_service_models(ApiService::NanoGpt)?;
     models.extend(fetch_service_models(ApiService::Synthetic)?);
+    models.extend(fetch_service_models(ApiService::OpencodeGo)?);
     models.sort_by(|left, right| compare_models(left, right, state));
     Ok(models)
 }
@@ -295,6 +304,7 @@ fn fetch_service_models(
                 .collect())
         }
         ApiService::Synthetic => fetch_synthetic_models(),
+        ApiService::OpencodeGo => Ok(opencode_go_models()),
     }
 }
 
@@ -372,6 +382,45 @@ fn synthetic_capabilities(features: Option<&[String]>) -> Option<ModelCapabiliti
         structured_output: Some(contains("structured_outputs") || contains("json_mode")),
         pdf_upload: None,
     })
+}
+
+fn opencode_go_models() -> Vec<CatalogModel> {
+    [
+        ("glm-5", "GLM 5"),
+        ("glm-5.1", "GLM 5.1"),
+        ("kimi-k2.5", "Kimi K2.5"),
+        ("kimi-k2.6", "Kimi K2.6"),
+        ("mimo-v2-pro", "MiMo V2 Pro"),
+        ("mimo-v2-omni", "MiMo V2 Omni"),
+        ("minimax-m2.5", "MiniMax M2.5"),
+        ("minimax-m2.7", "MiniMax M2.7"),
+        ("qwen3.5-plus", "Qwen3.5 Plus"),
+        ("qwen3.6-plus", "Qwen3.6 Plus"),
+    ]
+    .into_iter()
+    .map(|(id, name)| CatalogModel {
+        service: ApiService::OpencodeGo,
+        info: ModelInfo {
+            id: format!("opencode-go/{id}"),
+            object: "model".to_string(),
+            created: 0,
+            owned_by: "opencode-go".to_string(),
+            name: Some(name.to_string()),
+            description: Some(
+                "Curated OpenCode Go model. The available list is sourced from the OpenCode Go docs."
+                    .to_string(),
+            ),
+            context_length: None,
+            max_output_tokens: None,
+            pricing: None,
+            capabilities: None,
+            category: Some("OpenCode Go".to_string()),
+            cost_estimate: None,
+            tags: None,
+            supports_provider_selection: Some(false),
+        },
+    })
+    .collect()
 }
 
 fn update_output_token_cache(state: &mut ModelState, models: &[ModelInfo]) {
@@ -952,10 +1001,14 @@ fn draw_model_picker(
         stdout,
         &fit_line(
             &format!(
-                "Service: {}    Tabs: {}  {}",
+                "Service: {}    Tabs: {}",
                 current_service.display_name(),
-                service_tab_label(ApiService::NanoGpt, current_service),
-                service_tab_label(ApiService::Synthetic, current_service),
+                AVAILABLE_SERVICES
+                    .iter()
+                    .copied()
+                    .map(|service| service_tab_label(service, current_service))
+                    .collect::<Vec<_>>()
+                    .join("  "),
             ),
             content_width,
         ),
@@ -1048,12 +1101,16 @@ fn draw_model_picker(
 }
 
 fn cycle_service(current: ApiService, forward: bool) -> ApiService {
-    match (current, forward) {
-        (ApiService::NanoGpt, true) => ApiService::Synthetic,
-        (ApiService::Synthetic, true) => ApiService::NanoGpt,
-        (ApiService::NanoGpt, false) => ApiService::Synthetic,
-        (ApiService::Synthetic, false) => ApiService::NanoGpt,
-    }
+    let current_index = AVAILABLE_SERVICES
+        .iter()
+        .position(|service| *service == current)
+        .unwrap_or(0);
+    let offset = if forward {
+        1
+    } else {
+        AVAILABLE_SERVICES.len().saturating_sub(1)
+    };
+    AVAILABLE_SERVICES[(current_index + offset) % AVAILABLE_SERVICES.len()]
 }
 
 fn service_tab_label(service: ApiService, current: ApiService) -> String {
@@ -1366,16 +1423,16 @@ fn toggle_favorite(model_id: &str, state: &mut ModelState) {
 }
 
 fn state_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    Ok(nanocode_config_home()?.join("state.json"))
+    Ok(pebble_config_home()?.join("state.json"))
 }
 
-fn nanocode_config_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    if let Some(path) = env::var_os("NANOCODE_CONFIG_HOME") {
+fn pebble_config_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if let Some(path) = env::var_os("PEBBLE_CONFIG_HOME") {
         return Ok(PathBuf::from(path));
     }
     match env::var_os("HOME") {
-        Some(home) => Ok(PathBuf::from(home).join(".nanocode")),
-        None => Err("could not resolve NANOCODE_CONFIG_HOME or HOME".into()),
+        Some(home) => Ok(PathBuf::from(home).join(".pebble")),
+        None => Err("could not resolve PEBBLE_CONFIG_HOME or HOME".into()),
     }
 }
 
@@ -1384,8 +1441,8 @@ mod tests {
     use api::{ApiService, ModelInfo};
 
     use super::{
-        filtered_model_indices, toggle_favorite, update_output_token_cache, CatalogModel,
-        ModelState,
+        filtered_model_indices, infer_service_for_model, toggle_favorite,
+        update_output_token_cache, CatalogModel, ModelState,
     };
 
     #[test]
@@ -1429,6 +1486,14 @@ mod tests {
         assert_eq!(
             filtered_model_indices(&models, ApiService::NanoGpt, "gm51"),
             vec![0]
+        );
+    }
+
+    #[test]
+    fn infers_opencode_go_service_from_model_prefix() {
+        assert_eq!(
+            infer_service_for_model("opencode-go/glm-5.1"),
+            ApiService::OpencodeGo
         );
     }
 

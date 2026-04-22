@@ -13,7 +13,7 @@ use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 200_000;
-const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "NANOCODE_AUTO_COMPACT_INPUT_TOKENS";
+const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "PEBBLE_AUTO_COMPACT_INPUT_TOKENS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {

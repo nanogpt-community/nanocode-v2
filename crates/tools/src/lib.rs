@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use api::{
-    resolve_api_key_for, resolve_root_url_for, ApiService, InputContentBlock, InputMessage,
-    MessageRequest, NanoGptClient, OutputContentBlock, ToolChoice, ToolDefinition,
+    ApiService, InputContentBlock, InputMessage, MessageRequest, NanoGptClient, OutputContentBlock,
+    ToolChoice, ToolDefinition,
 };
 use plugins::{PluginManager, PluginManagerConfig, PluginTool};
 use reqwest::blocking::Client;
@@ -662,7 +663,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Config",
-            description: "Get or set NanoCode settings.",
+            description: "Get or set Pebble settings.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -895,10 +896,6 @@ struct WebSearchInput {
     query: String,
     provider: Option<String>,
     depth: Option<String>,
-    #[serde(rename = "outputType")]
-    output_type: Option<String>,
-    #[serde(rename = "includeImages")]
-    include_images: Option<bool>,
     #[serde(rename = "fromDate")]
     from_date: Option<String>,
     #[serde(rename = "toDate")]
@@ -1233,99 +1230,52 @@ struct WebScrapeSummary {
     stealth_mode_used: Option<bool>,
 }
 
+#[derive(Debug, Clone)]
+struct WebToolsConfig {
+    api_key: String,
+    base_url: String,
+}
+
 #[derive(Debug, Serialize)]
-struct NanoGptWebSearchRequest {
+#[serde(rename_all = "camelCase")]
+struct ExaSearchRequest {
     query: String,
+    #[serde(rename = "type")]
+    search_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    provider: Option<String>,
+    num_results: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    depth: Option<String>,
-    #[serde(rename = "outputType", skip_serializing_if = "Option::is_none")]
-    output_type: Option<String>,
-    #[serde(
-        rename = "structuredOutputSchema",
-        skip_serializing_if = "Option::is_none"
-    )]
-    structured_output_schema: Option<String>,
-    #[serde(rename = "includeImages", skip_serializing_if = "Option::is_none")]
-    include_images: Option<bool>,
-    #[serde(rename = "fromDate", skip_serializing_if = "Option::is_none")]
-    from_date: Option<String>,
-    #[serde(rename = "toDate", skip_serializing_if = "Option::is_none")]
-    to_date: Option<String>,
-    #[serde(rename = "includeDomains", skip_serializing_if = "Option::is_none")]
     include_domains: Option<Vec<String>>,
-    #[serde(rename = "excludeDomains", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     exclude_domains: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NanoGptWebSearchResponse {
-    data: Value,
-    metadata: NanoGptWebSearchMetadata,
-}
-
-#[derive(Debug, Deserialize)]
-struct NanoGptWebSearchMetadata {
-    query: String,
-    provider: String,
-    depth: String,
-    #[serde(rename = "outputType")]
-    output_type: String,
-    cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_published_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end_published_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contents: Option<ExaSearchContents>,
 }
 
 #[derive(Debug, Serialize)]
-struct NanoGptWebScrapeRequest {
+#[serde(rename_all = "camelCase")]
+struct ExaSearchContents {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    highlights: Option<ExaHighlightsConfig>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExaHighlightsConfig {
+    max_characters: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExaContentsRequest {
     urls: Vec<String>,
-    #[serde(rename = "stealthMode", skip_serializing_if = "Option::is_none")]
-    stealth_mode: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NanoGptWebScrapeResponse {
-    results: Vec<NanoGptWebScrapeResult>,
-    summary: NanoGptWebScrapeSummary,
-}
-
-#[derive(Debug, Deserialize)]
-struct NanoGptWebScrapeResult {
-    url: String,
-    success: bool,
-    title: Option<String>,
-    content: Option<String>,
-    markdown: Option<String>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct NanoGptWebScrapeSummary {
-    requested: u64,
-    processed: u64,
-    successful: u64,
-    failed: u64,
-    #[serde(rename = "totalCost")]
-    total_cost: Option<f64>,
-    #[serde(rename = "stealthModeUsed")]
-    stealth_mode_used: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct SyntheticSearchRequest {
-    query: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct SyntheticSearchResponse {
-    results: Vec<SyntheticSearchResult>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SyntheticSearchResult {
-    url: String,
-    title: Option<String>,
-    text: Option<String>,
-    published: Option<String>,
+    text: bool,
 }
 
 fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
@@ -1363,88 +1313,38 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
 }
 
 fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
-    match active_backend_service() {
-        ApiService::NanoGpt => execute_nanogpt_web_search(input),
-        ApiService::Synthetic => execute_synthetic_web_search(input),
-    }
-}
-
-fn execute_nanogpt_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
     let started = Instant::now();
     let client = build_http_client()?;
-    let api_key = resolve_api_key_for(ApiService::NanoGpt).map_err(|error| error.to_string())?;
-    let request = NanoGptWebSearchRequest {
+    let config = resolve_web_tools_config()?;
+    let request = ExaSearchRequest {
         query: input.query.clone(),
-        provider: input.provider.clone(),
-        depth: input.depth.clone(),
-        output_type: input.output_type.clone(),
-        structured_output_schema: input.structured_output_schema.clone(),
-        include_images: input.include_images,
-        from_date: input.from_date.clone(),
-        to_date: input.to_date.clone(),
-        include_domains: input.allowed_domains.clone(),
-        exclude_domains: input.blocked_domains.clone(),
+        search_type: exa_search_type(input),
+        num_results: Some(10),
+        include_domains: normalize_domain_filters(input.allowed_domains.as_deref()),
+        exclude_domains: normalize_domain_filters(input.blocked_domains.as_deref()),
+        start_published_date: input.from_date.clone(),
+        end_published_date: input.to_date.clone(),
+        output_schema: parse_structured_output_schema(input.structured_output_schema.as_deref())?,
+        contents: Some(ExaSearchContents {
+            highlights: Some(ExaHighlightsConfig {
+                max_characters: 4_000,
+            }),
+        }),
     };
-    let response = client
-        .post(nanogpt_web_search_url()?)
+    let payload = client
+        .post(exa_search_url(&config)?)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header("authorization", format!("Bearer {api_key}"))
-        .header("x-api-key", &api_key)
+        .header("x-api-key", &config.api_key)
         .json(&request)
         .send()
         .map_err(|error| error.to_string())?;
-    let response = response
-        .error_for_status()
-        .map_err(|error| error.to_string())?;
-    let payload = response
-        .json::<NanoGptWebSearchResponse>()
-        .map_err(|error| error.to_string())?;
-    let hits = extract_nanogpt_search_hits(&payload.data);
-
-    let summary = summarize_nanogpt_web_search(&payload, &hits);
-
-    Ok(WebSearchOutput {
-        query: payload.metadata.query,
-        results: vec![
-            WebSearchResultItem::Commentary(summary),
-            WebSearchResultItem::SearchResult {
-                tool_use_id: String::from("web_search_1"),
-                content: hits,
-            },
-        ],
-        duration_seconds: started.elapsed().as_secs_f64(),
-    })
-}
-
-fn execute_synthetic_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
-    let started = Instant::now();
-    let client = build_http_client()?;
-    let api_key = resolve_api_key_for(ApiService::Synthetic).map_err(|error| error.to_string())?;
-    let url = synthetic_web_search_url()?;
-    let payload = client
-        .post(url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .bearer_auth(api_key)
-        .json(&SyntheticSearchRequest {
-            query: input.query.clone(),
-        })
-        .send()
-        .map_err(|error| error.to_string())?
+    let payload = payload
         .error_for_status()
         .map_err(|error| error.to_string())?
-        .json::<SyntheticSearchResponse>()
+        .json::<Value>()
         .map_err(|error| error.to_string())?;
-
-    let hits = payload
-        .results
-        .iter()
-        .map(|result| SearchHit {
-            title: result.title.clone().unwrap_or_else(|| result.url.clone()),
-            url: result.url.clone(),
-        })
-        .collect::<Vec<_>>();
-
-    let summary = summarize_synthetic_search(&payload.results);
+    let hits = extract_exa_search_hits(&payload);
+    let summary = summarize_exa_search(input, &payload, &hits);
 
     Ok(WebSearchOutput {
         query: input.query.clone(),
@@ -1473,80 +1373,223 @@ fn execute_web_scrape(input: &WebScrapeInput) -> Result<WebScrapeOutput, String>
 
     let started = Instant::now();
     let client = build_http_client()?;
-    let api_key = resolve_api_key_for(ApiService::NanoGpt).map_err(|error| error.to_string())?;
-    let response = client
-        .post(nanogpt_web_scrape_url()?)
+    let config = resolve_web_tools_config()?;
+    let payload = client
+        .post(exa_contents_url(&config)?)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header("authorization", format!("Bearer {api_key}"))
-        .header("x-api-key", &api_key)
-        .json(&NanoGptWebScrapeRequest {
+        .header("x-api-key", &config.api_key)
+        .json(&ExaContentsRequest {
             urls: input.urls.clone(),
-            stealth_mode: input.stealth_mode,
+            text: true,
         })
         .send()
-        .map_err(|error| error.to_string())?;
-    let payload = response
+        .map_err(|error| error.to_string())?
         .error_for_status()
         .map_err(|error| error.to_string())?
-        .json::<NanoGptWebScrapeResponse>()
+        .json::<Value>()
         .map_err(|error| error.to_string())?;
+    let results = payload
+        .get("results")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let processed = results.len() as u64;
+    let successful = results
+        .iter()
+        .filter(|result| result.get("error").is_none())
+        .count() as u64;
+    let failed = processed.saturating_sub(successful);
 
     Ok(WebScrapeOutput {
-        results: payload
-            .results
+        results: results
             .into_iter()
             .map(|result| WebScrapeResultItem {
-                url: result.url,
-                success: result.success,
-                title: result.title,
-                content: result.content,
-                markdown: result.markdown,
-                error: result.error,
+                url: result
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                success: result.get("error").is_none(),
+                title: result
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                content: result
+                    .get("text")
+                    .or_else(|| result.get("summary"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                markdown: result
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                error: result
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
             })
             .collect(),
         summary: WebScrapeSummary {
-            requested: payload.summary.requested,
-            processed: payload.summary.processed,
-            successful: payload.summary.successful,
-            failed: payload.summary.failed,
-            total_cost: payload.summary.total_cost,
-            stealth_mode_used: payload.summary.stealth_mode_used,
+            requested: input.urls.len() as u64,
+            processed,
+            successful,
+            failed,
+            total_cost: payload
+                .get("costDollars")
+                .and_then(|value| value.get("total"))
+                .and_then(Value::as_f64),
+            stealth_mode_used: input.stealth_mode,
         },
         duration_seconds: started.elapsed().as_secs_f64(),
     })
 }
 
-fn nanogpt_web_search_url() -> Result<String, String> {
-    let url = format!(
-        "{}/api/web",
-        resolve_root_url_for(ApiService::NanoGpt).trim_end_matches('/')
-    );
+fn exa_search_url(config: &WebToolsConfig) -> Result<String, String> {
+    let url = format!("{}/search", config.base_url.trim_end_matches('/'));
     reqwest::Url::parse(&url).map_err(|error| error.to_string())?;
     Ok(url)
 }
 
-fn nanogpt_web_scrape_url() -> Result<String, String> {
-    let url = format!(
-        "{}/api/scrape-urls",
-        resolve_root_url_for(ApiService::NanoGpt).trim_end_matches('/')
-    );
+fn exa_contents_url(config: &WebToolsConfig) -> Result<String, String> {
+    let url = format!("{}/contents", config.base_url.trim_end_matches('/'));
     reqwest::Url::parse(&url).map_err(|error| error.to_string())?;
     Ok(url)
 }
 
-fn synthetic_web_search_url() -> Result<String, String> {
-    let url = format!(
-        "{}/v2/search",
-        resolve_root_url_for(ApiService::Synthetic).trim_end_matches('/')
-    );
-    reqwest::Url::parse(&url).map_err(|error| error.to_string())?;
-    Ok(url)
+fn resolve_web_tools_config() -> Result<WebToolsConfig, String> {
+    let api_key = std::env::var("EXA_API_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(read_exa_api_key_from_credentials_file)
+        .ok_or_else(|| {
+            "missing Exa API key; set EXA_API_KEY or save credentials with `/login exa`".to_string()
+        })?;
+    let base_url =
+        std::env::var("EXA_BASE_URL").unwrap_or_else(|_| "https://api.exa.ai".to_string());
+    Ok(WebToolsConfig { api_key, base_url })
 }
 
-fn active_backend_service() -> ApiService {
-    *active_backend_service_cell()
-        .lock()
-        .expect("active backend service lock should not be poisoned")
+fn read_exa_api_key_from_credentials_file() -> Option<String> {
+    let config_home = std::env::var_os("PEBBLE_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pebble")))?;
+    let contents = fs::read_to_string(config_home.join("credentials.json")).ok()?;
+    let parsed = serde_json::from_str::<Value>(&contents).ok()?;
+    parsed
+        .get("exa_api_key")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn exa_search_type(input: &WebSearchInput) -> String {
+    let requested = input
+        .depth
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase());
+    if requested
+        .as_deref()
+        .is_some_and(|value| matches!(value, "deep" | "deeper" | "deep-lite" | "deep-reasoning"))
+        || input.structured_output_schema.is_some()
+    {
+        "deep".to_string()
+    } else {
+        "auto".to_string()
+    }
+}
+
+fn parse_structured_output_schema(value: Option<&str>) -> Result<Option<Value>, String> {
+    let Some(value) = value.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    serde_json::from_str(value)
+        .map(Some)
+        .map_err(|error| format!("invalid structuredOutputSchema JSON: {error}"))
+}
+
+fn normalize_domain_filters(values: Option<&[String]>) -> Option<Vec<String>> {
+    let normalized = values
+        .into_iter()
+        .flatten()
+        .filter_map(|value| normalize_domain(value))
+        .collect::<Vec<_>>();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn normalize_domain(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let candidate = if trimmed.contains("://") {
+        reqwest::Url::parse(trimmed)
+            .ok()
+            .and_then(|url| url.host_str().map(ToOwned::to_owned))
+    } else {
+        Some(
+            trimmed
+                .trim_start_matches('.')
+                .trim_end_matches('/')
+                .to_ascii_lowercase(),
+        )
+    }?;
+    if candidate.is_empty() {
+        None
+    } else {
+        Some(candidate)
+    }
+}
+
+fn extract_exa_search_hits(payload: &Value) -> Vec<SearchHit> {
+    payload
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|result| {
+            let url = result.get("url").and_then(Value::as_str)?.to_string();
+            let title = result
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or(url.as_str())
+                .to_string();
+            Some(SearchHit { title, url })
+        })
+        .collect()
+}
+
+fn summarize_exa_search(input: &WebSearchInput, payload: &Value, hits: &[SearchHit]) -> String {
+    let search_type = payload
+        .get("searchType")
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
+    let cost = payload
+        .get("costDollars")
+        .and_then(|value| value.get("total"))
+        .and_then(Value::as_f64);
+    let output_content = payload
+        .get("output")
+        .and_then(|value| value.get("content"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::trim)
+        .map(ToOwned::to_owned);
+    let mut summary = format!(
+        "Exa web search ({search_type}) returned {} result{}.",
+        hits.len(),
+        if hits.len() == 1 { "" } else { "s" }
+    );
+    if let Some(cost) = cost {
+        summary.push_str(&format!(" Estimated cost: ${cost:.4}."));
+    }
+    if input.provider.is_some() {
+        summary.push_str(" The legacy provider field was ignored.");
+    }
+    if let Some(output_content) = output_content {
+        summary.push_str("\n\n");
+        summary.push_str(&output_content);
+    }
+    summary
 }
 
 fn build_http_client() -> Result<Client, String> {
@@ -1682,113 +1725,6 @@ fn preview_text(input: &str, max_chars: usize) -> String {
     format!("{}…", shortened.trim_end())
 }
 
-fn extract_nanogpt_search_hits(data: &Value) -> Vec<SearchHit> {
-    let Some(items) = data.as_array() else {
-        return Vec::new();
-    };
-    let mut hits = Vec::new();
-    let mut seen = BTreeSet::new();
-    for item in items {
-        let Some(url) = item
-            .get("url")
-            .or_else(|| item.get("link"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        let title = item
-            .get("title")
-            .or_else(|| item.get("name"))
-            .or_else(|| item.get("headline"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(url);
-        if seen.insert(url.to_string()) {
-            hits.push(SearchHit {
-                title: title.to_string(),
-                url: url.to_string(),
-            });
-        }
-    }
-    hits.truncate(8);
-    hits
-}
-
-fn summarize_nanogpt_web_search(payload: &NanoGptWebSearchResponse, hits: &[SearchHit]) -> String {
-    let metadata = &payload.metadata;
-    if !hits.is_empty() {
-        let rendered_hits = hits
-            .iter()
-            .map(|hit| format!("- [{}]({})", hit.title, hit.url))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut summary = format!(
-            "Search results for {:?} via {} (depth: {}, output: {}). Include a Sources section in the final answer.\n{}",
-            metadata.query, metadata.provider, metadata.depth, metadata.output_type, rendered_hits
-        );
-        if let Some(cost) = metadata.cost {
-            summary.push_str(&format!("\nEstimated search cost: ${cost:.4}"));
-        }
-        return summary;
-    }
-
-    let rendered = match &payload.data {
-        Value::String(text) => text.trim().to_string(),
-        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
-    };
-    let mut summary = format!(
-        "Web search for {:?} via {} (depth: {}, output: {}). Include citations from the provider response in the final answer.\n{}",
-        metadata.query,
-        metadata.provider,
-        metadata.depth,
-        metadata.output_type,
-        preview_text(&collapse_whitespace(&rendered), 1600)
-    );
-    if let Some(cost) = metadata.cost {
-        summary.push_str(&format!("\nEstimated search cost: ${cost:.4}"));
-    }
-    summary
-}
-
-fn summarize_synthetic_search(results: &[SyntheticSearchResult]) -> String {
-    if results.is_empty() {
-        return "Synthetic web search returned no results.".to_string();
-    }
-
-    let rendered_hits = results
-        .iter()
-        .take(8)
-        .map(|hit| {
-            let title = hit
-                .title
-                .as_deref()
-                .filter(|title| !title.is_empty())
-                .unwrap_or(&hit.url);
-            let snippet = hit
-                .text
-                .as_deref()
-                .map(|text| preview_text(&collapse_whitespace(text), 160))
-                .unwrap_or_default();
-            let published = hit
-                .published
-                .as_deref()
-                .map(|value| format!(" published={value}"))
-                .unwrap_or_default();
-            format!("- [{}]({}){} {}", title, hit.url, published, snippet)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    format!(
-        "Synthetic web search returned {} result(s). Include a Sources section in the final answer.\n{}",
-        results.len(),
-        rendered_hits
-    )
-}
-
 fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> {
     validate_todos(&input.todos)?;
     let store_path = todo_store_path()?;
@@ -1868,14 +1804,14 @@ fn validate_todos(todos: &[TodoItem]) -> Result<(), String> {
 }
 
 fn todo_store_path() -> Result<std::path::PathBuf, String> {
-    if let Ok(path) = std::env::var("NANOCODE_TODO_STORE") {
+    if let Ok(path) = std::env::var("PEBBLE_TODO_STORE") {
         return Ok(std::path::PathBuf::from(path));
     }
     if let Ok(path) = std::env::var("CLAWD_TODO_STORE") {
         return Ok(std::path::PathBuf::from(path));
     }
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    Ok(cwd.join(".nanocode").join("todos.md"))
+    Ok(cwd.join(".pebble").join("todos.md"))
 }
 
 fn render_todo_markdown(todos: &[TodoItem]) -> String {
@@ -2121,7 +2057,7 @@ fn render_agent_output(output: &AgentOutput) -> String {
 }
 
 fn current_agent_depth() -> Result<usize, String> {
-    std::env::var("NANOCODE_AGENT_DEPTH")
+    std::env::var("PEBBLE_AGENT_DEPTH")
         .ok()
         .or_else(|| std::env::var("CLAWD_AGENT_DEPTH").ok())
         .map(|value| {
@@ -2134,22 +2070,22 @@ fn current_agent_depth() -> Result<usize, String> {
 }
 
 fn with_agent_depth<T>(depth: usize, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    let previous = std::env::var("NANOCODE_AGENT_DEPTH")
+    let previous = std::env::var("PEBBLE_AGENT_DEPTH")
         .ok()
         .or_else(|| std::env::var("CLAWD_AGENT_DEPTH").ok());
-    std::env::set_var("NANOCODE_AGENT_DEPTH", depth.to_string());
+    std::env::set_var("PEBBLE_AGENT_DEPTH", depth.to_string());
     let result = f();
     if let Some(previous) = previous {
-        std::env::set_var("NANOCODE_AGENT_DEPTH", previous);
+        std::env::set_var("PEBBLE_AGENT_DEPTH", previous);
     } else {
-        std::env::remove_var("NANOCODE_AGENT_DEPTH");
+        std::env::remove_var("PEBBLE_AGENT_DEPTH");
     }
     std::env::remove_var("CLAWD_AGENT_DEPTH");
     result
 }
 
 fn agent_default_model() -> Option<String> {
-    std::env::var("NANOCODE_MODEL")
+    std::env::var("PEBBLE_MODEL")
         .ok()
         .or_else(|| std::env::var("CLAWD_MODEL").ok())
         .filter(|value| !value.trim().is_empty())
@@ -2161,7 +2097,7 @@ fn default_agent_model() -> String {
 
 fn build_agent_system_prompt() -> Result<Vec<String>, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let date = std::env::var("NANOCODE_CURRENT_DATE")
+    let date = std::env::var("PEBBLE_CURRENT_DATE")
         .or_else(|_| std::env::var("CLAWD_CURRENT_DATE"))
         .unwrap_or_else(|_| String::from("2026-04-01"));
     load_system_prompt(cwd, &date, std::env::consts::OS, "unknown")
@@ -2193,7 +2129,7 @@ impl ToolExecutor for AgentToolExecutor {
 
 enum AgentApiClient {
     Scripted(ScriptedAgentApiClient),
-    NanoGpt(NanoCodeAgentApiClient),
+    NanoGpt(PebbleAgentApiClient),
 }
 
 impl ApiClient for AgentApiClient {
@@ -2205,14 +2141,14 @@ impl ApiClient for AgentApiClient {
     }
 }
 
-struct NanoCodeAgentApiClient {
+struct PebbleAgentApiClient {
     runtime: tokio::runtime::Runtime,
     client: NanoGptClient,
     model: String,
     tool_registry: GlobalToolRegistry,
 }
 
-impl NanoCodeAgentApiClient {
+impl PebbleAgentApiClient {
     fn new(model: String, tool_registry: GlobalToolRegistry) -> Result<Self, String> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
@@ -2223,7 +2159,7 @@ impl NanoCodeAgentApiClient {
     }
 }
 
-impl ApiClient for NanoCodeAgentApiClient {
+impl ApiClient for PebbleAgentApiClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let message_request = MessageRequest {
             model: self.model.clone(),
@@ -2251,7 +2187,7 @@ fn build_agent_api_client(
     model: String,
     tool_registry: GlobalToolRegistry,
 ) -> Result<AgentApiClient, String> {
-    if let Some(script) = std::env::var("NANOCODE_AGENT_TEST_SCRIPT")
+    if let Some(script) = std::env::var("PEBBLE_AGENT_TEST_SCRIPT")
         .ok()
         .or_else(|| std::env::var("CLAWD_AGENT_TEST_SCRIPT").ok())
         .filter(|value| !value.trim().is_empty())
@@ -2260,7 +2196,7 @@ fn build_agent_api_client(
             &script,
         )?));
     }
-    Ok(AgentApiClient::NanoGpt(NanoCodeAgentApiClient::new(
+    Ok(AgentApiClient::NanoGpt(PebbleAgentApiClient::new(
         model,
         tool_registry,
     )?))
@@ -2362,6 +2298,8 @@ fn convert_agent_messages(messages: &[ConversationMessage]) -> Vec<InputMessage>
             (!content.is_empty()).then(|| InputMessage {
                 role: role.to_string(),
                 content,
+                reasoning_content: None,
+                reasoning: None,
             })
         })
         .collect()
@@ -2572,7 +2510,7 @@ fn canonical_tool_token(value: &str) -> String {
 }
 
 fn agent_store_dir() -> Result<std::path::PathBuf, String> {
-    if let Ok(path) = std::env::var("NANOCODE_AGENT_STORE") {
+    if let Ok(path) = std::env::var("PEBBLE_AGENT_STORE") {
         return Ok(std::path::PathBuf::from(path));
     }
     if let Ok(path) = std::env::var("CLAWD_AGENT_STORE") {
@@ -2580,9 +2518,9 @@ fn agent_store_dir() -> Result<std::path::PathBuf, String> {
     }
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     if let Some(workspace_root) = cwd.ancestors().nth(2) {
-        return Ok(workspace_root.join(".nanocode").join("agents"));
+        return Ok(workspace_root.join(".pebble").join("agents"));
     }
-    Ok(cwd.join(".nanocode").join("agents"))
+    Ok(cwd.join(".pebble").join("agents"))
 }
 
 fn make_agent_id() -> String {
@@ -3123,16 +3061,16 @@ fn config_file_for_scope(scope: ConfigScope) -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
     Ok(match scope {
         ConfigScope::Global => config_home_dir()?.join("settings.json"),
-        ConfigScope::Settings => cwd.join(".nanocode").join("settings.local.json"),
+        ConfigScope::Settings => cwd.join(".pebble").join("settings.local.json"),
     })
 }
 
 fn config_home_dir() -> Result<PathBuf, String> {
-    if let Ok(path) = std::env::var("NANOCODE_CONFIG_HOME") {
+    if let Ok(path) = std::env::var("PEBBLE_CONFIG_HOME") {
         return Ok(PathBuf::from(path));
     }
     let home = std::env::var("HOME").map_err(|_| String::from("HOME is not set"))?;
-    Ok(PathBuf::from(home).join(".nanocode"))
+    Ok(PathBuf::from(home).join(".pebble"))
 }
 
 fn read_json_object(path: &Path) -> Result<serde_json::Map<String, Value>, String> {
@@ -3563,31 +3501,25 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
-            assert!(request_line.starts_with("POST /api/web "));
+            assert!(request_line.starts_with("POST /search "));
             HttpResponse::json(
                 200,
                 "OK",
                 r#"
                 {
-                  "data": [
+                  "results": [
                     { "title": "Reqwest docs", "url": "https://docs.rs/reqwest" },
                     { "title": "Tokio docs", "url": "https://docs.rs/tokio" }
                   ],
-                  "metadata": {
-                    "query": "rust web search",
-                    "provider": "linkup",
-                    "depth": "deep",
-                    "outputType": "searchResults",
-                    "timestamp": "2026-04-01T00:00:00Z",
-                    "cost": 0.06
-                  }
+                  "searchType": "deep",
+                  "costDollars": { "total": 0.06 }
                 }
                 "#,
             )
         }));
 
-        std::env::set_var("NANOGPT_API_KEY", "test-key");
-        std::env::set_var("NANOGPT_BASE_URL", format!("http://{}", server.addr()));
+        std::env::set_var("EXA_API_KEY", "test-key");
+        std::env::set_var("EXA_BASE_URL", format!("http://{}", server.addr()));
         let result = execute_tool(
             "WebSearch",
             &json!({
@@ -3600,15 +3532,15 @@ mod tests {
             }),
         )
         .expect("WebSearch should succeed");
-        std::env::remove_var("NANOGPT_API_KEY");
-        std::env::remove_var("NANOGPT_BASE_URL");
+        std::env::remove_var("EXA_API_KEY");
+        std::env::remove_var("EXA_BASE_URL");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["query"], "rust web search");
         let results = output["results"].as_array().expect("results array");
         let commentary = results[0].as_str().expect("commentary string");
-        assert!(commentary.contains("linkup"));
-        assert!(commentary.contains("depth: deep"));
+        assert!(commentary.contains("Exa web search (deep)"));
+        assert!(commentary.contains("legacy provider field was ignored"));
         assert!(commentary.contains("$0.0600"));
         let search_result = results
             .iter()
@@ -3626,33 +3558,26 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
-            assert!(request_line.starts_with("POST /api/web "));
+            assert!(request_line.starts_with("POST /search "));
             HttpResponse::json(
                 200,
                 "OK",
                 r#"
                 {
-                  "data": {
-                    "answer": "Rust is a systems programming language focused on safety.",
-                    "sources": [
-                      { "title": "The Rust Book", "url": "https://doc.rust-lang.org/book/" }
-                    ]
-                  },
-                  "metadata": {
-                    "query": "what is rust",
-                    "provider": "linkup",
-                    "depth": "standard",
-                    "outputType": "sourcedAnswer",
-                    "timestamp": "2026-04-01T00:00:00Z",
-                    "cost": 0.006
+                  "results": [
+                    { "title": "The Rust Book", "url": "https://doc.rust-lang.org/book/" }
+                  ],
+                  "searchType": "auto",
+                  "output": {
+                    "content": "Rust is a systems programming language focused on safety."
                   }
                 }
                 "#,
             )
         }));
 
-        std::env::set_var("NANOGPT_API_KEY", "test-key");
-        std::env::set_var("NANOGPT_BASE_URL", format!("http://{}", server.addr()));
+        std::env::set_var("EXA_API_KEY", "test-key");
+        std::env::set_var("EXA_BASE_URL", format!("http://{}", server.addr()));
         let result = execute_tool(
             "WebSearch",
             &json!({
@@ -3661,21 +3586,21 @@ mod tests {
             }),
         )
         .expect("WebSearch sourced answer parsing should succeed");
-        std::env::remove_var("NANOGPT_API_KEY");
-        std::env::remove_var("NANOGPT_BASE_URL");
+        std::env::remove_var("EXA_API_KEY");
+        std::env::remove_var("EXA_BASE_URL");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         let results = output["results"].as_array().expect("results array");
         let commentary = results[0].as_str().expect("commentary string");
-        assert!(commentary.contains("sourcedAnswer"));
+        assert!(commentary.contains("Exa web search (auto)"));
         assert!(commentary.contains("Rust is a systems programming language"));
 
-        std::env::set_var("NANOGPT_BASE_URL", "://bad-base-url");
-        std::env::set_var("NANOGPT_API_KEY", "test-key");
+        std::env::set_var("EXA_BASE_URL", "://bad-base-url");
+        std::env::set_var("EXA_API_KEY", "test-key");
         let error = execute_tool("WebSearch", &json!({ "query": "generic links" }))
             .expect_err("invalid base URL should fail");
-        std::env::remove_var("NANOGPT_BASE_URL");
-        std::env::remove_var("NANOGPT_API_KEY");
+        std::env::remove_var("EXA_BASE_URL");
+        std::env::remove_var("EXA_API_KEY");
         assert!(error.contains("relative URL without a base") || error.contains("empty host"));
     }
 
@@ -3685,7 +3610,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
-            assert!(request_line.starts_with("POST /api/scrape-urls "));
+            assert!(request_line.starts_with("POST /contents "));
             HttpResponse::json(
                 200,
                 "OK",
@@ -3694,27 +3619,18 @@ mod tests {
                   "results": [
                     {
                       "url": "https://example.com/article",
-                      "success": true,
                       "title": "Example Article",
-                      "content": "<html>raw</html>",
-                      "markdown": "# Example Article\n\nBody text."
+                      "text": "# Example Article\n\nBody text."
                     }
                   ],
-                  "summary": {
-                    "requested": 1,
-                    "processed": 1,
-                    "successful": 1,
-                    "failed": 0,
-                    "totalCost": 0.001,
-                    "stealthModeUsed": false
-                  }
+                  "costDollars": { "total": 0.001 }
                 }
                 "##,
             )
         }));
 
-        std::env::set_var("NANOGPT_API_KEY", "test-key");
-        std::env::set_var("NANOGPT_BASE_URL", format!("http://{}", server.addr()));
+        std::env::set_var("EXA_API_KEY", "test-key");
+        std::env::set_var("EXA_BASE_URL", format!("http://{}", server.addr()));
         let result = execute_tool(
             "WebScrape",
             &json!({
@@ -3723,8 +3639,8 @@ mod tests {
             }),
         )
         .expect("WebScrape should succeed");
-        std::env::remove_var("NANOGPT_API_KEY");
-        std::env::remove_var("NANOGPT_BASE_URL");
+        std::env::remove_var("EXA_API_KEY");
+        std::env::remove_var("EXA_BASE_URL");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
         assert_eq!(output["summary"]["requested"], 1);
@@ -3866,7 +3782,7 @@ mod tests {
     }
 
     #[test]
-    fn todo_write_persists_markdown_in_nanocode_directory() {
+    fn todo_write_persists_markdown_in_pebble_directory() {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3886,7 +3802,7 @@ mod tests {
         )
         .expect("TodoWrite should succeed");
 
-        let persisted = std::fs::read_to_string(temp.join(".nanocode").join("todos.md"))
+        let persisted = std::fs::read_to_string(temp.join(".pebble").join("todos.md"))
             .expect("todo markdown exists");
         std::env::set_current_dir(previous).expect("restore cwd");
         let _ = std::fs::remove_dir_all(temp);
@@ -3995,10 +3911,10 @@ mod tests {
         let dir = temp_path("agent-store");
         let config_home = temp_path("agent-config");
         std::fs::create_dir_all(&config_home).expect("config home should exist");
-        std::env::set_var("NANOCODE_AGENT_STORE", &dir);
-        std::env::set_var("NANOCODE_CONFIG_HOME", &config_home);
+        std::env::set_var("PEBBLE_AGENT_STORE", &dir);
+        std::env::set_var("PEBBLE_CONFIG_HOME", &config_home);
         std::env::set_var(
-            "NANOCODE_AGENT_TEST_SCRIPT",
+            "PEBBLE_AGENT_TEST_SCRIPT",
             serde_json::to_string(&vec![
                 vec![json!({
                     "type": "tool_use",
@@ -4045,7 +3961,7 @@ mod tests {
         assert!(manifest_contents.contains("\"subagentType\": \"Explore\""));
 
         std::env::set_var(
-            "NANOCODE_AGENT_TEST_SCRIPT",
+            "PEBBLE_AGENT_TEST_SCRIPT",
             serde_json::to_string(&vec![vec![json!({
                 "type": "text",
                 "text": "Normalized alias check."
@@ -4066,7 +3982,7 @@ mod tests {
         assert_eq!(normalized_output["subagentType"], "Explore");
 
         std::env::set_var(
-            "NANOCODE_AGENT_TEST_SCRIPT",
+            "PEBBLE_AGENT_TEST_SCRIPT",
             serde_json::to_string(&vec![vec![json!({
                 "type": "text",
                 "text": "Name normalization check."
@@ -4082,9 +3998,9 @@ mod tests {
             }),
         )
         .expect("Agent should normalize explicit names");
-        std::env::remove_var("NANOCODE_AGENT_TEST_SCRIPT");
-        std::env::remove_var("NANOCODE_AGENT_STORE");
-        std::env::remove_var("NANOCODE_CONFIG_HOME");
+        std::env::remove_var("PEBBLE_AGENT_TEST_SCRIPT");
+        std::env::remove_var("PEBBLE_AGENT_STORE");
+        std::env::remove_var("PEBBLE_CONFIG_HOME");
         let named_output: serde_json::Value = serde_json::from_str(&named).expect("valid json");
         assert_eq!(named_output["name"], "ship-audit");
         let _ = std::fs::remove_dir_all(dir);
@@ -4116,7 +4032,7 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("NANOCODE_AGENT_DEPTH", "1");
+        std::env::set_var("PEBBLE_AGENT_DEPTH", "1");
         let depth_error = execute_tool(
             "Agent",
             &json!({
@@ -4126,7 +4042,7 @@ mod tests {
             }),
         )
         .expect_err("max depth should fail");
-        std::env::remove_var("NANOCODE_AGENT_DEPTH");
+        std::env::remove_var("PEBBLE_AGENT_DEPTH");
         assert!(depth_error.contains("max_depth exceeded"));
     }
 
@@ -4523,7 +4439,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
-            "nanocode-config-{}",
+            "pebble-config-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time")
@@ -4531,19 +4447,19 @@ mod tests {
         ));
         let home = root.join("home");
         let cwd = root.join("cwd");
-        std::fs::create_dir_all(home.join(".nanocode")).expect("home dir");
-        std::fs::create_dir_all(cwd.join(".nanocode")).expect("cwd dir");
+        std::fs::create_dir_all(home.join(".pebble")).expect("home dir");
+        std::fs::create_dir_all(cwd.join(".pebble")).expect("cwd dir");
         std::fs::write(
-            home.join(".nanocode").join("settings.json"),
+            home.join(".pebble").join("settings.json"),
             r#"{"verbose":false}"#,
         )
         .expect("write global settings");
 
         let original_home = std::env::var("HOME").ok();
-        let original_nanocode_home = std::env::var("NANOCODE_CONFIG_HOME").ok();
+        let original_pebble_home = std::env::var("PEBBLE_CONFIG_HOME").ok();
         let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_var("HOME", &home);
-        std::env::remove_var("NANOCODE_CONFIG_HOME");
+        std::env::remove_var("PEBBLE_CONFIG_HOME");
         std::env::set_current_dir(&cwd).expect("set cwd");
 
         let get = execute_tool("Config", &json!({"setting": "verbose"})).expect("get config");
@@ -4576,9 +4492,9 @@ mod tests {
             Some(value) => std::env::set_var("HOME", value),
             None => std::env::remove_var("HOME"),
         }
-        match original_nanocode_home {
-            Some(value) => std::env::set_var("NANOCODE_CONFIG_HOME", value),
-            None => std::env::remove_var("NANOCODE_CONFIG_HOME"),
+        match original_pebble_home {
+            Some(value) => std::env::set_var("PEBBLE_CONFIG_HOME", value),
+            None => std::env::remove_var("PEBBLE_CONFIG_HOME"),
         }
         let _ = std::fs::remove_dir_all(root);
     }

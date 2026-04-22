@@ -29,7 +29,7 @@ pub use config::{
     McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpStdioStderrMode, McpTransport,
     McpWebSocketServerConfig, OAuthConfig, ResolvedPermissionMode, RuntimeConfig,
     RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig, ScopedMcpServerConfig,
-    NANOCODE_SETTINGS_SCHEMA_NAME,
+    PEBBLE_SETTINGS_SCHEMA_NAME,
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,

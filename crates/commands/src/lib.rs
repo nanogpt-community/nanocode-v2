@@ -38,11 +38,32 @@ impl CommandRegistry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashCommandCategory {
+    Core,
+    Session,
+    Workspace,
+    Repl,
+}
+
+impl SlashCommandCategory {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Core => "Core",
+            Self::Session => "Session",
+            Self::Workspace => "Workspace",
+            Self::Repl => "REPL",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlashCommandSpec {
     pub name: &'static str,
     pub aliases: &'static [&'static str],
     pub summary: &'static str,
     pub argument_hint: Option<&'static str>,
+    pub category: SlashCommandCategory,
+    pub detail: &'static str,
     pub resume_supported: bool,
 }
 
@@ -52,6 +73,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "Show available slash commands",
         argument_hint: None,
+        category: SlashCommandCategory::Core,
+        detail: "Use `/help <topic>` for focused guidance on auth, sessions, extensions, web tools, or vim mode.",
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -59,6 +82,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "Show current session status",
         argument_hint: None,
+        category: SlashCommandCategory::Core,
+        detail: "Shows model, service, permissions, runtime toggles, workspace context, MCP counts, and web tool readiness.",
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -66,6 +91,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "Compact local session history",
         argument_hint: None,
+        category: SlashCommandCategory::Session,
+        detail: "Condenses older messages into a resumable summary while keeping the active session usable.",
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -73,6 +100,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "Show or toggle extended thinking",
         argument_hint: Some("[on|off]"),
+        category: SlashCommandCategory::Core,
+        detail: "Without an argument, reports whether extended thinking is enabled for the current session.",
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -80,20 +109,26 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "Show or switch the active model",
         argument_hint: Some("[model]"),
+        category: SlashCommandCategory::Core,
+        detail: "With no argument, opens the model picker. Model IDs are service-qualified, e.g. `opencode-go/kimi-k2.6`.",
         resume_supported: false,
     },
     SlashCommandSpec {
         name: "mcp",
         aliases: &[],
         summary: "Inspect configured MCP servers or list exposed MCP tools",
-        argument_hint: Some("[status|tools|reload]"),
+        argument_hint: Some("[status|tools|reload|add <name>|enable <name>|disable <name>]"),
+        category: SlashCommandCategory::Workspace,
+        detail: "Use `/mcp add <name>` to scaffold a server entry in `.pebble/settings.json`, then `/mcp enable <name>` or `/mcp disable <name>` to manage local overrides in `.pebble/settings.local.json`.",
         resume_supported: false,
     },
     SlashCommandSpec {
         name: "permissions",
-        aliases: &[],
+        aliases: &["bypass"],
         summary: "Show or switch the active permission mode",
         argument_hint: Some("[read-only|workspace-write|danger-full-access]"),
+        category: SlashCommandCategory::Core,
+        detail: "`/bypass` is a shortcut for `/permissions danger-full-access`.",
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -101,6 +136,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "Start a fresh local session",
         argument_hint: Some("[--confirm]"),
+        category: SlashCommandCategory::Session,
+        detail: "Creates a new managed session while preserving the current model and runtime toggles.",
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -108,6 +145,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "Show cumulative token usage for this session",
         argument_hint: None,
+        category: SlashCommandCategory::Core,
+        detail: "Reports cumulative token usage and estimated cost for the current session.",
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -115,27 +154,35 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "Load a saved session into the REPL",
         argument_hint: Some("[session-id-or-path]"),
+        category: SlashCommandCategory::Session,
+        detail: "Use `/resume last` to reopen the most recently modified saved session.",
         resume_supported: false,
     },
     SlashCommandSpec {
         name: "config",
         aliases: &[],
-        summary: "Inspect NanoCode config files or merged sections",
+        summary: "Inspect Pebble config files or merged sections",
         argument_hint: Some("[env|hooks|model|plugins]"),
+        category: SlashCommandCategory::Workspace,
+        detail: "Shows merged runtime config and which config files were loaded.",
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "memory",
         aliases: &[],
-        summary: "Inspect loaded NanoCode instruction memory files",
+        summary: "Inspect loaded Pebble instruction memory files",
         argument_hint: None,
+        category: SlashCommandCategory::Workspace,
+        detail: "Lists project and user instruction files discovered by the runtime.",
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "init",
         aliases: &[],
-        summary: "Create a starter NANOCODE.md for this repo",
+        summary: "Create a starter PEBBLE.md for this repo",
         argument_hint: None,
+        category: SlashCommandCategory::Workspace,
+        detail: "Bootstraps common project-local Pebble files for a repository.",
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -143,6 +190,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "Show git diff for current workspace changes",
         argument_hint: None,
+        category: SlashCommandCategory::Workspace,
+        detail: "Runs a local git diff against the current worktree.",
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -150,6 +199,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "Show CLI version and build information",
         argument_hint: None,
+        category: SlashCommandCategory::Core,
+        detail: "Prints the Pebble build version and related metadata.",
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -157,6 +208,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "List, create, or switch git branches",
         argument_hint: Some("[list|create <name>|switch <name>]"),
+        category: SlashCommandCategory::Workspace,
+        detail: "Simple git branch helpers for listing, creating, and switching local branches.",
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -164,6 +217,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "List, add, remove, or prune git worktrees",
         argument_hint: Some("[list|add <path> [branch]|remove <path>|prune]"),
+        category: SlashCommandCategory::Workspace,
+        detail: "Convenience wrapper over `git worktree` commands.",
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -171,6 +226,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "Export the current conversation to a file",
         argument_hint: Some("[file]"),
+        category: SlashCommandCategory::Session,
+        detail: "Writes the current session transcript to a text file in the working directory unless an explicit path is provided.",
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -178,6 +235,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "List or switch managed local sessions",
         argument_hint: Some("[list|switch <session-id>]"),
+        category: SlashCommandCategory::Session,
+        detail: "Use `switch` to move between saved sessions without leaving the REPL.",
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -185,36 +244,86 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "List recent managed local sessions",
         argument_hint: None,
+        category: SlashCommandCategory::Session,
+        detail: "Shows recent managed sessions with model and last-prompt metadata.",
         resume_supported: false,
     },
     SlashCommandSpec {
         name: "plugins",
         aliases: &["plugin", "marketplace"],
-        summary: "Manage NanoCode plugins",
+        summary: "Manage Pebble plugins",
         argument_hint: Some(
-            "[list|install <path>|enable <id>|disable <id>|uninstall <id>|update <id>]",
+            "[list|help|install <path>|enable <id>|disable <id>|uninstall <id>|update <id>]",
         ),
+        category: SlashCommandCategory::Workspace,
+        detail: "Use `/plugins help` for local plugin layout, install, and enable/disable guidance.",
         resume_supported: false,
     },
     SlashCommandSpec {
         name: "agents",
         aliases: &[],
-        summary: "List configured NanoCode agents",
+        summary: "List configured Pebble agents",
         argument_hint: Some("[list|help]"),
+        category: SlashCommandCategory::Workspace,
+        detail: "Lists configured agent definitions discovered from project and user config roots.",
         resume_supported: true,
     },
     SlashCommandSpec {
         name: "skills",
         aliases: &[],
-        summary: "List available NanoCode skills",
-        argument_hint: Some("[list|help]"),
+        summary: "List available Pebble skills",
+        argument_hint: Some("[list|help|init <name>]"),
+        category: SlashCommandCategory::Workspace,
+        detail: "Use `/skills init <name>` to scaffold `.pebble/skills/<name>/SKILL.md` in the current project.",
         resume_supported: true,
+    },
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelpTopic {
+    pub name: &'static str,
+    pub summary: &'static str,
+    pub detail: &'static str,
+}
+
+const HELP_TOPICS: &[HelpTopic] = &[
+    HelpTopic {
+        name: "help",
+        summary: "Understand command help and topic help",
+        detail: "Run `/help` for the full command guide or `/help <topic>` for focused help. Supported topics: help, auth, sessions, extensions, web, vim.",
+    },
+    HelpTopic {
+        name: "auth",
+        summary: "Authenticate model services and Exa",
+        detail: "Run `/login` or `/auth` with no argument to open a service picker. Supported services are `nanogpt`, `synthetic`, `opencode-go`, and `exa`. API keys are stored in `~/.pebble/credentials.json`, and shell-scoped env vars still take precedence.",
+    },
+    HelpTopic {
+        name: "sessions",
+        summary: "Manage, resume, and restore sessions",
+        detail: "Use `/sessions` to list recent sessions, `/resume` to open the picker, `/resume last` for the most recent saved session, and `/session switch <id>` to jump directly.",
+    },
+    HelpTopic {
+        name: "extensions",
+        summary: "Add skills, MCP servers, and plugins",
+        detail: "Use `/skills init <name>` to scaffold a project skill, `/mcp add <name>` to add a starter MCP server entry to `.pebble/settings.json`, `/mcp enable <name>` or `/mcp disable <name>` for local MCP overrides, and `/plugins help` for local plugin install and enable guidance.",
+    },
+    HelpTopic {
+        name: "web",
+        summary: "Provider-agnostic web search and scrape",
+        detail: "Pebble always uses Exa for `WebSearch` and `WebScrape`. Configure `EXA_API_KEY` or store Exa credentials through `/login exa`.",
+    },
+    HelpTopic {
+        name: "vim",
+        summary: "Rustyline vi editing mode",
+        detail: "`/vim` toggles rustyline's vi keybindings for the REPL input editor. It does not change the rest of the terminal UI or command semantics.",
     },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
-    Help,
+    Help {
+        topic: Option<String>,
+    },
     Status,
     Compact,
     Thinking {
@@ -284,7 +393,9 @@ impl SlashCommand {
         let mut parts = trimmed.trim_start_matches('/').split_whitespace();
         let command = parts.next().unwrap_or_default();
         Some(match command {
-            "help" => Self::Help,
+            "help" => Self::Help {
+                topic: parts.next().map(ToOwned::to_owned),
+            },
             "status" => Self::Status,
             "compact" => Self::Compact,
             "thinking" => Self::Thinking {
@@ -299,6 +410,9 @@ impl SlashCommand {
             },
             "mcp" => Self::Mcp {
                 action: parts.next().map(ToOwned::to_owned),
+            },
+            "bypass" => Self::Permissions {
+                mode: Some("danger-full-access".to_string()),
             },
             "permissions" => Self::Permissions {
                 mode: parts.next().map(ToOwned::to_owned),
@@ -376,31 +490,129 @@ pub fn resume_supported_slash_commands() -> Vec<&'static SlashCommandSpec> {
 
 #[must_use]
 pub fn render_slash_command_help() -> String {
+    render_slash_command_help_topic(None)
+}
+
+#[must_use]
+pub fn render_slash_command_help_topic(topic: Option<&str>) -> String {
+    let topic = topic
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase());
+    let Some(topic) = topic else {
+        return render_full_slash_command_help();
+    };
+
+    if let Some(help_topic) = HELP_TOPICS.iter().find(|candidate| candidate.name == topic) {
+        return format!(
+            "Help: {}\n  {}\n\n{}",
+            help_topic.name, help_topic.summary, help_topic.detail
+        );
+    }
+
+    if let Some(spec) = slash_command_specs()
+        .iter()
+        .find(|spec| spec.name == topic || spec.aliases.iter().any(|alias| *alias == topic))
+    {
+        let aliases = if spec.aliases.is_empty() {
+            "none".to_string()
+        } else {
+            spec.aliases.join(", ")
+        };
+        let usage = slash_command_usage(spec);
+        let resume = if spec.resume_supported { "yes" } else { "no" };
+        return format!(
+            "Help: /{}\n  Category         {}\n  Usage            {}\n  Aliases          {}\n  Resume           {}\n\n{}",
+            spec.name,
+            spec.category.label(),
+            usage,
+            aliases,
+            resume,
+            spec.detail
+        );
+    }
+
+    format!(
+        "Unknown help topic `{topic}`.\n\n{}",
+        render_help_topics_overview()
+    )
+}
+
+#[must_use]
+pub fn render_help_topics_overview() -> String {
+    let mut lines = vec!["Help topics".to_string()];
+    for topic in HELP_TOPICS {
+        lines.push(format!("  {:<18} {}", topic.name, topic.summary));
+    }
+    lines.join("\n")
+}
+
+#[must_use]
+pub fn command_names_and_aliases() -> Vec<String> {
+    slash_command_specs()
+        .iter()
+        .flat_map(|spec| {
+            std::iter::once(format!("/{}", spec.name)).chain(
+                spec.aliases
+                    .iter()
+                    .map(|alias| format!("/{alias}"))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
+fn render_full_slash_command_help() -> String {
     let mut lines = vec![
         "Slash commands".to_string(),
         "  [resume] means the command also works with --resume SESSION.json".to_string(),
     ];
-    for spec in slash_command_specs() {
-        let name = match spec.argument_hint {
-            Some(argument_hint) => format!("/{} {}", spec.name, argument_hint),
-            None => format!("/{}", spec.name),
-        };
-        let aliases = if spec.aliases.is_empty() {
-            String::new()
-        } else {
-            format!(" (aliases: {})", spec.aliases.join(", "))
-        };
-        let resume = if spec.resume_supported {
-            " [resume]"
-        } else {
-            ""
-        };
-        lines.push(format!(
-            "  {name:<20} {}{}{}",
-            spec.summary, aliases, resume
-        ));
+    for category in [
+        SlashCommandCategory::Core,
+        SlashCommandCategory::Session,
+        SlashCommandCategory::Workspace,
+        SlashCommandCategory::Repl,
+    ] {
+        let mut category_lines = slash_command_specs()
+            .iter()
+            .filter(|spec| spec.category == category)
+            .map(|spec| {
+                let aliases = if spec.aliases.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (aliases: {})", spec.aliases.join(", "))
+                };
+                let resume = if spec.resume_supported {
+                    " [resume]"
+                } else {
+                    ""
+                };
+                format!(
+                    "  {:<32} {}{}{}",
+                    slash_command_usage(spec),
+                    spec.summary,
+                    aliases,
+                    resume
+                )
+            })
+            .collect::<Vec<_>>();
+        if category_lines.is_empty() {
+            continue;
+        }
+        lines.push(String::new());
+        lines.push(category.label().to_string());
+        lines.append(&mut category_lines);
     }
+    lines.push(String::new());
+    lines.push(render_help_topics_overview());
     lines.join("\n")
+}
+
+fn slash_command_usage(spec: &SlashCommandSpec) -> String {
+    match spec.argument_hint {
+        Some(argument_hint) => format!("/{} {}", spec.name, argument_hint),
+        None => format!("/{}", spec.name),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -431,8 +643,8 @@ pub fn handle_slash_command(
                 session: result.compacted_session,
             })
         }
-        SlashCommand::Help => Some(SlashCommandResult {
-            message: render_slash_command_help(),
+        SlashCommand::Help { topic } => Some(SlashCommandResult {
+            message: render_slash_command_help_topic(topic.as_deref()),
             session: session.clone(),
         }),
         SlashCommand::Status
@@ -470,9 +682,9 @@ enum DefinitionSource {
 impl DefinitionSource {
     fn label(self) -> &'static str {
         match self {
-            Self::Project => "Project (.nanocode)",
-            Self::UserConfigHome => "User (NANOCODE_CONFIG_HOME)",
-            Self::UserHome => "User (~/.nanocode)",
+            Self::Project => "Project (.pebble)",
+            Self::UserConfigHome => "User (PEBBLE_CONFIG_HOME)",
+            Self::UserHome => "User (~/.pebble)",
         }
     }
 }
@@ -632,8 +844,40 @@ pub fn handle_skills_slash_command(args: Option<&str>, cwd: &Path) -> io::Result
             Ok(render_skills_report(&skills))
         }
         Some("-h" | "--help" | "help") => Ok(render_skills_usage(None)),
+        Some(args) if args.starts_with("init ") => scaffold_skill(args, cwd),
         Some(args) => Ok(render_skills_usage(Some(args))),
     }
+}
+
+fn scaffold_skill(args: &str, cwd: &Path) -> io::Result<String> {
+    let name = args.trim_start_matches("init").trim();
+    if name.is_empty() {
+        return Ok("Skills\n  error: missing skill name\n  usage: /skills init <name>".to_string());
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Ok(format!(
+            "Skills\n  error: invalid skill name `{name}`\n  hint: skill names become directory names under .pebble/skills/"
+        ));
+    }
+
+    let skill_dir = cwd.join(".pebble").join("skills").join(name);
+    fs::create_dir_all(&skill_dir)?;
+    let skill_file = skill_dir.join("SKILL.md");
+    if skill_file.exists() {
+        return Ok(format!(
+            "Skills\n  result:  exists\n  name:    {name}\n  file:    {}",
+            skill_file.display()
+        ));
+    }
+
+    let body = format!(
+        "# {name}\n\nDescribe when this skill should be used and what it should do.\n\n## Workflow\n\n1. Capture the goal.\n2. Read only the files you need.\n3. Perform the task.\n4. Report the result.\n"
+    );
+    fs::write(&skill_file, body)?;
+    Ok(format!(
+        "Skills\n  result:  initialized\n  name:    {name}\n  file:    {}",
+        skill_file.display()
+    ))
 }
 
 fn normalize_optional_args(args: Option<&str>) -> Option<&str> {
@@ -697,11 +941,11 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
         push_unique_root(
             &mut roots,
             DefinitionSource::Project,
-            ancestor.join(".nanocode").join(leaf),
+            ancestor.join(".pebble").join(leaf),
         );
     }
 
-    if let Ok(config_home) = env::var("NANOCODE_CONFIG_HOME") {
+    if let Ok(config_home) = env::var("PEBBLE_CONFIG_HOME") {
         push_unique_root(
             &mut roots,
             DefinitionSource::UserConfigHome,
@@ -713,7 +957,7 @@ fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, P
         push_unique_root(
             &mut roots,
             DefinitionSource::UserHome,
-            PathBuf::from(home).join(".nanocode").join(leaf),
+            PathBuf::from(home).join(".pebble").join(leaf),
         );
     }
 
@@ -727,18 +971,18 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::Project,
-            ancestor.join(".nanocode").join("skills"),
+            ancestor.join(".pebble").join("skills"),
             SkillOrigin::SkillsDir,
         );
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::Project,
-            ancestor.join(".nanocode").join("commands"),
+            ancestor.join(".pebble").join("commands"),
             SkillOrigin::LegacyCommandsDir,
         );
     }
 
-    if let Ok(config_home) = env::var("NANOCODE_CONFIG_HOME") {
+    if let Ok(config_home) = env::var("PEBBLE_CONFIG_HOME") {
         let config_home = PathBuf::from(config_home);
         push_unique_skill_root(
             &mut roots,
@@ -755,7 +999,7 @@ fn discover_skill_roots(cwd: &Path) -> Vec<SkillRoot> {
     }
 
     if let Some(home) = env::var_os("HOME") {
-        let home = PathBuf::from(home).join(".nanocode");
+        let home = PathBuf::from(home).join(".pebble");
         push_unique_skill_root(
             &mut roots,
             DefinitionSource::UserHome,
@@ -986,7 +1230,9 @@ fn render_agents_usage(args: Option<&str>) -> String {
 fn render_skills_usage(args: Option<&str>) -> String {
     let mut lines = vec![
         "Skills".to_string(),
-        "  Usage            /skills [list|help]".to_string(),
+        "  Usage            /skills [list|help|init <name>]".to_string(),
+        "  Init             Create .pebble/skills/<name>/SKILL.md in the current project"
+            .to_string(),
     ];
     if let Some(args) = args {
         lines.push(format!("  Unsupported      {}", args.trim()));
@@ -1004,7 +1250,10 @@ mod tests {
 
     #[test]
     fn parses_supported_slash_commands() {
-        assert_eq!(SlashCommand::parse("/help"), Some(SlashCommand::Help));
+        assert_eq!(
+            SlashCommand::parse("/help"),
+            Some(SlashCommand::Help { topic: None })
+        );
         assert_eq!(SlashCommand::parse(" /status "), Some(SlashCommand::Status));
         assert_eq!(
             SlashCommand::parse("/model claude-opus"),
@@ -1020,6 +1269,12 @@ mod tests {
             SlashCommand::parse("/permissions read-only"),
             Some(SlashCommand::Permissions {
                 mode: Some("read-only".to_string()),
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/bypass"),
+            Some(SlashCommand::Permissions {
+                mode: Some("danger-full-access".to_string()),
             })
         );
         assert_eq!(
@@ -1114,8 +1369,9 @@ mod tests {
         assert!(help.contains("/compact"));
         assert!(help.contains("/thinking [on|off]"));
         assert!(help.contains("/model [model]"));
-        assert!(help.contains("/mcp [status|tools|reload]"));
+        assert!(help.contains("/mcp [status|tools|reload|add <name>|enable <name>|disable <name>]"));
         assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
+        assert!(help.contains("aliases: bypass"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume [session-id-or-path]"));
@@ -1130,10 +1386,11 @@ mod tests {
         assert!(help.contains("/session [list|switch <session-id>]"));
         assert!(help.contains("/sessions"));
         assert!(help.contains(
-            "/plugins [list|install <path>|enable <id>|disable <id>|uninstall <id>|update <id>]"
+            "/plugins [list|help|install <path>|enable <id>|disable <id>|uninstall <id>|update <id>]"
         ));
         assert!(help.contains("/agents [list|help]"));
-        assert!(help.contains("/skills [list|help]"));
+        assert!(help.contains("/skills [list|help|init <name>]"));
+        assert!(help.contains("Help topics"));
         assert_eq!(slash_command_specs().len(), 23);
         assert_eq!(resume_supported_slash_commands().len(), 13);
     }

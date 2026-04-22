@@ -4,9 +4,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Clone, Parser, PartialEq, Eq)]
 #[command(
-    name = "nanocode",
+    name = "pebble",
     version,
-    about = "NanoCode CLI prototype"
+    about = "Pebble CLI prototype"
 )]
 pub struct Cli {
     #[arg(long, default_value = "openai/gpt-5.2")]
@@ -58,7 +58,7 @@ mod tests {
     #[test]
     fn parses_requested_flags() {
         let cli = Cli::parse_from([
-            "nanocode",
+            "pebble",
             "--model",
             "openai/gpt-5.2",
             "--permission-mode",

@@ -153,7 +153,7 @@ fn persist_compact_summary(formatted_summary: &str) {
     let Ok(cwd) = std::env::current_dir() else {
         return;
     };
-    let memory_dir = cwd.join(".nanocode").join("memory");
+    let memory_dir = cwd.join(".pebble").join("memory");
     if fs::create_dir_all(&memory_dir).is_err() {
         return;
     }
@@ -574,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn persists_compacted_summaries_under_dot_nanocode_memory() {
+    fn persists_compacted_summaries_under_dot_pebble_memory() {
         let _guard = crate::test_env_lock();
         let temp = std::env::temp_dir().join(format!(
             "runtime-compact-memory-{}",
@@ -613,7 +613,7 @@ mod tests {
                 max_estimated_tokens: 1,
             },
         );
-        let memory_dir = temp.join(".nanocode").join("memory");
+        let memory_dir = temp.join(".pebble").join("memory");
         let files = fs::read_dir(&memory_dir)
             .expect("memory dir exists")
             .flatten()

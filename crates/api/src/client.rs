@@ -9,12 +9,14 @@ use serde::Serialize;
 use crate::error::ApiError;
 use crate::sse::SseParser;
 use crate::types::{
-    ChatCompletionRequest, ChatCompletionResponse, MessageRequest, MessageResponse, ModelsResponse,
-    ProviderSelectionResponse, StreamEvent,
+    ChatCompletionContent, ChatCompletionFunction, ChatCompletionMessage, ChatCompletionRequest,
+    ChatCompletionResponse, ChatCompletionThinkingConfig, ChatCompletionTool, MessageRequest,
+    MessageResponse, ModelsResponse, OutputContentBlock, ProviderSelectionResponse, StreamEvent,
 };
 
 const DEFAULT_BASE_URL: &str = "https://nano-gpt.com/api";
 const DEFAULT_SYNTHETIC_MESSAGES_BASE_URL: &str = "https://api.synthetic.new/anthropic/v1";
+const DEFAULT_OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
@@ -107,9 +109,13 @@ impl NanoGptClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageResponse, ApiError> {
+        if self.service == ApiService::OpencodeGo && !opencode_go_uses_messages_api(&request.model)
+        {
+            return self.send_opencode_go_chat_completion(request).await;
+        }
         let request = MessageRequest {
             stream: false,
-            ..request.clone()
+            ..self.normalize_message_request(request)
         };
         let response = self.send_with_retry(&request).await?;
         let request_id = request_id_from_headers(response.headers());
@@ -158,16 +164,14 @@ impl NanoGptClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
+        if self.service == ApiService::OpencodeGo {
+            let response = self.send_message(request).await?;
+            return Ok(MessageStream::from_message_response(response));
+        }
         let response = self
-            .send_with_retry(&request.clone().with_streaming())
+            .send_with_retry(&self.normalize_message_request(&request.clone().with_streaming()))
             .await?;
-        Ok(MessageStream {
-            request_id: request_id_from_headers(response.headers()),
-            response,
-            parser: SseParser::new(),
-            pending: VecDeque::new(),
-            done: false,
-        })
+        Ok(MessageStream::from_http_response(response))
     }
 
     pub async fn fetch_models(&self, detailed: bool) -> Result<ModelsResponse, ApiError> {
@@ -268,6 +272,33 @@ impl NanoGptClient {
             .map_err(ApiError::from)
     }
 
+    async fn send_chat_completion_raw(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> Result<reqwest::Response, ApiError> {
+        let request_url = format!(
+            "{}{}",
+            self.base_url.trim_end_matches('/'),
+            self.chat_completions_path()
+        );
+        if nanogpt_client_debug_enabled() {
+            let resolved_base_url = self.base_url.trim_end_matches('/');
+            eprintln!("[nanogpt-client] resolved_base_url={resolved_base_url}");
+            eprintln!("[nanogpt-client] request_url={request_url}");
+        }
+        let request_builder = self
+            .http
+            .post(&request_url)
+            .header("content-type", "application/json");
+        let request_builder = self.apply_auth_headers(request_builder, true);
+
+        request_builder
+            .json(request)
+            .send()
+            .await
+            .map_err(ApiError::from)
+    }
+
     async fn send_get_request(
         &self,
         path: &str,
@@ -307,6 +338,9 @@ impl NanoGptClient {
                     ApiService::Synthetic => eprintln!(
                         "[nanogpt-client] headers authorization=Bearer [REDACTED]"
                     ),
+                    ApiService::OpencodeGo => eprintln!(
+                        "[nanogpt-client] headers x-api-key=[REDACTED] authorization=Bearer [REDACTED]"
+                    ),
                 }
             }
             match self.service {
@@ -314,6 +348,9 @@ impl NanoGptClient {
                     .bearer_auth(&self.api_key)
                     .header("x-api-key", &self.api_key),
                 ApiService::Synthetic => request_builder.bearer_auth(&self.api_key),
+                ApiService::OpencodeGo => request_builder
+                    .bearer_auth(&self.api_key)
+                    .header("x-api-key", &self.api_key),
             }
         };
 
@@ -352,6 +389,7 @@ impl NanoGptClient {
         match self.service {
             ApiService::NanoGpt => "/v1/messages",
             ApiService::Synthetic => "/messages",
+            ApiService::OpencodeGo => "/v1/messages",
         }
     }
 
@@ -359,7 +397,75 @@ impl NanoGptClient {
         match self.service {
             ApiService::NanoGpt => "/v1/chat/completions",
             ApiService::Synthetic => "/chat/completions",
+            ApiService::OpencodeGo => "/v1/chat/completions",
         }
+    }
+
+    fn normalize_message_request(&self, request: &MessageRequest) -> MessageRequest {
+        let mut normalized = request.clone();
+        normalized.model = self.normalize_model_id(&normalized.model);
+        normalized
+    }
+
+    fn normalize_model_id(&self, model: &str) -> String {
+        match self.service {
+            ApiService::OpencodeGo => normalize_opencode_go_model_id(model).to_string(),
+            ApiService::NanoGpt | ApiService::Synthetic => model.to_string(),
+        }
+    }
+
+    async fn send_opencode_go_chat_completion(
+        &self,
+        request: &MessageRequest,
+    ) -> Result<MessageResponse, ApiError> {
+        let chat_request = message_request_to_chat_completion_request(request, self)?;
+        let response = self.send_chat_completion_with_retry(&chat_request).await?;
+        let request_id = request_id_from_headers(response.headers());
+        let response = response
+            .json::<ChatCompletionResponse>()
+            .await
+            .map_err(ApiError::from)?;
+        Ok(chat_completion_to_message_response(
+            response,
+            request.model.clone(),
+            request_id,
+        ))
+    }
+
+    async fn send_chat_completion_with_retry(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> Result<reqwest::Response, ApiError> {
+        let mut attempts = 0;
+        let mut last_error: Option<ApiError>;
+
+        loop {
+            attempts += 1;
+            match self.send_chat_completion_raw(request).await {
+                Ok(response) => match expect_success(response).await {
+                    Ok(response) => return Ok(response),
+                    Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
+                        last_error = Some(error);
+                    }
+                    Err(error) => return Err(error),
+                },
+                Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+
+            if attempts > self.max_retries {
+                break;
+            }
+
+            tokio::time::sleep(self.backoff_for_attempt(attempts)?).await;
+        }
+
+        Err(ApiError::RetriesExhausted {
+            attempts,
+            last_error: Box::new(last_error.expect("retry loop must capture an error")),
+        })
     }
 }
 
@@ -372,6 +478,7 @@ fn read_api_key() -> Result<String, ApiError> {
 pub enum ApiService {
     NanoGpt,
     Synthetic,
+    OpencodeGo,
 }
 
 impl ApiService {
@@ -380,6 +487,7 @@ impl ApiService {
         match self {
             Self::NanoGpt => "nanogpt",
             Self::Synthetic => "synthetic",
+            Self::OpencodeGo => "opencode_go",
         }
     }
 
@@ -388,6 +496,7 @@ impl ApiService {
         match self {
             Self::NanoGpt => "NanoGPT",
             Self::Synthetic => "Synthetic",
+            Self::OpencodeGo => "OpenCode Go",
         }
     }
 }
@@ -414,6 +523,8 @@ pub fn resolve_base_url_for(service: ApiService) -> String {
         }
         ApiService::Synthetic => std::env::var("SYNTHETIC_BASE_URL")
             .unwrap_or_else(|_| DEFAULT_SYNTHETIC_MESSAGES_BASE_URL.to_string()),
+        ApiService::OpencodeGo => std::env::var("OPENCODE_GO_BASE_URL")
+            .unwrap_or_else(|_| DEFAULT_OPENCODE_GO_BASE_URL.to_string()),
     }
 }
 
@@ -435,6 +546,7 @@ pub fn resolve_root_url_for(service: ApiService) -> String {
                 .unwrap_or(trimmed)
                 .to_string()
         }
+        ApiService::OpencodeGo => resolve_base_url_for(service),
     }
 }
 
@@ -445,6 +557,7 @@ fn read_api_key_from_credentials_file(service: ApiService) -> Option<String> {
     let service_key = match service {
         ApiService::NanoGpt => "nanogpt_api_key",
         ApiService::Synthetic => "synthetic_api_key",
+        ApiService::OpencodeGo => "opencode_go_api_key",
     };
     parsed
         .get(service_key)
@@ -462,13 +575,14 @@ fn service_api_key_env(service: ApiService) -> &'static str {
     match service {
         ApiService::NanoGpt => "NANOGPT_API_KEY",
         ApiService::Synthetic => "SYNTHETIC_API_KEY",
+        ApiService::OpencodeGo => "OPENCODE_GO_API_KEY",
     }
 }
 
 fn credentials_path() -> Option<PathBuf> {
-    let config_home = std::env::var_os("NANOCODE_CONFIG_HOME")
+    let config_home = std::env::var_os("PEBBLE_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".nanocode")))?;
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pebble")))?;
     Some(config_home.join("credentials.json"))
 }
 
@@ -502,13 +616,41 @@ fn providers_url(base_url: &str, canonical_id: &str) -> Result<reqwest::Url, Api
 #[derive(Debug)]
 pub struct MessageStream {
     request_id: Option<String>,
-    response: reqwest::Response,
-    parser: SseParser,
+    state: MessageStreamState,
     pending: VecDeque<StreamEvent>,
-    done: bool,
+}
+
+#[derive(Debug)]
+enum MessageStreamState {
+    Http {
+        response: reqwest::Response,
+        parser: SseParser,
+        done: bool,
+    },
+    Buffered,
 }
 
 impl MessageStream {
+    fn from_http_response(response: reqwest::Response) -> Self {
+        Self {
+            request_id: request_id_from_headers(response.headers()),
+            state: MessageStreamState::Http {
+                response,
+                parser: SseParser::new(),
+                done: false,
+            },
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn from_message_response(response: MessageResponse) -> Self {
+        Self {
+            request_id: response.request_id.clone(),
+            state: MessageStreamState::Buffered,
+            pending: VecDeque::from(message_response_to_stream_events(response)),
+        }
+    }
+
     #[must_use]
     pub fn request_id(&self) -> Option<&str> {
         self.request_id.as_deref()
@@ -520,25 +662,400 @@ impl MessageStream {
                 return Ok(Some(event));
             }
 
-            if self.done {
-                let remaining = self.parser.finish()?;
-                self.pending.extend(remaining);
-                if let Some(event) = self.pending.pop_front() {
-                    return Ok(Some(event));
-                }
-                return Ok(None);
-            }
+            match &mut self.state {
+                MessageStreamState::Buffered => return Ok(None),
+                MessageStreamState::Http {
+                    response,
+                    parser,
+                    done,
+                } => {
+                    if *done {
+                        let remaining = parser.finish()?;
+                        self.pending.extend(remaining);
+                        if let Some(event) = self.pending.pop_front() {
+                            return Ok(Some(event));
+                        }
+                        return Ok(None);
+                    }
 
-            match self.response.chunk().await? {
-                Some(chunk) => {
-                    self.pending.extend(self.parser.push(&chunk)?);
-                }
-                None => {
-                    self.done = true;
+                    match response.chunk().await? {
+                        Some(chunk) => {
+                            self.pending.extend(parser.push(&chunk)?);
+                        }
+                        None => {
+                            *done = true;
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+fn normalize_opencode_go_model_id(model: &str) -> &str {
+    model.strip_prefix("opencode-go/").unwrap_or(model)
+}
+
+fn opencode_go_uses_messages_api(model: &str) -> bool {
+    matches!(
+        normalize_opencode_go_model_id(model),
+        "minimax-m2.5" | "minimax-m2.7"
+    )
+}
+
+fn opencode_go_prefers_thinking_disabled(model: &str) -> bool {
+    matches!(
+        normalize_opencode_go_model_id(model),
+        "kimi-k2.5" | "kimi-k2.6"
+    )
+}
+
+fn invalid_request_error(message: impl Into<String>) -> ApiError {
+    ApiError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message.into(),
+    ))
+}
+
+fn message_request_to_chat_completion_request(
+    request: &MessageRequest,
+    client: &NanoGptClient,
+) -> Result<ChatCompletionRequest, ApiError> {
+    let mut messages = Vec::new();
+    if let Some(system) = request.system.as_ref().filter(|system| !system.is_empty()) {
+        messages.push(ChatCompletionMessage {
+            role: "system".to_string(),
+            content: Some(ChatCompletionContent::Text(system.clone())),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            reasoning: None,
+        });
+    }
+
+    for message in &request.messages {
+        messages.extend(input_message_to_chat_completion_messages(message)?);
+    }
+
+    Ok(ChatCompletionRequest {
+        model: client.normalize_model_id(&request.model),
+        messages,
+        max_tokens: Some(request.max_tokens),
+        tools: request.tools.as_ref().map(|tools| {
+            tools
+                .iter()
+                .map(|tool| ChatCompletionTool {
+                    kind: "function".to_string(),
+                    function: ChatCompletionFunction {
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        parameters: Some(tool.input_schema.clone()),
+                    },
+                })
+                .collect()
+        }),
+        tool_choice: request.tool_choice.as_ref().map(map_tool_choice),
+        billing_mode: None,
+        thinking: (client.service == ApiService::OpencodeGo
+            && opencode_go_prefers_thinking_disabled(&request.model))
+        .then(ChatCompletionThinkingConfig::disabled),
+        stream: false,
+    })
+}
+
+fn input_message_to_chat_completion_messages(
+    message: &crate::types::InputMessage,
+) -> Result<Vec<ChatCompletionMessage>, ApiError> {
+    match message.role.as_str() {
+        "assistant" => assistant_input_to_chat_completion_messages(message),
+        "user" => user_input_to_chat_completion_messages(message),
+        other => Err(invalid_request_error(format!(
+            "unsupported role for chat/completions translation: {other}"
+        ))),
+    }
+}
+
+fn assistant_input_to_chat_completion_messages(
+    message: &crate::types::InputMessage,
+) -> Result<Vec<ChatCompletionMessage>, ApiError> {
+    let mut text_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+
+    for block in &message.content {
+        match block {
+            crate::types::InputContentBlock::Text { text } => {
+                if !text.is_empty() {
+                    text_parts.push(text.clone());
+                }
+            }
+            crate::types::InputContentBlock::ToolUse { id, name, input } => {
+                tool_calls.push(crate::types::ChatCompletionToolCall {
+                    id: id.clone(),
+                    kind: "function".to_string(),
+                    function: crate::types::ChatCompletionFunctionCall {
+                        name: name.clone(),
+                        arguments: input.to_string(),
+                    },
+                });
+            }
+            crate::types::InputContentBlock::Image { .. } => {
+                return Err(invalid_request_error(
+                    "image inputs are not supported for OpenCode Go chat/completions models",
+                ));
+            }
+            crate::types::InputContentBlock::ToolResult { .. } => {
+                return Err(invalid_request_error(
+                    "assistant tool_result blocks cannot be translated to chat/completions",
+                ));
+            }
+        }
+    }
+
+    Ok(vec![ChatCompletionMessage {
+        role: "assistant".to_string(),
+        content: (!text_parts.is_empty())
+            .then(|| ChatCompletionContent::Text(text_parts.join("\n\n"))),
+        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+        tool_call_id: None,
+        reasoning_content: message.reasoning_content.clone(),
+        reasoning: message
+            .reasoning
+            .clone()
+            .or(message.reasoning_content.clone()),
+    }])
+}
+
+fn user_input_to_chat_completion_messages(
+    message: &crate::types::InputMessage,
+) -> Result<Vec<ChatCompletionMessage>, ApiError> {
+    let mut messages = Vec::new();
+    let mut pending_text = Vec::new();
+
+    for block in &message.content {
+        match block {
+            crate::types::InputContentBlock::Text { text } => {
+                if !text.is_empty() {
+                    pending_text.push(text.clone());
+                }
+            }
+            crate::types::InputContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                if !pending_text.is_empty() {
+                    messages.push(ChatCompletionMessage {
+                        role: "user".to_string(),
+                        content: Some(ChatCompletionContent::Text(pending_text.join("\n\n"))),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                        reasoning: None,
+                    });
+                    pending_text.clear();
+                }
+                messages.push(ChatCompletionMessage {
+                    role: "tool".to_string(),
+                    content: Some(ChatCompletionContent::Text(tool_result_content_to_string(
+                        content,
+                    )?)),
+                    tool_calls: None,
+                    tool_call_id: Some(tool_use_id.clone()),
+                    reasoning_content: None,
+                    reasoning: None,
+                });
+            }
+            crate::types::InputContentBlock::Image { .. } => {
+                return Err(invalid_request_error(
+                    "image inputs are not supported for OpenCode Go chat/completions models",
+                ));
+            }
+            crate::types::InputContentBlock::ToolUse { .. } => {
+                return Err(invalid_request_error(
+                    "user tool_use blocks cannot be translated to chat/completions",
+                ));
+            }
+        }
+    }
+
+    if !pending_text.is_empty() {
+        messages.push(ChatCompletionMessage {
+            role: "user".to_string(),
+            content: Some(ChatCompletionContent::Text(pending_text.join("\n\n"))),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+            reasoning: None,
+        });
+    }
+
+    Ok(messages)
+}
+
+fn tool_result_content_to_string(
+    content: &[crate::types::ToolResultContentBlock],
+) -> Result<String, ApiError> {
+    let mut parts = Vec::new();
+    for block in content {
+        match block {
+            crate::types::ToolResultContentBlock::Text { text } => parts.push(text.clone()),
+            crate::types::ToolResultContentBlock::Json { value } => parts.push(value.to_string()),
+        }
+    }
+    if parts.is_empty() {
+        return Err(invalid_request_error(
+            "tool result content cannot be empty for chat/completions translation",
+        ));
+    }
+    Ok(parts.join("\n"))
+}
+
+fn map_tool_choice(choice: &crate::types::ToolChoice) -> crate::types::ChatCompletionToolChoice {
+    match choice {
+        crate::types::ToolChoice::Auto => {
+            crate::types::ChatCompletionToolChoice::Mode("auto".to_string())
+        }
+        crate::types::ToolChoice::Any => {
+            crate::types::ChatCompletionToolChoice::Mode("required".to_string())
+        }
+        crate::types::ToolChoice::Tool { name } => {
+            crate::types::ChatCompletionToolChoice::Function {
+                kind: "function".to_string(),
+                function: crate::types::ChatCompletionNamedFunction { name: name.clone() },
+            }
+        }
+    }
+}
+
+fn chat_completion_to_message_response(
+    response: ChatCompletionResponse,
+    requested_model: String,
+    request_id: Option<String>,
+) -> MessageResponse {
+    let choice =
+        response
+            .choices
+            .into_iter()
+            .next()
+            .unwrap_or(crate::types::ChatCompletionChoice {
+                index: 0,
+                message: crate::types::ChatCompletionAssistantMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                    reasoning: None,
+                },
+                finish_reason: None,
+            });
+
+    let mut content = Vec::new();
+    if let Some(reasoning) = choice
+        .message
+        .reasoning
+        .clone()
+        .or(choice.message.reasoning_content.clone())
+        .filter(|text| !text.is_empty())
+    {
+        content.push(OutputContentBlock::Thinking {
+            thinking: reasoning,
+            signature: None,
+        });
+    }
+    if let Some(text) = choice
+        .message
+        .content
+        .as_ref()
+        .and_then(chat_completion_content_to_text)
+        .filter(|text| !text.is_empty())
+    {
+        content.push(OutputContentBlock::Text { text });
+    }
+    if let Some(tool_calls) = choice.message.tool_calls {
+        for tool_call in tool_calls {
+            let input = serde_json::from_str(&tool_call.function.arguments)
+                .unwrap_or_else(|_| serde_json::Value::String(tool_call.function.arguments));
+            content.push(OutputContentBlock::ToolUse {
+                id: tool_call.id,
+                name: tool_call.function.name,
+                input,
+            });
+        }
+    }
+
+    let usage = response.usage.unwrap_or(crate::types::ChatCompletionUsage {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+    });
+
+    MessageResponse {
+        id: response.id,
+        kind: "message".to_string(),
+        role: choice.message.role,
+        content,
+        model: requested_model,
+        stop_reason: choice.finish_reason,
+        stop_sequence: None,
+        usage: crate::types::Usage {
+            input_tokens: usage.prompt_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            output_tokens: usage.completion_tokens,
+        },
+        request_id,
+    }
+}
+
+fn chat_completion_content_to_text(content: &ChatCompletionContent) -> Option<String> {
+    match content {
+        ChatCompletionContent::Text(text) => Some(text.clone()),
+        ChatCompletionContent::Parts(parts) => {
+            let text = parts
+                .iter()
+                .filter(|part| part.kind == "text" || part.kind == "output_text")
+                .filter_map(|part| part.text.as_deref())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+    }
+}
+
+fn message_response_to_stream_events(response: MessageResponse) -> Vec<StreamEvent> {
+    let usage = response.usage.clone();
+    let delta = crate::types::MessageDelta {
+        stop_reason: response.stop_reason.clone(),
+        stop_sequence: response.stop_sequence.clone(),
+    };
+    let content_blocks = response.content.clone();
+    let message = MessageResponse {
+        content: Vec::new(),
+        ..response
+    };
+    let mut events = vec![StreamEvent::MessageStart(crate::types::MessageStartEvent {
+        message,
+    })];
+
+    for (index, block) in content_blocks.into_iter().enumerate() {
+        let index = index as u32;
+        events.push(StreamEvent::ContentBlockStart(
+            crate::types::ContentBlockStartEvent {
+                index,
+                content_block: block,
+            },
+        ));
+        events.push(StreamEvent::ContentBlockStop(
+            crate::types::ContentBlockStopEvent { index },
+        ));
+    }
+
+    events.push(StreamEvent::MessageDelta(crate::types::MessageDeltaEvent {
+        delta,
+        usage,
+    }));
+    events.push(StreamEvent::MessageStop(crate::types::MessageStopEvent {}));
+    events
 }
 
 async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {
@@ -597,7 +1114,7 @@ mod tests {
 
     fn temp_config_home() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "nanocode-api-test-{}",
+            "pebble-api-test-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time should be after epoch")
@@ -611,10 +1128,10 @@ mod tests {
         let root = temp_config_home();
         std::fs::create_dir_all(&root).expect("config dir should exist");
         std::env::remove_var("NANOGPT_API_KEY");
-        std::env::set_var("NANOCODE_CONFIG_HOME", &root);
+        std::env::set_var("PEBBLE_CONFIG_HOME", &root);
         let error = super::read_api_key().expect_err("missing key should error");
         assert!(matches!(error, crate::error::ApiError::MissingApiKey));
-        std::env::remove_var("NANOCODE_CONFIG_HOME");
+        std::env::remove_var("PEBBLE_CONFIG_HOME");
         std::fs::remove_dir_all(root).expect("temp config dir should be removed");
     }
 
@@ -624,11 +1141,11 @@ mod tests {
         let root = temp_config_home();
         std::fs::create_dir_all(&root).expect("config dir should exist");
         std::env::set_var("NANOGPT_API_KEY", "");
-        std::env::set_var("NANOCODE_CONFIG_HOME", &root);
+        std::env::set_var("PEBBLE_CONFIG_HOME", &root);
         let error = super::read_api_key().expect_err("empty key should error");
         assert!(matches!(error, crate::error::ApiError::MissingApiKey));
         std::env::remove_var("NANOGPT_API_KEY");
-        std::env::remove_var("NANOCODE_CONFIG_HOME");
+        std::env::remove_var("PEBBLE_CONFIG_HOME");
         std::fs::remove_dir_all(root).expect("temp config dir should be removed");
     }
 
@@ -638,13 +1155,13 @@ mod tests {
         let root = temp_config_home();
         std::fs::create_dir_all(&root).expect("config dir should exist");
         std::env::set_var("NANOGPT_API_KEY", "nano-key");
-        std::env::set_var("NANOCODE_CONFIG_HOME", &root);
+        std::env::set_var("PEBBLE_CONFIG_HOME", &root);
         assert_eq!(
             super::read_api_key().expect("api key should load"),
             "nano-key"
         );
         std::env::remove_var("NANOGPT_API_KEY");
-        std::env::remove_var("NANOCODE_CONFIG_HOME");
+        std::env::remove_var("PEBBLE_CONFIG_HOME");
         std::fs::remove_dir_all(root).expect("temp config dir should be removed");
     }
 
@@ -659,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn read_api_key_uses_nanocode_credentials_file() {
+    fn read_api_key_uses_pebble_credentials_file() {
         let _guard = env_lock();
         let root = temp_config_home();
         std::fs::create_dir_all(&root).expect("config dir should exist");
@@ -670,13 +1187,13 @@ mod tests {
         .expect("credentials should write");
 
         std::env::remove_var("NANOGPT_API_KEY");
-        std::env::set_var("NANOCODE_CONFIG_HOME", &root);
+        std::env::set_var("PEBBLE_CONFIG_HOME", &root);
         assert_eq!(
             super::read_api_key().expect("api key should load"),
             "from-credentials"
         );
 
-        std::env::remove_var("NANOCODE_CONFIG_HOME");
+        std::env::remove_var("PEBBLE_CONFIG_HOME");
         std::fs::remove_dir_all(root).expect("temp config dir should be removed");
     }
 

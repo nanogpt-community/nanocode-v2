@@ -1,4 +1,4 @@
-name: Release NanoCode
+name: Release Pebble
 
 on:
   push:
@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-nanocode
+  group: release-pebble
   cancel-in-progress: false
 
 jobs:
@@ -85,7 +85,7 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             label: linux-x64
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
             label: macos-arm64
 
@@ -106,11 +106,11 @@ jobs:
       - name: Build release binary
         shell: bash
         env:
-          NANOCODE_BUILD_TARGET: ${{ matrix.target }}
+          PEBBLE_BUILD_TARGET: ${{ matrix.target }}
         run: |
           cargo build \
             --release \
-            -p nanocode \
+            -p pebble \
             --target "${{ matrix.target }}"
 
       - name: Prepare release binary
@@ -118,15 +118,15 @@ jobs:
         run: |
           version="${{ needs.metadata.outputs.version }}"
           target="${{ matrix.target }}"
-          binary_name="nanocode-${target}"
-          cp "target/${target}/release/nanocode" "$binary_name"
+          binary_name="pebble-${target}"
+          cp "target/${target}/release/pebble" "$binary_name"
           chmod +x "$binary_name"
 
       - name: Upload release binary
         uses: actions/upload-artifact@v4
         with:
-          name: nanocode-${{ matrix.target }}
-          path: nanocode-${{ matrix.target }}
+          name: pebble-${{ matrix.target }}
+          path: pebble-${{ matrix.target }}
           if-no-files-found: error
 
   release:
@@ -154,11 +154,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.metadata.outputs.tag }}
-          name: NanoCode ${{ needs.metadata.outputs.version }}
+          name: Pebble ${{ needs.metadata.outputs.version }}
           generate_release_notes: true
           draft: false
           prerelease: false
           overwrite_files: true
           files: |
-            release-artifacts/**/nanocode-*
+            release-artifacts/**/pebble-*
             release-artifacts/SHA256SUMS

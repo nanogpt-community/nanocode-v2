@@ -55,14 +55,35 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<ChatCompletionToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub billing_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ChatCompletionThinkingConfig>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stream: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatCompletionThinkingConfig {
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+impl ChatCompletionThinkingConfig {
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            kind: "disabled".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InputMessage {
     pub role: String,
     pub content: Vec<InputContentBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 impl InputMessage {
@@ -71,6 +92,8 @@ impl InputMessage {
         Self {
             role: "user".to_string(),
             content: vec![InputContentBlock::Text { text: text.into() }],
+            reasoning_content: None,
+            reasoning: None,
         }
     }
 
@@ -89,6 +112,8 @@ impl InputMessage {
                 }],
                 is_error,
             }],
+            reasoning_content: None,
+            reasoning: None,
         }
     }
 }
@@ -219,9 +244,13 @@ pub struct ChatCompletionChoice {
 pub struct ChatCompletionAssistantMessage {
     pub role: String,
     #[serde(default)]
-    pub content: Option<String>,
+    pub content: Option<ChatCompletionContent>,
     #[serde(default)]
     pub tool_calls: Option<Vec<ChatCompletionToolCall>>,
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
+    #[serde(default)]
+    pub reasoning: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,11 +281,30 @@ pub struct ChatCompletionUsage {
 pub struct ChatCompletionMessage {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<ChatCompletionContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ChatCompletionToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ChatCompletionContent {
+    Text(String),
+    Parts(Vec<ChatCompletionContentPart>),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatCompletionContentPart {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 impl MessageResponse {

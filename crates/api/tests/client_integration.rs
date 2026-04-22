@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api::{
-    ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ImageSource,
-    InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest, NanoGptClient,
+    ApiError, ApiService, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
+    ImageSource, InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest, NanoGptClient,
     OutputContentBlock, StreamEvent, ToolChoice, ToolDefinition,
 };
 use serde_json::json;
@@ -20,7 +20,7 @@ async fn send_message_posts_json_and_parses_response() {
         "\"id\":\"msg_test\",",
         "\"type\":\"message\",",
         "\"role\":\"assistant\",",
-        "\"content\":[{\"type\":\"text\",\"text\":\"Hello from NanoCode\"}],",
+        "\"content\":[{\"type\":\"text\",\"text\":\"Hello from Pebble\"}],",
         "\"model\":\"openai/gpt-5.2\",",
         "\"stop_reason\":\"end_turn\",",
         "\"stop_sequence\":null,",
@@ -46,7 +46,7 @@ async fn send_message_posts_json_and_parses_response() {
     assert_eq!(
         response.content,
         vec![OutputContentBlock::Text {
-            text: "Hello from NanoCode".to_string(),
+            text: "Hello from Pebble".to_string(),
         }]
     );
 
@@ -73,6 +73,188 @@ async fn send_message_posts_json_and_parses_response() {
     assert_eq!(body["tool_choice"]["type"], json!("auto"));
 }
 
+#[tokio::test]
+async fn opencode_go_chat_models_translate_messages_to_chat_completions() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_test\",",
+        "\"object\":\"chat.completion\",",
+        "\"created\":1774656000,",
+        "\"choices\":[{",
+        "\"index\":0,",
+        "\"message\":{",
+        "\"role\":\"assistant\",",
+        "\"content\":\"Hello from OpenCode Go\",",
+        "\"reasoning_content\":\"Internal reasoning\",",
+        "\"tool_calls\":[{",
+        "\"id\":\"call_123\",",
+        "\"type\":\"function\",",
+        "\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}",
+        "}]",
+        "},",
+        "\"finish_reason\":\"tool_calls\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":3,\"total_tokens\":12}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response_with_headers(
+            "200 OK",
+            "application/json",
+            body,
+            &[("request-id", "req_go_123")],
+        )],
+    )
+    .await;
+
+    let client = NanoGptClient::new("go-key")
+        .with_service(ApiService::OpencodeGo)
+        .with_base_url(server.base_url());
+    let response = client
+        .send_message(&MessageRequest {
+            model: "opencode-go/kimi-k2.6".to_string(),
+            max_tokens: 128,
+            messages: vec![InputMessage::user_text("hello")],
+            system: Some("system".to_string()),
+            tools: Some(vec![ToolDefinition {
+                name: "get_weather".to_string(),
+                description: Some("Get weather".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"}
+                    }
+                }),
+            }]),
+            tool_choice: Some(ToolChoice::Auto),
+            thinking: None,
+            stream: false,
+        })
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.request_id.as_deref(), Some("req_go_123"));
+    assert_eq!(response.model, "opencode-go/kimi-k2.6");
+    assert_eq!(response.usage.input_tokens, 9);
+    assert_eq!(response.usage.output_tokens, 3);
+    assert_eq!(
+        response.content,
+        vec![
+            OutputContentBlock::Thinking {
+                thinking: "Internal reasoning".to_string(),
+                signature: None,
+            },
+            OutputContentBlock::Text {
+                text: "Hello from OpenCode Go".to_string(),
+            },
+            OutputContentBlock::ToolUse {
+                id: "call_123".to_string(),
+                name: "get_weather".to_string(),
+                input: json!({"city":"Paris"}),
+            }
+        ]
+    );
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("server should capture request");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer go-key")
+    );
+    assert_eq!(
+        request.headers.get("x-api-key").map(String::as_str),
+        Some("go-key")
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be json");
+    assert_eq!(body["model"], json!("kimi-k2.6"));
+    assert_eq!(body["messages"][0]["role"], json!("system"));
+    assert_eq!(body["messages"][1]["role"], json!("user"));
+    assert_eq!(body["messages"][1]["content"], json!("hello"));
+    assert_eq!(body["tool_choice"], json!("auto"));
+    assert_eq!(body["thinking"]["type"], json!("disabled"));
+}
+
+#[tokio::test]
+async fn opencode_go_stream_message_emits_buffered_content_blocks() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_test\",",
+        "\"object\":\"chat.completion\",",
+        "\"created\":1774656000,",
+        "\"choices\":[{",
+        "\"index\":0,",
+        "\"message\":{",
+        "\"role\":\"assistant\",",
+        "\"content\":\"Hello from OpenCode Go\",",
+        "\"tool_calls\":[{",
+        "\"id\":\"call_123\",",
+        "\"type\":\"function\",",
+        "\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}",
+        "}]",
+        "},",
+        "\"finish_reason\":\"tool_calls\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":3,\"total_tokens\":12}",
+        "}"
+    );
+    let server = spawn_server(
+        state,
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let client = NanoGptClient::new("go-key")
+        .with_service(ApiService::OpencodeGo)
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&MessageRequest {
+            model: "opencode-go/glm-5.1".to_string(),
+            max_tokens: 128,
+            messages: vec![InputMessage::user_text("hello")],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            stream: true,
+        })
+        .await
+        .expect("stream should start");
+
+    let mut events = Vec::new();
+    while let Some(event) = stream
+        .next_event()
+        .await
+        .expect("stream event should parse")
+    {
+        events.push(event);
+    }
+
+    assert!(matches!(events[0], StreamEvent::MessageStart(_)));
+    assert!(matches!(
+        events[1],
+        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+            content_block: OutputContentBlock::Text { .. },
+            ..
+        })
+    ));
+    assert!(matches!(events[2], StreamEvent::ContentBlockStop(_)));
+    assert!(matches!(
+        events[3],
+        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+            content_block: OutputContentBlock::ToolUse { .. },
+            ..
+        })
+    ));
+    assert!(matches!(events[4], StreamEvent::ContentBlockStop(_)));
+    assert!(matches!(events[5], StreamEvent::MessageDelta(_)));
+    assert!(matches!(events[6], StreamEvent::MessageStop(_)));
+}
+
 #[test]
 fn image_content_blocks_serialize_with_base64_source() {
     let request = MessageRequest {
@@ -87,6 +269,8 @@ fn image_content_blocks_serialize_with_base64_source() {
                     data: "AQID".to_string(),
                 },
             }],
+            reasoning_content: None,
+            reasoning: None,
         }],
         system: None,
         tools: None,
@@ -586,6 +770,8 @@ fn sample_request(stream: bool) -> MessageRequest {
                     is_error: false,
                 },
             ],
+            reasoning_content: None,
+            reasoning: None,
         }],
         system: Some("Use tools when needed".to_string()),
         tools: Some(vec![ToolDefinition {

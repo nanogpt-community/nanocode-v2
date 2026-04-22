@@ -17,7 +17,7 @@ const BUNDLED_MARKETPLACE: &str = "bundled";
 const SETTINGS_FILE_NAME: &str = "settings.json";
 const REGISTRY_FILE_NAME: &str = "installed.json";
 const MANIFEST_FILE_NAME: &str = "plugin.json";
-const MANIFEST_DIR_NAME: &str = ".nanocode-plugin";
+const MANIFEST_DIR_NAME: &str = ".pebble-plugin";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -182,14 +182,14 @@ impl PluginTool {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .env("NANOCODE_PLUGIN_ID", &self.plugin_id)
-            .env("NANOCODE_PLUGIN_NAME", &self.plugin_name)
-            .env("NANOCODE_TOOL_NAME", &self.definition.name)
-            .env("NANOCODE_TOOL_INPUT", &input_json);
+            .env("PEBBLE_PLUGIN_ID", &self.plugin_id)
+            .env("PEBBLE_PLUGIN_NAME", &self.plugin_name)
+            .env("PEBBLE_TOOL_NAME", &self.definition.name)
+            .env("PEBBLE_TOOL_INPUT", &input_json);
         if let Some(root) = &self.root {
             process
                 .current_dir(root)
-                .env("NANOCODE_PLUGIN_ROOT", root.display().to_string());
+                .env("PEBBLE_PLUGIN_ROOT", root.display().to_string());
         }
 
         let mut child = process.spawn()?;
@@ -1019,9 +1019,9 @@ fn run_lifecycle_commands(
         if let Some(root) = root {
             process.current_dir(root);
         }
-        process.env("NANOCODE_PLUGIN_ID", &metadata.id);
-        process.env("NANOCODE_PLUGIN_NAME", &metadata.name);
-        process.env("NANOCODE_PLUGIN_STAGE", stage);
+        process.env("PEBBLE_PLUGIN_ID", &metadata.id);
+        process.env("PEBBLE_PLUGIN_NAME", &metadata.name);
+        process.env("PEBBLE_PLUGIN_STAGE", stage);
         let output = process.output()?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1133,7 +1133,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("nanocode-plugins-{label}-{nanos}"))
+        std::env::temp_dir().join(format!("pebble-plugins-{label}-{nanos}"))
     }
 
     fn write_file(path: &Path, contents: &str) {

@@ -136,6 +136,7 @@ mod tests {
     fn bootstraps_stdio_servers_into_transport_targets() {
         let config = ScopedMcpServerConfig {
             scope: ConfigSource::User,
+            enabled: true,
             config: McpServerConfig::Stdio(McpStdioServerConfig {
                 command: "uvx".to_string(),
                 args: vec!["mcp-server".to_string()],
@@ -169,6 +170,7 @@ mod tests {
     fn bootstraps_remote_servers_with_oauth_auth() {
         let config = ScopedMcpServerConfig {
             scope: ConfigSource::Project,
+            enabled: true,
             config: McpServerConfig::Http(McpRemoteServerConfig {
                 url: "https://vendor.example/mcp".to_string(),
                 headers: BTreeMap::from([("X-Test".to_string(), "1".to_string())]),
@@ -206,6 +208,7 @@ mod tests {
     fn bootstraps_websocket_and_sdk_transports_without_oauth() {
         let ws = ScopedMcpServerConfig {
             scope: ConfigSource::Local,
+            enabled: true,
             config: McpServerConfig::Ws(McpWebSocketServerConfig {
                 url: "wss://vendor.example/mcp".to_string(),
                 headers: BTreeMap::new(),
@@ -214,6 +217,7 @@ mod tests {
         };
         let sdk = ScopedMcpServerConfig {
             scope: ConfigSource::Local,
+            enabled: true,
             config: McpServerConfig::Sdk(McpSdkServerConfig {
                 name: "sdk-server".to_string(),
             }),

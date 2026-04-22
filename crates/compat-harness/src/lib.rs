@@ -117,7 +117,7 @@ pub fn extract_manifest(paths: &UpstreamPaths) -> std::io::Result<ExtractedManif
     let bootstrap = if paths.cli_path().exists() {
         extract_bootstrap_plan(&fs::read_to_string(paths.cli_path())?)
     } else {
-        BootstrapPlan::nanocode_default()
+        BootstrapPlan::pebble_default()
     };
 
     Ok(ExtractedManifest {
@@ -389,7 +389,11 @@ mod tests {
 
     #[test]
     fn detects_known_upstream_command_symbols() {
-        let commands = extract_manifest(&fixture_paths())
+        let paths = fixture_paths();
+        if !has_upstream_fixture(&paths) {
+            return;
+        }
+        let commands = extract_manifest(&paths)
             .expect("manifest should load")
             .commands;
         let names: Vec<_> = commands
@@ -403,7 +407,11 @@ mod tests {
 
     #[test]
     fn detects_known_upstream_tool_symbols() {
-        let tools = extract_manifest(&fixture_paths())
+        let paths = fixture_paths();
+        if !has_upstream_fixture(&paths) {
+            return;
+        }
+        let tools = extract_manifest(&paths)
             .expect("manifest should load")
             .tools;
         let names: Vec<_> = tools

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::json::JsonValue;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 
-pub const NANOCODE_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
+pub const PEBBLE_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConfigSource {
@@ -70,6 +70,7 @@ pub struct McpConfigCollection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopedMcpServerConfig {
     pub scope: ConfigSource,
+    pub enabled: bool,
     pub config: McpServerConfig,
 }
 
@@ -211,11 +212,11 @@ impl ConfigLoader {
             },
             ConfigEntry {
                 source: ConfigSource::Project,
-                path: self.cwd.join(".nanocode").join("settings.json"),
+                path: self.cwd.join(".pebble").join("settings.json"),
             },
             ConfigEntry {
                 source: ConfigSource::Local,
-                path: self.cwd.join(".nanocode").join("settings.local.json"),
+                path: self.cwd.join(".pebble").join("settings.local.json"),
             },
         ]
     }
@@ -434,10 +435,10 @@ impl RuntimePluginConfig {
 
 #[must_use]
 pub fn default_config_home() -> PathBuf {
-    std::env::var_os("NANOCODE_CONFIG_HOME")
+    std::env::var_os("PEBBLE_CONFIG_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".nanocode")))
-        .unwrap_or_else(|| PathBuf::from(".nanocode"))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pebble")))
+        .unwrap_or_else(|| PathBuf::from(".pebble"))
 }
 
 impl McpConfigCollection {
@@ -453,6 +454,11 @@ impl McpConfigCollection {
 }
 
 impl ScopedMcpServerConfig {
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     #[must_use]
     pub fn transport(&self) -> McpTransport {
         self.config.transport()
@@ -512,15 +518,14 @@ fn merge_mcp_servers(
     };
     let servers = expect_object(mcp_servers, &format!("{}: mcpServers", path.display()))?;
     for (name, value) in servers {
-        let parsed = parse_mcp_server_config(
-            name,
-            value,
-            &format!("{}: mcpServers.{name}", path.display()),
-        )?;
+        let context = format!("{}: mcpServers.{name}", path.display());
+        let server = expect_object(value, &context)?;
+        let parsed = parse_mcp_server_config(name, value, &context)?;
         target.insert(
             name.clone(),
             ScopedMcpServerConfig {
                 scope: source,
+                enabled: optional_bool(server, "enabled", &context)?.unwrap_or(true),
                 config: parsed,
             },
         );
@@ -928,7 +933,7 @@ fn deep_merge_objects(
 mod tests {
     use super::{
         ConfigLoader, ConfigSource, McpServerConfig, McpTransport, ResolvedPermissionMode,
-        NANOCODE_SETTINGS_SCHEMA_NAME,
+        PEBBLE_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -947,7 +952,7 @@ mod tests {
     fn rejects_non_object_settings_files() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".nanocode");
+        let home = root.join("home").join(".pebble");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(home.join("settings.json"), "[]").expect("write bad settings");
@@ -963,11 +968,11 @@ mod tests {
     }
 
     #[test]
-    fn loads_and_merges_nanocode_config_files_by_precedence() {
+    fn loads_and_merges_pebble_config_files_by_precedence() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".nanocode");
-        fs::create_dir_all(cwd.join(".nanocode")).expect("project config dir");
+        let home = root.join("home").join(".pebble");
+        fs::create_dir_all(cwd.join(".pebble")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
@@ -976,12 +981,12 @@ mod tests {
         )
         .expect("write user settings");
         fs::write(
-            cwd.join(".nanocode").join("settings.json"),
+            cwd.join(".pebble").join("settings.json"),
             r#"{"env":{"B":"2"},"hooks":{"PostToolUse":["project"]}}"#,
         )
         .expect("write project settings");
         fs::write(
-            cwd.join(".nanocode").join("settings.local.json"),
+            cwd.join(".pebble").join("settings.local.json"),
             r#"{"model":"opus","permissionMode":"acceptEdits"}"#,
         )
         .expect("write local settings");
@@ -990,7 +995,7 @@ mod tests {
             .load()
             .expect("config should load");
 
-        assert_eq!(NANOCODE_SETTINGS_SCHEMA_NAME, "SettingsSchema");
+        assert_eq!(PEBBLE_SETTINGS_SCHEMA_NAME, "SettingsSchema");
         assert_eq!(loaded.loaded_entries().len(), 3);
         assert_eq!(loaded.loaded_entries()[0].source, ConfigSource::User);
         assert_eq!(
@@ -1030,12 +1035,12 @@ mod tests {
     fn parses_sandbox_config() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".nanocode");
-        fs::create_dir_all(cwd.join(".nanocode")).expect("project config dir");
+        let home = root.join("home").join(".pebble");
+        fs::create_dir_all(cwd.join(".pebble")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
-            cwd.join(".nanocode").join("settings.local.json"),
+            cwd.join(".pebble").join("settings.local.json"),
             r#"{
               "sandbox": {
                 "enabled": true,
@@ -1068,8 +1073,8 @@ mod tests {
     fn parses_typed_mcp_and_oauth_config() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".nanocode");
-        fs::create_dir_all(cwd.join(".nanocode")).expect("project config dir");
+        let home = root.join("home").join(".pebble");
+        fs::create_dir_all(cwd.join(".pebble")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
@@ -1106,7 +1111,7 @@ mod tests {
         )
         .expect("write user settings");
         fs::write(
-            cwd.join(".nanocode").join("settings.local.json"),
+            cwd.join(".pebble").join("settings.local.json"),
             r#"{
               "mcpServers": {
                 "remote-server": {
@@ -1128,6 +1133,7 @@ mod tests {
             .get("stdio-server")
             .expect("stdio server should exist");
         assert_eq!(stdio_server.scope, ConfigSource::User);
+        assert!(stdio_server.enabled);
         assert_eq!(stdio_server.transport(), McpTransport::Stdio);
 
         let remote_server = loaded
@@ -1135,6 +1141,7 @@ mod tests {
             .get("remote-server")
             .expect("remote server should exist");
         assert_eq!(remote_server.scope, ConfigSource::Local);
+        assert!(remote_server.enabled);
         assert_eq!(remote_server.transport(), McpTransport::Ws);
         match &remote_server.config {
             McpServerConfig::Ws(config) => {
@@ -1159,8 +1166,8 @@ mod tests {
     fn parses_plugin_config() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".nanocode");
-        fs::create_dir_all(cwd.join(".nanocode")).expect("project config dir");
+        let home = root.join("home").join(".pebble");
+        fs::create_dir_all(cwd.join(".pebble")).expect("project config dir");
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
@@ -1208,7 +1215,7 @@ mod tests {
     fn rejects_invalid_mcp_server_shapes() {
         let root = temp_dir();
         let cwd = root.join("project");
-        let home = root.join("home").join(".nanocode");
+        let home = root.join("home").join(".pebble");
         fs::create_dir_all(&home).expect("home config dir");
         fs::create_dir_all(&cwd).expect("project dir");
         fs::write(
@@ -1223,6 +1230,39 @@ mod tests {
         assert!(error
             .to_string()
             .contains("mcpServers.broken: missing string field url"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_disabled_mcp_server_flag() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".pebble");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{
+              "mcpServers": {
+                "context7": {
+                  "type": "http",
+                  "url": "https://example.test/mcp",
+                  "enabled": false
+                }
+              }
+            }"#,
+        )
+        .expect("write settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        let server = loaded
+            .mcp()
+            .get("context7")
+            .expect("context7 server should exist");
+        assert!(!server.enabled);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

@@ -719,27 +719,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nanocode"
-version = "0.1.7"
-dependencies = [
- "api",
- "commands",
- "compat-harness",
- "crossterm",
- "plugins",
- "pulldown-cmark",
- "reqwest",
- "runtime",
- "rustyline",
- "serde",
- "serde_json",
- "sha2",
- "syntect",
- "tokio",
- "tools",
-]
-
-[[package]]
 name = "nibble_vec"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -815,6 +794,27 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-link",
+]
+
+[[package]]
+name = "pebble"
+version = "0.1.7"
+dependencies = [
+ "api",
+ "commands",
+ "compat-harness",
+ "crossterm",
+ "plugins",
+ "pulldown-cmark",
+ "reqwest",
+ "runtime",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "sha2",
+ "syntect",
+ "tokio",
+ "tools",
 ]
 
 [[package]]

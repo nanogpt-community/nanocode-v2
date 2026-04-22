@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 
 const STARTER_SETTINGS_LOCAL_JSON: &str =
     concat!("{\n", "  \"permissionMode\": \"workspace-write\"\n", "}\n",);
-const GITIGNORE_COMMENT: &str = "# NanoCode local artifacts";
+const GITIGNORE_COMMENT: &str = "# Pebble local artifacts";
 const GITIGNORE_ENTRIES: [&str; 4] = [
-    ".nanocode/settings.local.json",
-    ".nanocode/sessions/",
-    ".nanocode/agents/",
-    ".nanocode/mcp/",
+    ".pebble/settings.local.json",
+    ".pebble/sessions/",
+    ".pebble/agents/",
+    ".pebble/mcp/",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,17 +78,24 @@ struct RepoDetection {
 }
 
 pub(crate) fn initialize_repo(cwd: &Path) -> Result<InitReport, Box<dyn std::error::Error>> {
+    initialize_repo_with_pebble_md(cwd, &render_init_pebble_md(cwd))
+}
+
+pub(crate) fn initialize_repo_with_pebble_md(
+    cwd: &Path,
+    pebble_md_content: &str,
+) -> Result<InitReport, Box<dyn std::error::Error>> {
     let mut artifacts = Vec::new();
 
-    let nanocode_dir = cwd.join(".nanocode");
+    let pebble_dir = cwd.join(".pebble");
     artifacts.push(InitArtifact {
-        name: ".nanocode/",
-        status: ensure_dir(&nanocode_dir)?,
+        name: ".pebble/",
+        status: ensure_dir(&pebble_dir)?,
     });
 
-    let settings_local = nanocode_dir.join("settings.local.json");
+    let settings_local = pebble_dir.join("settings.local.json");
     artifacts.push(InitArtifact {
-        name: ".nanocode/settings.local.json",
+        name: ".pebble/settings.local.json",
         status: write_file_if_missing(&settings_local, STARTER_SETTINGS_LOCAL_JSON)?,
     });
 
@@ -98,11 +105,10 @@ pub(crate) fn initialize_repo(cwd: &Path) -> Result<InitReport, Box<dyn std::err
         status: ensure_gitignore_entries(&gitignore)?,
     });
 
-    let nanocode_md = cwd.join("NANOCODE.md");
-    let content = render_init_nanocode_md(cwd);
+    let pebble_md = cwd.join("PEBBLE.md");
     artifacts.push(InitArtifact {
-        name: "NANOCODE.md",
-        status: write_file_if_missing(&nanocode_md, &content)?,
+        name: "PEBBLE.md",
+        status: write_file_if_missing(&pebble_md, pebble_md_content)?,
     });
 
     Ok(InitReport {
@@ -159,12 +165,12 @@ fn ensure_gitignore_entries(path: &Path) -> Result<InitStatus, std::io::Error> {
     Ok(InitStatus::Updated)
 }
 
-pub(crate) fn render_init_nanocode_md(cwd: &Path) -> String {
+pub(crate) fn render_init_pebble_md(cwd: &Path) -> String {
     let detection = detect_repo(cwd);
     let mut lines = vec![
-        "# NANOCODE.md".to_string(),
+        "# PEBBLE.md".to_string(),
         String::new(),
-        "This file gives NanoCode repo-specific guidance for working in this project.".to_string(),
+        "This file gives Pebble repo-specific guidance for working in this project.".to_string(),
         String::new(),
     ];
 
@@ -209,10 +215,9 @@ pub(crate) fn render_init_nanocode_md(cwd: &Path) -> String {
 
     lines.push("## Working agreement".to_string());
     lines.push("- Prefer small, reviewable changes and keep generated bootstrap files aligned with actual repo workflows.".to_string());
-    lines.push("- Keep shared defaults in `.nanocode/settings.json`; reserve `.nanocode/settings.local.json` for machine-local overrides.".to_string());
+    lines.push("- Keep shared defaults in `.pebble/settings.json`; reserve `.pebble/settings.local.json` for machine-local overrides.".to_string());
     lines.push(
-        "- Update `NANOCODE.md` intentionally when repo workflows or conventions change."
-            .to_string(),
+        "- Update `PEBBLE.md` intentionally when repo workflows or conventions change.".to_string(),
     );
     lines.push(String::new());
 
@@ -342,19 +347,19 @@ fn framework_notes(detection: &RepoDetection) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{initialize_repo, render_init_nanocode_md};
+    use super::{initialize_repo, initialize_repo_with_pebble_md, render_init_pebble_md};
 
     #[test]
-    fn renders_nanocode_md_header() {
-        let rendered = render_init_nanocode_md(std::path::Path::new("."));
-        assert!(rendered.contains("# NANOCODE.md"));
-        assert!(rendered.contains("NanoCode"));
+    fn renders_pebble_md_header() {
+        let rendered = render_init_pebble_md(std::path::Path::new("."));
+        assert!(rendered.contains("# PEBBLE.md"));
+        assert!(rendered.contains("Pebble"));
     }
 
     #[test]
-    fn initialize_repo_creates_nanocode_artifacts() {
+    fn initialize_repo_creates_pebble_artifacts() {
         let root = std::env::temp_dir().join(format!(
-            "nanocode-init-{}",
+            "pebble-init-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("time should work")
@@ -366,9 +371,28 @@ mod tests {
         assert!(report
             .artifacts
             .iter()
-            .any(|artifact| artifact.name == "NANOCODE.md"));
-        assert!(root.join("NANOCODE.md").is_file());
-        assert!(root.join(".nanocode").is_dir());
+            .any(|artifact| artifact.name == "PEBBLE.md"));
+        assert!(root.join("PEBBLE.md").is_file());
+        assert!(root.join(".pebble").is_dir());
+
+        std::fs::remove_dir_all(&root).expect("temp root should be removable");
+    }
+
+    #[test]
+    fn initialize_repo_writes_custom_pebble_md() {
+        let root = std::env::temp_dir().join(format!(
+            "pebble-init-custom-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should work")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp root should exist");
+
+        initialize_repo_with_pebble_md(&root, "# PEBBLE.md\n\nCustom project guidance\n")
+            .expect("init should succeed");
+        let written = std::fs::read_to_string(root.join("PEBBLE.md")).expect("pebble md exists");
+        assert!(written.contains("Custom project guidance"));
 
         std::fs::remove_dir_all(&root).expect("temp root should be removable");
     }

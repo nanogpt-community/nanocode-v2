@@ -49,6 +49,10 @@ pub struct SessionMetadata {
     pub model: String,
     pub message_count: u32,
     pub last_prompt: Option<String>,
+    pub permission_mode: Option<String>,
+    pub thinking_enabled: Option<bool>,
+    pub proxy_tool_calls: Option<bool>,
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +189,36 @@ impl SessionMetadata {
                 JsonValue::String(last_prompt.clone()),
             );
         }
+        if let Some(permission_mode) = &self.permission_mode {
+            object.insert(
+                "permission_mode".to_string(),
+                JsonValue::String(permission_mode.clone()),
+            );
+        }
+        if let Some(thinking_enabled) = self.thinking_enabled {
+            object.insert(
+                "thinking_enabled".to_string(),
+                JsonValue::Bool(thinking_enabled),
+            );
+        }
+        if let Some(proxy_tool_calls) = self.proxy_tool_calls {
+            object.insert(
+                "proxy_tool_calls".to_string(),
+                JsonValue::Bool(proxy_tool_calls),
+            );
+        }
+        if let Some(allowed_tools) = &self.allowed_tools {
+            object.insert(
+                "allowed_tools".to_string(),
+                JsonValue::Array(
+                    allowed_tools
+                        .iter()
+                        .cloned()
+                        .map(JsonValue::String)
+                        .collect(),
+                ),
+            );
+        }
         JsonValue::Object(object)
     }
 
@@ -197,6 +231,10 @@ impl SessionMetadata {
             model: required_string(object, "model")?,
             message_count: required_u32(object, "message_count")?,
             last_prompt: optional_string(object, "last_prompt"),
+            permission_mode: optional_string(object, "permission_mode"),
+            thinking_enabled: optional_bool(object, "thinking_enabled"),
+            proxy_tool_calls: optional_bool(object, "proxy_tool_calls"),
+            allowed_tools: optional_string_array(object, "allowed_tools")?,
         })
     }
 }
@@ -460,6 +498,31 @@ fn optional_string(object: &BTreeMap<String, JsonValue>, key: &str) -> Option<St
         .map(ToOwned::to_owned)
 }
 
+fn optional_bool(object: &BTreeMap<String, JsonValue>, key: &str) -> Option<bool> {
+    object.get(key).and_then(JsonValue::as_bool)
+}
+
+fn optional_string_array(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Result<Option<Vec<String>>, SessionError> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| SessionError::Format(format!("{key} must be an array")))?;
+    let mut strings = Vec::with_capacity(values.len());
+    for item in values {
+        strings.push(
+            item.as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| SessionError::Format(format!("{key} entries must be strings")))?,
+        );
+    }
+    Ok(Some(strings))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ContentBlock, ConversationMessage, MessageRole, Session, SessionMetadata};
@@ -475,6 +538,10 @@ mod tests {
             model: "zai-org/glm-5.1".to_string(),
             message_count: 3,
             last_prompt: Some("hello".to_string()),
+            permission_mode: Some("workspace-write".to_string()),
+            thinking_enabled: Some(true),
+            proxy_tool_calls: Some(false),
+            allowed_tools: Some(vec!["read_file".to_string(), "glob_search".to_string()]),
         });
         session
             .messages

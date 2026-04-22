@@ -36,6 +36,10 @@ impl SlashCommandHelper {
         self.current_line.borrow_mut().clear();
     }
 
+    fn set_completions(&mut self, completions: Vec<String>) {
+        self.completions = completions;
+    }
+
     fn current_line(&self) -> String {
         self.current_line.borrow().clone()
     }
@@ -56,7 +60,7 @@ impl Completer for SlashCommandHelper {
         pos: usize,
         _ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        let Some(prefix) = slash_command_prefix(line, pos) else {
+        let Some((start, prefix)) = slash_command_prefix(line, pos) else {
             return Ok((0, Vec::new()));
         };
 
@@ -70,7 +74,7 @@ impl Completer for SlashCommandHelper {
             })
             .collect();
 
-        Ok((0, matches))
+        Ok((start, matches))
     }
 }
 
@@ -103,7 +107,7 @@ pub struct LineEditor {
 impl LineEditor {
     #[must_use]
     pub fn new(prompt: impl Into<String>, completions: Vec<String>) -> Self {
-        let vim_enabled = env_flag_enabled("NANOCODE_VIM");
+        let vim_enabled = env_flag_enabled("PEBBLE_VIM");
         let editor = Self::build_editor(completions.clone(), vim_enabled);
 
         Self {
@@ -121,6 +125,13 @@ impl LineEditor {
         }
 
         let _ = self.editor.add_history_entry(entry);
+    }
+
+    pub fn set_completions(&mut self, completions: Vec<String>) {
+        self.completions = completions.clone();
+        if let Some(helper) = self.editor.helper_mut() {
+            helper.set_completions(completions);
+        }
     }
 
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
@@ -265,17 +276,17 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn slash_command_prefix(line: &str, pos: usize) -> Option<&str> {
+fn slash_command_prefix(line: &str, pos: usize) -> Option<(usize, &str)> {
     if pos != line.len() {
         return None;
     }
 
     let prefix = &line[..pos];
-    if prefix.contains(char::is_whitespace) || !prefix.starts_with('/') {
+    if !prefix.starts_with('/') {
         return None;
     }
 
-    Some(prefix)
+    Some((0, prefix))
 }
 
 #[cfg(test)]
@@ -288,7 +299,7 @@ mod tests {
 
     #[test]
     fn extracts_only_terminal_slash_command_prefixes() {
-        assert_eq!(slash_command_prefix("/he", 3), Some("/he"));
+        assert_eq!(slash_command_prefix("/he", 3), Some((0, "/he")));
         assert_eq!(slash_command_prefix("/help me", 5), None);
         assert_eq!(slash_command_prefix("hello", 5), None);
         assert_eq!(slash_command_prefix("/help", 2), None);
@@ -314,6 +325,29 @@ mod tests {
                 .map(|candidate| candidate.replacement)
                 .collect::<Vec<_>>(),
             vec!["/help".to_string(), "/hello".to_string()]
+        );
+    }
+
+    #[test]
+    fn completes_contextual_slash_commands_with_arguments() {
+        let helper = SlashCommandHelper::new(vec![
+            "/help auth".to_string(),
+            "/help sessions".to_string(),
+            "/permissions workspace-write".to_string(),
+        ]);
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+        let (start, matches) = helper
+            .complete("/help a", 7, &ctx)
+            .expect("completion should work");
+
+        assert_eq!(start, 0);
+        assert_eq!(
+            matches
+                .into_iter()
+                .map(|candidate| candidate.replacement)
+                .collect::<Vec<_>>(),
+            vec!["/help auth".to_string()]
         );
     }
 
