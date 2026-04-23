@@ -1,5 +1,11 @@
 # CHANGELOG (STARTING FROM v0.4.0)
 
+## v0.4.1
+
+- Add safer atomic writes for JSON, session, config, plugin, tool, and file-edit persistence to reduce the risk of truncated files.
+- Add CI coverage for formatting, clippy, and serial workspace tests.
+- Fix runtime prompt tests so they isolate temp roots from ambient project instruction and memory files.
+
 ## v0.4.0
 
 - Completely redesigned compaction
