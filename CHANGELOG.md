@@ -1,5 +1,12 @@
 # CHANGELOG (STARTING FROM v0.4.0)
 
+## v0.4.2
+
+- Add repo-aware defaults for native search tools: broad `grep_search` and `glob_search` now skip hidden/project-state directories, respect `.gitignore`, and avoid `.git`, `target`, `.pebble/sessions`, `.pebble/tool-results`, `.pebble/agents`, `.sandbox-home`, and `.sandbox-tmp` unless explicitly targeted.
+- Add workspace-bound path enforcement for `read_file`, `write_file`, `edit_file`, `glob_search`, `grep_search`, and `apply_patch` targets, including lexical and symlink escape checks with clear `path escapes workspace: ...` errors.
+- Add focused runtime coverage for workspace path safety, symlink escapes, missing file creation, patch target safety, and repo-aware search behavior.
+- Replace direct runtime `walkdir` traversal with `ignore::WalkBuilder` and remove the direct `walkdir` runtime dependency.
+
 ## v0.4.1
 
 - Add safer atomic writes for JSON, session, config, plugin, tool, and file-edit persistence to reduce the risk of truncated files.

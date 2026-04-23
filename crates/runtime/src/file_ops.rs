@@ -1,14 +1,25 @@
 use std::cmp::Reverse;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 use glob::Pattern;
+use ignore::WalkBuilder;
 use platform::write_atomic;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
-use walkdir::WalkDir;
+
+const SEARCH_RESULT_LIMIT: usize = 100;
+const DEFAULT_SEARCH_SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    ".pebble/sessions",
+    ".pebble/tool-results",
+    ".pebble/agents",
+    ".sandbox-home",
+    ".sandbox-tmp",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TextFilePayload {
@@ -163,7 +174,7 @@ pub fn read_file(
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> io::Result<ReadFileOutput> {
-    let absolute_path = normalize_path(path)?;
+    let absolute_path = normalize_existing_workspace_path(path)?;
     let content = fs::read_to_string(&absolute_path)?;
     let lines: Vec<&str> = content.lines().collect();
     let start_index = offset.unwrap_or(0).min(lines.len());
@@ -185,7 +196,7 @@ pub fn read_file(
 }
 
 pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
-    let absolute_path = normalize_path_allow_missing(path)?;
+    let absolute_path = normalize_missing_workspace_path(path)?;
     let original_file = fs::read_to_string(&absolute_path).ok();
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
@@ -212,7 +223,7 @@ pub fn edit_file(
     new_string: &str,
     replace_all: bool,
 ) -> io::Result<EditFileOutput> {
-    let absolute_path = normalize_path(path)?;
+    let absolute_path = normalize_existing_workspace_path(path)?;
     let original_file = fs::read_to_string(&absolute_path)?;
     if old_string == new_string {
         return Err(io::Error::new(
@@ -247,7 +258,7 @@ pub fn edit_file(
 }
 
 pub fn apply_patch(patch: &str, dry_run: bool) -> io::Result<ApplyPatchOutput> {
-    let cwd = std::env::current_dir()?;
+    let cwd = workspace_root()?;
     let plans = parse_patch_plans(patch, &cwd)?;
     if plans.is_empty() {
         return Err(io::Error::new(
@@ -357,24 +368,42 @@ pub fn apply_patch(patch: &str, dry_run: bool) -> io::Result<ApplyPatchOutput> {
 
 pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
+    let workspace = workspace_root()?;
     let base_dir = path
-        .map(normalize_path)
+        .map(normalize_existing_workspace_path)
         .transpose()?
-        .unwrap_or(std::env::current_dir()?);
-    let search_pattern = if Path::new(pattern).is_absolute() {
-        pattern.to_owned()
+        .unwrap_or_else(|| workspace.clone());
+    let explicit_path = path.is_some();
+    let pattern_path = if Path::new(pattern).is_absolute() {
+        PathBuf::from(pattern)
     } else {
-        base_dir.join(pattern).to_string_lossy().into_owned()
+        base_dir.join(pattern)
+    };
+    ensure_workspace_path(&normalize_path_lexically(&pattern_path), &workspace)?;
+    let search_pattern = pattern_path.to_string_lossy().into_owned();
+    let visible_files = if explicit_path {
+        None
+    } else {
+        Some(collect_search_files(&base_dir, false)?)
     };
 
     let mut matches = Vec::new();
     let entries = glob::glob(&search_pattern)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     for entry in entries.flatten() {
-        if entry.is_file() {
-            matches.push(entry);
+        if !entry.is_file() {
+            continue;
         }
+        let entry = normalize_existing_workspace_path_in_workspace(&entry, &workspace)?;
+        if let Some(visible_files) = &visible_files {
+            if visible_files.binary_search(&entry).is_err() {
+                continue;
+            }
+        }
+        matches.push(entry);
     }
+    matches.sort();
+    matches.dedup();
 
     matches.sort_by_key(|path| {
         fs::metadata(path)
@@ -383,10 +412,10 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
             .map(Reverse)
     });
 
-    let truncated = matches.len() > 100;
+    let truncated = matches.len() > SEARCH_RESULT_LIMIT;
     let filenames = matches
         .into_iter()
-        .take(100)
+        .take(SEARCH_RESULT_LIMIT)
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
 
@@ -402,9 +431,10 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let base_path = input
         .path
         .as_deref()
-        .map(normalize_path)
+        .map(normalize_existing_workspace_path)
         .transpose()?
-        .unwrap_or(std::env::current_dir()?);
+        .unwrap_or(workspace_root()?);
+    let explicit_path = input.path.is_some();
 
     let regex = RegexBuilder::new(&input.pattern)
         .case_insensitive(input.case_insensitive.unwrap_or(false))
@@ -429,7 +459,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let mut content_lines = Vec::new();
     let mut total_matches = 0usize;
 
-    for file_path in collect_search_files(&base_path)? {
+    for file_path in collect_search_files(&base_path, explicit_path)? {
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
             continue;
         }
@@ -507,18 +537,33 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     })
 }
 
-fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
+fn collect_search_files(base_path: &Path, explicit_path: bool) -> io::Result<Vec<PathBuf>> {
     if base_path.is_file() {
         return Ok(vec![base_path.to_path_buf()]);
     }
 
     let mut files = Vec::new();
-    for entry in WalkDir::new(base_path) {
+    let mut builder = WalkBuilder::new(base_path);
+    builder
+        .hidden(!explicit_path)
+        .ignore(!explicit_path)
+        .git_ignore(!explicit_path)
+        .git_global(!explicit_path)
+        .git_exclude(!explicit_path)
+        .parents(!explicit_path);
+
+    for entry in builder.build() {
         let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
-        if entry.file_type().is_file() {
+        let path = entry.path();
+        if entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+            && (explicit_path || is_default_search_visible(path, base_path))
+        {
             files.push(entry.path().to_path_buf());
         }
     }
+    files.sort();
     Ok(files)
 }
 
@@ -978,7 +1023,8 @@ fn validate_patch_path(cwd: &Path, path: &str) -> io::Result<PathBuf> {
     if clean.as_os_str().is_empty() {
         return Err(invalid_patch("patch path must not be empty"));
     }
-    Ok(cwd.join(clean))
+    normalize_missing_workspace_path_in_workspace(&clean, cwd)
+        .map_err(|error| invalid_patch(error.to_string()))
 }
 
 fn parse_hunk_header(header: &str) -> io::Result<(usize, usize, usize, usize)> {
@@ -1325,47 +1371,141 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
     }]
 }
 
-fn normalize_path(path: &str) -> io::Result<PathBuf> {
-    let candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    candidate.canonicalize()
+fn workspace_root() -> io::Result<PathBuf> {
+    std::env::current_dir()?.canonicalize()
 }
 
-fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
-    let candidate = if Path::new(path).is_absolute() {
-        PathBuf::from(path)
-    } else {
-        std::env::current_dir()?.join(path)
-    };
+fn normalize_existing_workspace_path(path: &str) -> io::Result<PathBuf> {
+    let workspace = workspace_root()?;
+    normalize_existing_workspace_path_in_workspace(Path::new(path), &workspace)
+}
 
-    if let Ok(canonical) = candidate.canonicalize() {
-        return Ok(canonical);
+fn normalize_existing_workspace_path_in_workspace(
+    path: &Path,
+    workspace: &Path,
+) -> io::Result<PathBuf> {
+    let candidate = resolve_candidate_path(path, workspace);
+    let lexical = normalize_path_lexically(&candidate);
+    ensure_workspace_path(&lexical, workspace)?;
+    let canonical = candidate.canonicalize()?;
+    ensure_workspace_path(&canonical, workspace)
+}
+
+fn normalize_missing_workspace_path(path: &str) -> io::Result<PathBuf> {
+    let workspace = workspace_root()?;
+    normalize_missing_workspace_path_in_workspace(Path::new(path), &workspace)
+}
+
+fn normalize_missing_workspace_path_in_workspace(
+    path: &Path,
+    workspace: &Path,
+) -> io::Result<PathBuf> {
+    let candidate = resolve_candidate_path(path, workspace);
+    let lexical = normalize_path_lexically(&candidate);
+    ensure_workspace_path(&lexical, workspace)?;
+
+    if let Ok(canonical) = lexical.canonicalize() {
+        return ensure_workspace_path(&canonical, workspace);
     }
 
-    if let Some(parent) = candidate.parent() {
-        let canonical_parent = parent
-            .canonicalize()
-            .unwrap_or_else(|_| parent.to_path_buf());
-        if let Some(name) = candidate.file_name() {
-            return Ok(canonical_parent.join(name));
+    let mut existing = lexical.as_path();
+    let mut missing_components = Vec::new();
+    loop {
+        match existing.canonicalize() {
+            Ok(canonical_existing) => {
+                let mut resolved = ensure_workspace_path(&canonical_existing, workspace)?;
+                for component in missing_components.iter().rev() {
+                    resolved.push(component);
+                }
+                return ensure_workspace_path(&resolved, workspace);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(file_name) = existing.file_name() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("path has no existing parent: {}", lexical.display()),
+                    ));
+                };
+                missing_components.push(file_name.to_os_string());
+                existing = existing.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("path has no existing parent: {}", lexical.display()),
+                    )
+                })?;
+            }
+            Err(error) => return Err(error),
         }
     }
+}
 
-    Ok(candidate)
+fn resolve_candidate_path(path: &Path, workspace: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    }
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                normalized.pop();
+            }
+        }
+    }
+    normalized
+}
+
+fn ensure_workspace_path(path: &Path, workspace: &Path) -> io::Result<PathBuf> {
+    if path.starts_with(workspace) {
+        Ok(path.to_path_buf())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("path escapes workspace: {}", path.display()),
+        ))
+    }
+}
+
+fn is_default_search_visible(path: &Path, base_path: &Path) -> bool {
+    let relative = path.strip_prefix(base_path).unwrap_or(path);
+    !is_hidden_path(relative) && !is_default_skip_path(relative)
+}
+
+fn is_hidden_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        let Component::Normal(part) = component else {
+            return false;
+        };
+        part.to_str()
+            .is_some_and(|part| part.starts_with('.') && part != "." && part != "..")
+    })
+}
+
+fn is_default_skip_path(path: &Path) -> bool {
+    DEFAULT_SEARCH_SKIP_DIRS
+        .iter()
+        .map(Path::new)
+        .any(|skip| path == skip || path.starts_with(skip))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         apply_patch, edit_file, glob_search, grep_search, read_file, write_file, GrepSearchInput,
     };
 
-    fn temp_path(name: &str) -> std::path::PathBuf {
+    fn temp_path(name: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time should move forward")
@@ -1373,38 +1513,202 @@ mod tests {
         std::env::temp_dir().join(format!("pebble-native-{name}-{unique}"))
     }
 
-    #[test]
-    fn reads_and_writes_files() {
-        let path = temp_path("read-write.txt");
-        let write_output = write_file(path.to_string_lossy().as_ref(), "one\ntwo\nthree")
-            .expect("write should succeed");
-        assert_eq!(write_output.kind, "create");
+    fn with_temp_workspace<T>(name: &str, test: impl FnOnce(&Path) -> T) -> T {
+        let _guard = crate::test_env_lock();
+        let dir = temp_path(name);
+        std::fs::create_dir_all(&dir).expect("workspace directory should be created");
+        let canonical_dir = dir
+            .canonicalize()
+            .expect("workspace directory should canonicalize");
+        let original_dir = std::env::current_dir().expect("cwd should exist");
+        std::env::set_current_dir(&canonical_dir).expect("set cwd");
 
-        let read_output = read_file(path.to_string_lossy().as_ref(), Some(1), Some(1))
-            .expect("read should succeed");
-        assert_eq!(read_output.file.content, "two");
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| test(&canonical_dir)));
+        std::env::set_current_dir(original_dir).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn grep_input(pattern: &str, path: Option<&str>, output_mode: &str) -> GrepSearchInput {
+        GrepSearchInput {
+            pattern: pattern.to_string(),
+            path: path.map(str::to_string),
+            glob: None,
+            output_mode: Some(output_mode.to_string()),
+            before: None,
+            after: None,
+            context_short: None,
+            context: None,
+            line_numbers: Some(true),
+            case_insensitive: Some(false),
+            file_type: None,
+            head_limit: Some(100),
+            offset: Some(0),
+            multiline: Some(false),
+        }
+    }
+
+    fn assert_error_contains(error: std::io::Error, expected: &str) {
+        let message = error.to_string();
+        assert!(
+            message.contains(expected),
+            "expected error `{message}` to contain `{expected}`"
+        );
+    }
+
+    fn assert_contains_relative_path(paths: &[String], workspace: &Path, relative: &str) {
+        let expected = workspace.join(relative).to_string_lossy().into_owned();
+        assert!(
+            paths.iter().any(|path| path == &expected),
+            "expected paths to contain `{expected}`, got {paths:?}"
+        );
+    }
+
+    fn assert_excludes_relative_path(paths: &[String], workspace: &Path, relative: &str) {
+        let expected = workspace.join(relative).to_string_lossy().into_owned();
+        assert!(
+            paths.iter().all(|path| path != &expected),
+            "expected paths to exclude `{expected}`, got {paths:?}"
+        );
     }
 
     #[test]
-    fn edits_file_contents() {
-        let path = temp_path("edit.txt");
-        write_file(path.to_string_lossy().as_ref(), "alpha beta alpha")
-            .expect("initial write should succeed");
-        let output = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", true)
-            .expect("edit should succeed");
-        assert!(output.replace_all);
+    fn reads_and_writes_files_inside_workspace() {
+        with_temp_workspace("read-write", |_| {
+            let write_output =
+                write_file("read-write.txt", "one\ntwo\nthree").expect("write should succeed");
+            assert_eq!(write_output.kind, "create");
+
+            let read_output =
+                read_file("read-write.txt", Some(1), Some(1)).expect("read should succeed");
+            assert_eq!(read_output.file.content, "two");
+        });
+    }
+
+    #[test]
+    fn edits_file_contents_inside_workspace() {
+        with_temp_workspace("edit", |_| {
+            write_file("edit.txt", "alpha beta alpha").expect("initial write should succeed");
+            let output =
+                edit_file("edit.txt", "alpha", "omega", true).expect("edit should succeed");
+            assert!(output.replace_all);
+            assert_eq!(
+                std::fs::read_to_string("edit.txt").expect("read edited file"),
+                "omega beta omega"
+            );
+        });
+    }
+
+    #[test]
+    fn rejects_absolute_paths_outside_workspace() {
+        with_temp_workspace("outside-path", |_| {
+            let outside = temp_path("outside-read.txt");
+            std::fs::write(&outside, "secret").expect("outside fixture write");
+
+            let error = read_file(outside.to_string_lossy().as_ref(), None, None)
+                .expect_err("outside read should fail");
+            assert_error_contains(error, "path escapes workspace:");
+
+            let error = write_file(outside.to_string_lossy().as_ref(), "changed")
+                .expect_err("outside write should fail");
+            assert_error_contains(error, "path escapes workspace:");
+            assert_eq!(
+                std::fs::read_to_string(&outside).expect("outside fixture read"),
+                "secret"
+            );
+
+            let _ = std::fs::remove_file(outside);
+        });
+    }
+
+    #[test]
+    fn rejects_parent_directory_escape() {
+        with_temp_workspace("parent-escape", |_| {
+            let error = write_file("../escape.txt", "nope").expect_err("parent escape should fail");
+            assert_error_contains(error, "path escapes workspace:");
+
+            let error = glob_search("../*.txt", None).expect_err("glob escape should fail");
+            assert_error_contains(error, "path escapes workspace:");
+        });
+    }
+
+    #[test]
+    fn creates_missing_files_inside_workspace() {
+        with_temp_workspace("missing-create", |_| {
+            let output = write_file("nested/new.txt", "created\n")
+                .expect("missing file create should succeed");
+            assert_eq!(output.kind, "create");
+            assert_eq!(
+                std::fs::read_to_string("nested/new.txt").expect("created file read"),
+                "created\n"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escape_for_native_file_tools() {
+        with_temp_workspace("symlink-escape", |_| {
+            let outside = temp_path("symlink-outside.txt");
+            std::fs::write(&outside, "secret").expect("outside fixture write");
+            std::os::unix::fs::symlink(&outside, "link.txt").expect("symlink fixture");
+
+            let error =
+                read_file("link.txt", None, None).expect_err("symlink read escape should fail");
+            assert_error_contains(error, "path escapes workspace:");
+
+            let error =
+                write_file("link.txt", "changed").expect_err("symlink write escape should fail");
+            assert_error_contains(error, "path escapes workspace:");
+
+            let error = edit_file("link.txt", "secret", "changed", false)
+                .expect_err("symlink edit escape should fail");
+            assert_error_contains(error, "path escapes workspace:");
+
+            assert_eq!(
+                std::fs::read_to_string(&outside).expect("outside fixture read"),
+                "secret"
+            );
+            let _ = std::fs::remove_file(outside);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_patch_targets_that_escape_through_symlink() {
+        with_temp_workspace("patch-symlink-escape", |_| {
+            let outside = temp_path("patch-symlink-outside.txt");
+            std::fs::write(&outside, "secret\n").expect("outside fixture write");
+            std::os::unix::fs::symlink(&outside, "link.txt").expect("symlink fixture");
+
+            let patch = "\
+*** Begin Patch
+*** Update File: link.txt
+@@
+-secret
++changed
+*** End Patch";
+            let error = apply_patch(patch, true).expect_err("symlink patch should fail");
+            assert_error_contains(error, "path escapes workspace:");
+            assert_eq!(
+                std::fs::read_to_string(&outside).expect("outside fixture read"),
+                "secret\n"
+            );
+            let _ = std::fs::remove_file(outside);
+        });
     }
 
     #[test]
     fn applies_unified_patch_with_dry_run() {
-        let _guard = crate::test_env_lock();
-        let dir = temp_path("patch-dir");
-        std::fs::create_dir_all(&dir).expect("directory should be created");
-        let original_dir = std::env::current_dir().expect("cwd should exist");
-        std::env::set_current_dir(&dir).expect("set cwd");
-        write_file("demo.txt", "alpha\nbeta\ngamma\n").expect("initial write should succeed");
+        with_temp_workspace("patch-dir", |_| {
+            write_file("demo.txt", "alpha\nbeta\ngamma\n").expect("initial write should succeed");
 
-        let patch = "\
+            let patch = "\
 --- a/demo.txt
 +++ b/demo.txt
 @@ -1,3 +1,3 @@
@@ -1413,67 +1717,54 @@ mod tests {
 +omega
  gamma
 ";
-        let checked = apply_patch(patch, true).expect("dry run should succeed");
-        assert!(checked.dry_run);
-        assert_eq!(checked.changed_files[0].action, "update");
-        assert_eq!(
-            std::fs::read_to_string("demo.txt").expect("read file"),
-            "alpha\nbeta\ngamma\n"
-        );
+            let checked = apply_patch(patch, true).expect("dry run should succeed");
+            assert!(checked.dry_run);
+            assert_eq!(checked.changed_files[0].action, "update");
+            assert_eq!(
+                std::fs::read_to_string("demo.txt").expect("read file"),
+                "alpha\nbeta\ngamma\n"
+            );
 
-        let applied = apply_patch(patch, false).expect("apply should succeed");
-        assert!(!applied.dry_run);
-        assert_eq!(
-            std::fs::read_to_string("demo.txt").expect("read file"),
-            "alpha\nomega\ngamma\n"
-        );
-
-        std::env::set_current_dir(original_dir).expect("restore cwd");
-        let _ = std::fs::remove_dir_all(dir);
+            let applied = apply_patch(patch, false).expect("apply should succeed");
+            assert!(!applied.dry_run);
+            assert_eq!(
+                std::fs::read_to_string("demo.txt").expect("read file"),
+                "alpha\nomega\ngamma\n"
+            );
+        });
     }
 
     #[test]
     fn applies_openai_style_patch_and_rejects_unsafe_paths() {
-        let _guard = crate::test_env_lock();
-        let dir = temp_path("openai-patch-dir");
-        std::fs::create_dir_all(&dir).expect("directory should be created");
-        let original_dir = std::env::current_dir().expect("cwd should exist");
-        std::env::set_current_dir(&dir).expect("set cwd");
-
-        let patch = "\
+        with_temp_workspace("openai-patch-dir", |_| {
+            let patch = "\
 *** Begin Patch
 *** Add File: nested/new.txt
 +one
 +two
 *** End Patch";
-        apply_patch(patch, false).expect("add file patch should succeed");
-        assert_eq!(
-            std::fs::read_to_string("nested/new.txt").expect("read file"),
-            "one\ntwo\n"
-        );
+            apply_patch(patch, false).expect("add file patch should succeed");
+            assert_eq!(
+                std::fs::read_to_string("nested/new.txt").expect("read file"),
+                "one\ntwo\n"
+            );
 
-        let unsafe_patch = "\
+            let unsafe_patch = "\
 *** Begin Patch
 *** Add File: ../escape.txt
 +nope
 *** End Patch";
-        let error = apply_patch(unsafe_patch, true).expect_err("unsafe path should fail");
-        assert!(error.to_string().contains("must not contain .."));
-
-        std::env::set_current_dir(original_dir).expect("restore cwd");
-        let _ = std::fs::remove_dir_all(dir);
+            let error = apply_patch(unsafe_patch, true).expect_err("unsafe path should fail");
+            assert!(error.to_string().contains("must not contain .."));
+        });
     }
 
     #[test]
     fn rejects_patch_context_mismatch_without_writing() {
-        let _guard = crate::test_env_lock();
-        let dir = temp_path("patch-mismatch-dir");
-        std::fs::create_dir_all(&dir).expect("directory should be created");
-        let original_dir = std::env::current_dir().expect("cwd should exist");
-        std::env::set_current_dir(&dir).expect("set cwd");
-        write_file("demo.txt", "alpha\nbeta\n").expect("initial write should succeed");
+        with_temp_workspace("patch-mismatch-dir", |_| {
+            write_file("demo.txt", "alpha\nbeta\n").expect("initial write should succeed");
 
-        let patch = "\
+            let patch = "\
 --- a/demo.txt
 +++ b/demo.txt
 @@ -1,2 +1,2 @@
@@ -1481,48 +1772,37 @@ mod tests {
 -missing
 +omega
 ";
-        let error = apply_patch(patch, false).expect_err("mismatch should fail");
-        assert!(error.to_string().contains("did not match"));
-        assert_eq!(
-            std::fs::read_to_string("demo.txt").expect("read file"),
-            "alpha\nbeta\n"
-        );
-
-        std::env::set_current_dir(original_dir).expect("restore cwd");
-        let _ = std::fs::remove_dir_all(dir);
+            let error = apply_patch(patch, false).expect_err("mismatch should fail");
+            assert!(error.to_string().contains("did not match"));
+            assert_eq!(
+                std::fs::read_to_string("demo.txt").expect("read file"),
+                "alpha\nbeta\n"
+            );
+        });
     }
 
     #[test]
     fn applies_patch_fixture_with_quoted_space_path() {
-        let _guard = crate::test_env_lock();
-        let dir = temp_path("patch-quoted-space-dir");
-        std::fs::create_dir_all(dir.join("dir")).expect("directory should be created");
-        let original_dir = std::env::current_dir().expect("cwd should exist");
-        std::env::set_current_dir(&dir).expect("set cwd");
-        write_file("dir/file with spaces.txt", "alpha\nbeta\ngamma\n")
-            .expect("initial write should succeed");
+        with_temp_workspace("patch-quoted-space-dir", |_| {
+            std::fs::create_dir_all("dir").expect("directory should be created");
+            write_file("dir/file with spaces.txt", "alpha\nbeta\ngamma\n")
+                .expect("initial write should succeed");
 
-        let patch = include_str!("../tests/fixtures/patches/quoted-space-path.patch");
-        apply_patch(patch, false).expect("quoted path patch should succeed");
-        assert_eq!(
-            std::fs::read_to_string("dir/file with spaces.txt").expect("read file"),
-            "alpha\nomega\ngamma\n"
-        );
-
-        std::env::set_current_dir(original_dir).expect("restore cwd");
-        let _ = std::fs::remove_dir_all(dir);
+            let patch = include_str!("../tests/fixtures/patches/quoted-space-path.patch");
+            apply_patch(patch, false).expect("quoted path patch should succeed");
+            assert_eq!(
+                std::fs::read_to_string("dir/file with spaces.txt").expect("read file"),
+                "alpha\nomega\ngamma\n"
+            );
+        });
     }
 
     #[test]
     fn preserves_crlf_and_no_final_newline() {
-        let _guard = crate::test_env_lock();
-        let dir = temp_path("patch-line-ending-dir");
-        std::fs::create_dir_all(&dir).expect("directory should be created");
-        let original_dir = std::env::current_dir().expect("cwd should exist");
-        std::env::set_current_dir(&dir).expect("set cwd");
-
-        write_file("crlf.txt", "alpha\r\nbeta\r\ngamma\r\n").expect("initial write should succeed");
-        let crlf_patch = "\
+        with_temp_workspace("patch-line-ending-dir", |_| {
+            write_file("crlf.txt", "alpha\r\nbeta\r\ngamma\r\n")
+                .expect("initial write should succeed");
+            let crlf_patch = "\
 --- a/crlf.txt
 +++ b/crlf.txt
 @@ -1,3 +1,3 @@
@@ -1531,85 +1811,136 @@ mod tests {
 +omega
  gamma
 ";
-        apply_patch(crlf_patch, false).expect("crlf patch should succeed");
-        assert_eq!(
-            std::fs::read_to_string("crlf.txt").expect("read file"),
-            "alpha\r\nomega\r\ngamma\r\n"
-        );
+            apply_patch(crlf_patch, false).expect("crlf patch should succeed");
+            assert_eq!(
+                std::fs::read_to_string("crlf.txt").expect("read file"),
+                "alpha\r\nomega\r\ngamma\r\n"
+            );
 
-        write_file("no-newline.txt", "old").expect("initial write should succeed");
-        let no_newline_patch = include_str!("../tests/fixtures/patches/no-final-newline.patch");
-        apply_patch(no_newline_patch, false).expect("no-final-newline patch should succeed");
-        assert_eq!(
-            std::fs::read_to_string("no-newline.txt").expect("read file"),
-            "new"
-        );
-
-        std::env::set_current_dir(original_dir).expect("restore cwd");
-        let _ = std::fs::remove_dir_all(dir);
+            write_file("no-newline.txt", "old").expect("initial write should succeed");
+            let no_newline_patch = include_str!("../tests/fixtures/patches/no-final-newline.patch");
+            apply_patch(no_newline_patch, false).expect("no-final-newline patch should succeed");
+            assert_eq!(
+                std::fs::read_to_string("no-newline.txt").expect("read file"),
+                "new"
+            );
+        });
     }
 
     #[test]
     fn rejects_binary_patch_and_binary_target_with_clear_errors() {
-        let _guard = crate::test_env_lock();
-        let dir = temp_path("patch-binary-dir");
-        std::fs::create_dir_all(&dir).expect("directory should be created");
-        let original_dir = std::env::current_dir().expect("cwd should exist");
-        std::env::set_current_dir(&dir).expect("set cwd");
+        with_temp_workspace("patch-binary-dir", |_| {
+            let binary_patch = include_str!("../tests/fixtures/patches/binary.patch");
+            let error = apply_patch(binary_patch, true).expect_err("binary patch should fail");
+            assert!(error
+                .to_string()
+                .contains("binary patches are not supported"));
 
-        let binary_patch = include_str!("../tests/fixtures/patches/binary.patch");
-        let error = apply_patch(binary_patch, true).expect_err("binary patch should fail");
-        assert!(error
-            .to_string()
-            .contains("binary patches are not supported"));
-
-        std::fs::write("image.bin", [0xff, 0x00, 0xfe]).expect("binary fixture write");
-        let text_patch = "\
+            std::fs::write("image.bin", [0xff, 0x00, 0xfe]).expect("binary fixture write");
+            let text_patch = "\
 --- a/image.bin
 +++ b/image.bin
 @@ -1 +1 @@
 -old
 +new
 ";
-        let error = apply_patch(text_patch, true).expect_err("binary target should fail");
-        assert!(error.to_string().contains("non-UTF-8 or binary file"));
+            let error = apply_patch(text_patch, true).expect_err("binary target should fail");
+            assert!(error.to_string().contains("non-UTF-8 or binary file"));
+        });
+    }
 
-        std::env::set_current_dir(original_dir).expect("restore cwd");
-        let _ = std::fs::remove_dir_all(dir);
+    #[test]
+    fn broad_search_skips_repo_state_hidden_dirs_and_gitignored_files() {
+        with_temp_workspace("repo-aware-search", |workspace| {
+            write_file("src/visible.txt", "visible needle\n").expect("visible fixture write");
+            for dir in super::DEFAULT_SEARCH_SKIP_DIRS {
+                write_file(&format!("{dir}/skipped.txt"), "skipped needle\n")
+                    .expect("skipped fixture write");
+            }
+            write_file(".gitignore", "ignored.txt\nignored-dir/\n")
+                .expect("gitignore fixture write");
+            write_file("ignored.txt", "ignored needle\n").expect("ignored file write");
+            write_file("ignored-dir/file.txt", "ignored dir needle\n")
+                .expect("ignored dir file write");
+
+            let grep_output = grep_search(&grep_input("needle", None, "files_with_matches"))
+                .expect("broad grep should succeed");
+            assert_contains_relative_path(&grep_output.filenames, workspace, "src/visible.txt");
+            assert_excludes_relative_path(&grep_output.filenames, workspace, "ignored.txt");
+            assert_excludes_relative_path(
+                &grep_output.filenames,
+                workspace,
+                "ignored-dir/file.txt",
+            );
+            for dir in super::DEFAULT_SEARCH_SKIP_DIRS {
+                assert_excludes_relative_path(
+                    &grep_output.filenames,
+                    workspace,
+                    &format!("{dir}/skipped.txt"),
+                );
+            }
+
+            let glob_output = glob_search("**/*.txt", None).expect("broad glob should succeed");
+            assert_contains_relative_path(&glob_output.filenames, workspace, "src/visible.txt");
+            assert_excludes_relative_path(&glob_output.filenames, workspace, "ignored.txt");
+            assert_excludes_relative_path(
+                &glob_output.filenames,
+                workspace,
+                "ignored-dir/file.txt",
+            );
+            for dir in super::DEFAULT_SEARCH_SKIP_DIRS {
+                assert_excludes_relative_path(
+                    &glob_output.filenames,
+                    workspace,
+                    &format!("{dir}/skipped.txt"),
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn explicit_search_paths_can_target_default_skipped_directories() {
+        with_temp_workspace("explicit-skipped-search", |workspace| {
+            for dir in super::DEFAULT_SEARCH_SKIP_DIRS {
+                write_file(&format!("{dir}/explicit.txt"), "explicit needle\n")
+                    .expect("explicit skipped fixture write");
+            }
+
+            for dir in super::DEFAULT_SEARCH_SKIP_DIRS {
+                let grep_output =
+                    grep_search(&grep_input("needle", Some(dir), "files_with_matches"))
+                        .expect("explicit grep should succeed");
+                assert_contains_relative_path(
+                    &grep_output.filenames,
+                    workspace,
+                    &format!("{dir}/explicit.txt"),
+                );
+
+                let glob_output =
+                    glob_search("**/*.txt", Some(dir)).expect("explicit glob should succeed");
+                assert_contains_relative_path(
+                    &glob_output.filenames,
+                    workspace,
+                    &format!("{dir}/explicit.txt"),
+                );
+            }
+        });
     }
 
     #[test]
     fn globs_and_greps_directory() {
-        let dir = temp_path("search-dir");
-        std::fs::create_dir_all(&dir).expect("directory should be created");
-        let file = dir.join("demo.rs");
-        write_file(
-            file.to_string_lossy().as_ref(),
-            "fn main() {\n println!(\"hello\");\n}\n",
-        )
-        .expect("file write should succeed");
+        with_temp_workspace("search-dir", |_| {
+            write_file("src/demo.rs", "fn main() {\n println!(\"hello\");\n}\n")
+                .expect("file write should succeed");
 
-        let globbed = glob_search("**/*.rs", Some(dir.to_string_lossy().as_ref()))
-            .expect("glob should succeed");
-        assert_eq!(globbed.num_files, 1);
+            let globbed = glob_search("**/*.rs", Some("src")).expect("glob should succeed");
+            assert_eq!(globbed.num_files, 1);
 
-        let grep_output = grep_search(&GrepSearchInput {
-            pattern: String::from("hello"),
-            path: Some(dir.to_string_lossy().into_owned()),
-            glob: Some(String::from("**/*.rs")),
-            output_mode: Some(String::from("content")),
-            before: None,
-            after: None,
-            context_short: None,
-            context: None,
-            line_numbers: Some(true),
-            case_insensitive: Some(false),
-            file_type: None,
-            head_limit: Some(10),
-            offset: Some(0),
-            multiline: Some(false),
-        })
-        .expect("grep should succeed");
-        assert!(grep_output.content.unwrap_or_default().contains("hello"));
+            let mut input = grep_input("hello", Some("src"), "content");
+            input.glob = Some(String::from("**/*.rs"));
+            input.head_limit = Some(10);
+            let grep_output = grep_search(&input).expect("grep should succeed");
+            assert!(grep_output.content.unwrap_or_default().contains("hello"));
+        });
     }
 }

@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "api"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "platform",
  "reqwest",
@@ -62,6 +62,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "bstr"
+version = "1.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63044e1ae8e69f3b5a92c736ca6269b8d12fa7efe39bf34ddb06d102cf0e2cab"
+dependencies = [
+ "memchr",
+ "serde",
 ]
 
 [[package]]
@@ -109,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "commands"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "platform",
  "runtime",
@@ -117,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "compat-harness"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "commands",
  "runtime",
@@ -143,6 +153,31 @@ checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
 ]
+
+[[package]]
+name = "crossbeam-deque"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9dd111b7b7f7d55b72c0a6ae361660ee5853c9af73f70c3c2ef6858b950e2e51"
+dependencies = [
+ "crossbeam-epoch",
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-epoch"
+version = "0.9.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crossterm"
@@ -381,6 +416,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
+name = "globset"
+version = "0.4.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52dfc19153a48bde0cbd630453615c8151bce3a5adfac7a0aebfbf0a1e1f57e3"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "log",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -597,6 +645,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ignore"
+version = "0.4.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3d782a365a015e0f5c04902246139249abf769125006fbe7649e2ee88169b4a"
+dependencies = [
+ "crossbeam-deque",
+ "globset",
+ "log",
+ "memchr",
+ "regex-automata",
+ "same-file",
+ "walkdir",
+ "winapi-util",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -799,7 +863,7 @@ dependencies = [
 
 [[package]]
 name = "pebble"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "api",
  "commands",
@@ -839,7 +903,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "platform"
-version = "0.4.1"
+version = "0.4.2"
 
 [[package]]
 name = "plist"
@@ -856,7 +920,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "platform",
  "serde",
@@ -1127,10 +1191,11 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "getrandom 0.3.4",
  "glob",
+ "ignore",
  "platform",
  "plugins",
  "regex",
@@ -1138,7 +1203,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
- "walkdir",
 ]
 
 [[package]]
@@ -1567,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "api",
  "platform",
