@@ -37,6 +37,14 @@ pub struct ModelState {
     pub provider_overrides: BTreeMap<String, String>,
     #[serde(default)]
     pub proxy_tool_calls: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub fast_mode: bool,
     #[serde(default)]
     pub max_output_tokens_by_model: BTreeMap<String, u32>,
     #[serde(default)]

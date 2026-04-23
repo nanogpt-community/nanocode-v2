@@ -39,9 +39,9 @@ impl ApiError {
         match self {
             Self::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
             Self::Api { retryable, .. } => *retryable,
-            Self::StreamApi { .. } => false,
             Self::RetriesExhausted { last_error, .. } => last_error.is_retryable(),
-            Self::MissingApiKey
+            Self::StreamApi { .. }
+            | Self::MissingApiKey
             | Self::MissingOpenAiCodexAuth
             | Self::InvalidApiKeyEnv(_)
             | Self::Io(_)

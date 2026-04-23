@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -13,7 +14,8 @@ use platform::pebble_config_home;
 use plugins::{PluginManager, PluginManagerConfig, PluginTool};
 use reqwest::blocking::Client;
 use runtime::{
-    edit_file, execute_bash, glob_search, grep_search, load_system_prompt_with_model_family,
+    apply_patch, edit_file, execute_bash, get_compact_continuation_message,
+    get_tool_result_context_output, glob_search, grep_search, load_system_prompt_with_model_family,
     read_file, write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ConfigLoader,
     ContentBlock, ConversationMessage, ConversationRuntime, GrepSearchInput, MessageRole,
     PermissionMode, PermissionPolicy, RuntimeConfig, RuntimeError, Session, TokenUsage, ToolError,
@@ -76,6 +78,7 @@ pub struct ActiveBackendServiceGuard {
     previous: ApiService,
 }
 
+#[must_use]
 pub fn set_active_backend_service(service: ApiService) -> ActiveBackendServiceGuard {
     let mut guard = active_backend_service_cell()
         .lock()
@@ -214,6 +217,7 @@ impl GlobalToolRegistry {
             ("read", "read_file"),
             ("write", "write_file"),
             ("edit", "edit_file"),
+            ("patch", "apply_patch"),
             ("glob", "glob_search"),
             ("grep", "grep_search"),
         ] {
@@ -329,6 +333,7 @@ pub fn current_tool_registry() -> Result<GlobalToolRegistry, String> {
     GlobalToolRegistry::with_plugin_tools(plugin_tools)
 }
 
+#[must_use]
 pub fn build_plugin_manager(
     cwd: &Path,
     loader: &ConfigLoader,
@@ -403,7 +408,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "write_file",
-            description: "Write a text file in the workspace.",
+            description:
+                "Create or overwrite a complete text file in the workspace. Prefer edit_file for a small exact replacement and apply_patch for multi-hunk or multi-file edits.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -417,7 +423,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_file",
-            description: "Replace text in a workspace file.",
+            description:
+                "Replace an exact string in one workspace file. Prefer this for small focused edits; use apply_patch for multi-hunk or multi-file changes.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -427,6 +434,21 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "replace_all": { "type": "boolean" }
                 },
                 "required": ["path", "old_string", "new_string"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "apply_patch",
+            description:
+                "Validate and apply a unified diff or OpenAI-style patch block across one or more workspace text files. Use dry_run=true to check a patch without writing files.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "patch": { "type": "string" },
+                    "dry_run": { "type": "boolean" }
+                },
+                "required": ["patch"],
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::WorkspaceWrite,
@@ -728,6 +750,7 @@ pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
         "read_file" => from_value::<ReadFileInput>(input).and_then(run_read_file),
         "write_file" => from_value::<WriteFileInput>(input).and_then(run_write_file),
         "edit_file" => from_value::<EditFileInput>(input).and_then(run_edit_file),
+        "apply_patch" => from_value::<ApplyPatchInput>(input).and_then(run_apply_patch),
         "glob_search" => from_value::<GlobSearchInputValue>(input).and_then(run_glob_search),
         "grep_search" => from_value::<GrepSearchInput>(input).and_then(run_grep_search),
         "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
@@ -780,6 +803,11 @@ fn run_edit_file(input: EditFileInput) -> Result<String, String> {
         )
         .map_err(io_to_string)?,
     )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_apply_patch(input: ApplyPatchInput) -> Result<String, String> {
+    to_pretty_json(apply_patch(&input.patch, input.dry_run.unwrap_or(false)).map_err(io_to_string)?)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -879,6 +907,12 @@ struct EditFileInput {
     old_string: String,
     new_string: String,
     replace_all: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplyPatchInput {
+    patch: String,
+    dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1579,7 +1613,7 @@ fn summarize_exa_search(input: &WebSearchInput, payload: &Value, hits: &[SearchH
         if hits.len() == 1 { "" } else { "s" }
     );
     if let Some(cost) = cost {
-        summary.push_str(&format!(" Estimated cost: ${cost:.4}."));
+        let _ = write!(summary, " Estimated cost: ${cost:.4}.");
     }
     if input.provider.is_some() {
         summary.push_str(" The legacy provider field was ignored.");
@@ -2147,7 +2181,7 @@ impl ToolExecutor for AgentToolExecutor {
 
 enum AgentApiClient {
     Scripted(ScriptedAgentApiClient),
-    NanoGpt(PebbleAgentApiClient),
+    NanoGpt(Box<PebbleAgentApiClient>),
 }
 
 impl ApiClient for AgentApiClient {
@@ -2216,10 +2250,9 @@ fn build_agent_api_client(
             &script,
         )?));
     }
-    Ok(AgentApiClient::NanoGpt(PebbleAgentApiClient::new(
-        model,
-        tool_registry,
-    )?))
+    Ok(AgentApiClient::NanoGpt(Box::new(
+        PebbleAgentApiClient::new(model, tool_registry)?,
+    )))
 }
 
 #[derive(Debug)]
@@ -2298,20 +2331,32 @@ fn convert_agent_messages(messages: &[ConversationMessage]) -> Vec<InputMessage>
                     ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
-                        input: serde_json::from_str(&input)
+                        input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
                     }),
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
+                        compacted,
                         ..
                     } => Some(InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![api::ToolResultContentBlock::Text {
-                            text: output.clone(),
+                            text: get_tool_result_context_output(output, *compacted).into_owned(),
                         }],
                         is_error: *is_error,
+                    }),
+                    ContentBlock::CompactionSummary {
+                        summary,
+                        recent_messages_preserved,
+                        ..
+                    } => Some(InputContentBlock::Text {
+                        text: get_compact_continuation_message(
+                            summary,
+                            true,
+                            *recent_messages_preserved,
+                        ),
                     }),
                 })
                 .collect::<Vec<_>>();
@@ -2351,7 +2396,7 @@ fn agent_response_to_events(response: api::MessageResponse) -> Vec<AssistantEven
                     id,
                     name,
                     input: input.to_string(),
-                })
+                });
             }
         }
     }
@@ -2416,7 +2461,13 @@ fn deferred_tool_specs() -> Vec<ToolSpec> {
         .filter(|spec| {
             !matches!(
                 spec.name,
-                "bash" | "read_file" | "write_file" | "edit_file" | "glob_search" | "grep_search"
+                "bash"
+                    | "read_file"
+                    | "write_file"
+                    | "edit_file"
+                    | "apply_patch"
+                    | "glob_search"
+                    | "grep_search"
             )
         })
         .collect()
@@ -3189,8 +3240,7 @@ fn command_exists(command: &str) -> bool {
         .arg("-lc")
         .arg(format!("command -v {command} >/dev/null 2>&1"))
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .is_ok_and(|status| status.success())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3416,6 +3466,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"edit_file"));
+        assert!(names.contains(&"apply_patch"));
         assert!(names.contains(&"WebFetch"));
         assert!(names.contains(&"WebSearch"));
         assert!(names.contains(&"WebScrape"));
@@ -3822,7 +3875,8 @@ mod tests {
         let persisted = std::fs::read_to_string(temp.join(".pebble").join("todos.md"))
             .expect("todo markdown exists");
         std::env::set_current_dir(previous).expect("restore cwd");
-        let _ = std::fs::remove_dir_all(temp);
+        // Leave cwd fixture dirs in place: tests run in parallel and shell
+        // subprocesses can transiently observe another test's previous cwd.
 
         assert!(persisted.contains("# Todo list"));
         assert!(persisted.contains("- [~] Add tool :: Adding tool"));
@@ -4189,6 +4243,9 @@ mod tests {
 
     #[test]
     fn bash_tool_reports_success_exit_failure_timeout_and_background() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let success = execute_tool("bash", &json!({ "command": "printf 'hello'" }))
             .expect("bash should succeed");
         let success_output: serde_json::Value = serde_json::from_str(&success).expect("json");
@@ -4225,6 +4282,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn file_tools_cover_read_write_and_edit_behaviors() {
         let _guard = env_lock()
             .lock()
@@ -4317,6 +4375,42 @@ mod tests {
             "omega\nbeta\nomega\n"
         );
 
+        execute_tool(
+            "write_file",
+            &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\ngamma\n" }),
+        )
+        .expect("reset file for patch");
+        let patch_check = execute_tool(
+            "apply_patch",
+            &json!({
+                "patch": "--- a/nested/demo.txt\n+++ b/nested/demo.txt\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+delta\n gamma\n",
+                "dry_run": true
+            }),
+        )
+        .expect("patch check should succeed");
+        let patch_check_output: serde_json::Value =
+            serde_json::from_str(&patch_check).expect("json");
+        assert_eq!(patch_check_output["dryRun"], true);
+        assert_eq!(
+            fs::read_to_string(root.join("nested/demo.txt")).expect("read file"),
+            "alpha\nbeta\ngamma\n"
+        );
+
+        let patch_apply = execute_tool(
+            "apply_patch",
+            &json!({
+                "patch": "--- a/nested/demo.txt\n+++ b/nested/demo.txt\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+delta\n gamma\n"
+            }),
+        )
+        .expect("patch apply should succeed");
+        let patch_apply_output: serde_json::Value =
+            serde_json::from_str(&patch_apply).expect("json");
+        assert_eq!(patch_apply_output["changedFiles"][0]["action"], "update");
+        assert_eq!(
+            fs::read_to_string(root.join("nested/demo.txt")).expect("read file"),
+            "alpha\ndelta\ngamma\n"
+        );
+
         let edit_same = execute_tool(
             "edit_file",
             &json!({ "path": "nested/demo.txt", "old_string": "omega", "new_string": "omega" }),
@@ -4332,7 +4426,8 @@ mod tests {
         assert!(edit_missing.contains("old_string not found"));
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
-        let _ = fs::remove_dir_all(root);
+        // Leave cwd fixture dirs in place: tests run in parallel and shell
+        // subprocesses can transiently observe another test's previous cwd.
     }
 
     #[test]
@@ -4404,7 +4499,8 @@ mod tests {
         assert!(!grep_error.is_empty());
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
-        let _ = fs::remove_dir_all(root);
+        // Leave cwd fixture dirs in place: tests run in parallel and shell
+        // subprocesses can transiently observe another test's previous cwd.
     }
 
     #[test]
@@ -4513,7 +4609,8 @@ mod tests {
             Some(value) => std::env::set_var("PEBBLE_CONFIG_HOME", value),
             None => std::env::remove_var("PEBBLE_CONFIG_HOME"),
         }
-        let _ = std::fs::remove_dir_all(root);
+        // Leave cwd fixture dirs in place: tests run in parallel and shell
+        // subprocesses can transiently observe another test's previous cwd.
     }
 
     #[test]

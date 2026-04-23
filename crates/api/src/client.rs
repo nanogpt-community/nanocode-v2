@@ -490,7 +490,7 @@ impl NanoGptClient {
                 }
                 request_builder
             }
-            ApiService::NanoGpt => {
+            ApiService::NanoGpt | ApiService::OpencodeGo => {
                 if debug {
                     eprintln!(
                         "[nanogpt-client] headers x-api-key=[REDACTED] authorization=Bearer [REDACTED]"
@@ -505,16 +505,6 @@ impl NanoGptClient {
                     eprintln!("[nanogpt-client] headers authorization=Bearer [REDACTED]");
                 }
                 request_builder.bearer_auth(&self.api_key)
-            }
-            ApiService::OpencodeGo => {
-                if debug {
-                    eprintln!(
-                        "[nanogpt-client] headers x-api-key=[REDACTED] authorization=Bearer [REDACTED]"
-                    );
-                }
-                request_builder
-                    .bearer_auth(&self.api_key)
-                    .header("x-api-key", &self.api_key)
             }
         };
 
@@ -551,19 +541,17 @@ impl NanoGptClient {
 
     fn messages_path(&self) -> &'static str {
         match self.service {
-            ApiService::NanoGpt => "/v1/messages",
+            ApiService::NanoGpt | ApiService::OpencodeGo => "/v1/messages",
             ApiService::Synthetic => "/messages",
             ApiService::OpenAiCodex => "/responses",
-            ApiService::OpencodeGo => "/v1/messages",
         }
     }
 
     fn chat_completions_path(&self) -> &'static str {
         match self.service {
-            ApiService::NanoGpt => "/v1/chat/completions",
+            ApiService::NanoGpt | ApiService::OpencodeGo => "/v1/chat/completions",
             ApiService::Synthetic => "/chat/completions",
             ApiService::OpenAiCodex => "/responses",
-            ApiService::OpencodeGo => "/v1/chat/completions",
         }
     }
 
@@ -779,6 +767,7 @@ pub fn resolve_api_key() -> Result<String, ApiError> {
     read_api_key()
 }
 
+#[must_use]
 pub fn resolve_base_url_for(service: ApiService) -> String {
     match service {
         ApiService::NanoGpt => {
@@ -793,6 +782,7 @@ pub fn resolve_base_url_for(service: ApiService) -> String {
     }
 }
 
+#[must_use]
 pub fn resolve_root_url_for(service: ApiService) -> String {
     match service {
         ApiService::NanoGpt => {
@@ -811,8 +801,7 @@ pub fn resolve_root_url_for(service: ApiService) -> String {
                 .unwrap_or(trimmed)
                 .to_string()
         }
-        ApiService::OpenAiCodex => resolve_base_url_for(service),
-        ApiService::OpencodeGo => resolve_base_url_for(service),
+        ApiService::OpenAiCodex | ApiService::OpencodeGo => resolve_base_url_for(service),
     }
 }
 
@@ -945,7 +934,7 @@ fn providers_url(base_url: &str, canonical_id: &str) -> Result<reqwest::Url, Api
         reqwest::Url::parse(&format!("{}/", base_url.trim_end_matches('/'))).map_err(|error| {
             ApiError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
         })?;
-    let mut segments = url.path_segments_mut().map_err(|_| {
+    let mut segments = url.path_segments_mut().map_err(|()| {
         ApiError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "invalid base url",
@@ -1211,14 +1200,17 @@ fn openai_codex_instructions(request: &MessageRequest) -> String {
         .as_ref()
         .map(|system| system.trim())
         .filter(|system| !system.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| "You are Pebble, a coding assistant.".to_string())
+        .map_or_else(
+            || "You are Pebble, a coding assistant.".to_string(),
+            ToOwned::to_owned,
+        )
 }
 
 fn openai_codex_tool_choice(choice: Option<&crate::types::ToolChoice>) -> String {
     match choice {
-        Some(crate::types::ToolChoice::Any) => "required".to_string(),
-        Some(crate::types::ToolChoice::Tool { .. }) => "required".to_string(),
+        Some(crate::types::ToolChoice::Any | crate::types::ToolChoice::Tool { .. }) => {
+            "required".to_string()
+        }
         Some(crate::types::ToolChoice::Auto) | None => "auto".to_string(),
     }
 }
@@ -1494,7 +1486,9 @@ fn process_openai_codex_sse_frame(
                 accumulator.usage = openai_codex_usage_from_response(&response);
             }
         }
-        "response.failed" => return Err(openai_codex_stream_error(&payload, event.response)),
+        "response.failed" => {
+            return Err(openai_codex_stream_error(&payload, event.response.as_ref()))
+        }
         "response.incomplete" => {
             return Err(ApiError::StreamApi {
                 error_type: Some("response_incomplete".to_string()),
@@ -1528,7 +1522,7 @@ fn openai_codex_output_item_to_content_blocks(item: &Value) -> Vec<OutputContent
                 .into_iter()
                 .flatten()
                 .filter_map(|content| match json_string_field(content, "type") {
-                    Some("output_text") | Some("text") => {
+                    Some("output_text" | "text") => {
                         json_string_field(content, "text").map(|text| OutputContentBlock::Text {
                             text: text.to_string(),
                         })
@@ -1621,9 +1615,8 @@ fn openai_codex_usage_from_response(response: &Value) -> Usage {
     }
 }
 
-fn openai_codex_stream_error(payload: &str, response: Option<Value>) -> ApiError {
+fn openai_codex_stream_error(payload: &str, response: Option<&Value>) -> ApiError {
     let error = response
-        .as_ref()
         .and_then(|response| response.get("error"))
         .unwrap_or(&Value::Null);
     ApiError::StreamApi {
@@ -1904,7 +1897,7 @@ fn chat_completion_to_message_response(
     if let Some(tool_calls) = choice.message.tool_calls {
         for tool_call in tool_calls {
             let input = serde_json::from_str(&tool_call.function.arguments)
-                .unwrap_or_else(|_| serde_json::Value::String(tool_call.function.arguments));
+                .unwrap_or(serde_json::Value::String(tool_call.function.arguments));
             content.push(OutputContentBlock::ToolUse {
                 id: tool_call.id,
                 name: tool_call.function.name,
@@ -1968,7 +1961,7 @@ fn message_response_to_stream_events(response: MessageResponse) -> Vec<StreamEve
     })];
 
     for (index, block) in content_blocks.into_iter().enumerate() {
-        let index = index as u32;
+        let index = u32::try_from(index).unwrap_or(u32::MAX);
         events.push(StreamEvent::ContentBlockStart(
             crate::types::ContentBlockStartEvent {
                 index,

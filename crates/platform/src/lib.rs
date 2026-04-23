@@ -27,6 +27,15 @@ pub fn pebble_config_home_or_default() -> PathBuf {
     pebble_config_home().unwrap_or_else(|| PathBuf::from(".pebble"))
 }
 
+fn windows_home_from_drive_path() -> Option<PathBuf> {
+    let drive = env::var_os("HOMEDRIVE").filter(|value| !value.is_empty())?;
+    let path = env::var_os("HOMEPATH").filter(|value| !value.is_empty())?;
+
+    let mut home = drive;
+    home.push(path);
+    Some(PathBuf::from(home))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{pebble_config_home, pebble_config_home_or_default, user_home_dir};
@@ -38,7 +47,7 @@ mod tests {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[test]
@@ -131,13 +140,4 @@ mod tests {
             std::env::remove_var(name);
         }
     }
-}
-
-fn windows_home_from_drive_path() -> Option<PathBuf> {
-    let drive = env::var_os("HOMEDRIVE").filter(|value| !value.is_empty())?;
-    let path = env::var_os("HOMEPATH").filter(|value| !value.is_empty())?;
-
-    let mut home = drive;
-    home.push(path);
-    Some(PathBuf::from(home))
 }

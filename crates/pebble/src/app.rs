@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -6,6 +6,7 @@ use std::io::{self, IsTerminal, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::{
@@ -37,7 +38,7 @@ use crate::models::{
     context_length_for_model, current_service_or_default, default_model_or,
     infer_service_for_model, load_model_state, max_output_tokens_for_model_or, open_model_picker,
     open_provider_picker, persist_current_model, persist_provider_for_model,
-    persist_proxy_tool_calls, provider_for_model, proxy_tool_calls_enabled,
+    persist_proxy_tool_calls, provider_for_model, proxy_tool_calls_enabled, save_model_state,
     validate_provider_for_model,
 };
 use crate::proxy::{
@@ -53,15 +54,17 @@ use commands::{
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use runtime::{
-    auto_compaction_threshold_from_env, load_system_prompt_with_model_family, mcp_tool_name,
+    apply_patch, auto_compaction_threshold_from_env, get_compact_continuation_message,
+    get_tool_result_context_output, load_system_prompt_with_model_family, mcp_tool_name,
     resolve_sandbox_status, spawn_mcp_stdio_process, ApiClient, ApiRequest, AssistantEvent,
     CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
-    ConversationRuntime, JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpClientAuth,
-    McpClientBootstrap, McpClientTransport, McpInitializeClientInfo, McpInitializeParams,
-    McpListToolsParams, McpListToolsResult, McpToolCallParams, McpToolCallResult, McpTransport,
-    MessageRole, PermissionMode, PermissionPolicy, PermissionPromptDecision, PermissionPrompter,
-    PermissionRequest, RuntimeError, ScopedMcpServerConfig, Session, SessionMetadata, TokenUsage,
-    ToolError, ToolExecutor, UsageTracker,
+    ConversationRuntime, EditHistoryFile, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
+    McpClientAuth, McpClientBootstrap, McpClientTransport, McpInitializeClientInfo,
+    McpInitializeParams, McpListToolsParams, McpListToolsResult, McpToolCallParams,
+    McpToolCallResult, McpTransport, MessageRole, PermissionMode, PermissionPolicy,
+    PermissionPromptDecision, PermissionPrompter, PermissionRequest, RuntimeError,
+    RuntimeJsonValue, ScopedMcpServerConfig, Session, SessionMetadata, SessionTurnSnapshot,
+    TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use tools::{
     build_plugin_manager, current_tool_registry, set_active_backend_service, GlobalToolRegistry,
@@ -72,6 +75,8 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 const DEFAULT_THINKING_BUDGET_TOKENS: u32 = 2_048;
 const INIT_PEBBLE_MD_MAX_TOKENS: u32 = 2_048;
 const DEFAULT_DATE: &str = "2026-03-31";
+const FILE_REF_MAX_BYTES: u64 = 200_000;
+const DIRECTORY_REF_MAX_ENTRIES: usize = 200;
 const SECRET_PROMPT_STALE_ENTER_WINDOW: Duration = Duration::from_millis(150);
 const OPENAI_CODEX_DEVICE_AUTH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const OPENAI_CODEX_DEVICE_POLL_SAFETY_MARGIN: Duration = Duration::from_secs(3);
@@ -462,6 +467,7 @@ struct ManagedSessionSummary {
     path: PathBuf,
     modified_epoch_secs: u64,
     message_count: usize,
+    title: Option<String>,
     model: Option<String>,
     started_at: Option<String>,
     last_prompt: Option<String>,
@@ -479,12 +485,21 @@ struct SessionRuntimeState {
     proxy_tool_calls: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StartupRuntimeDefaults {
+    permission_mode: PermissionMode,
+    collaboration_mode: CollaborationMode,
+    reasoning_effort: Option<ReasoningEffort>,
+    fast_mode: FastMode,
+}
+
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
+    let startup_defaults = startup_runtime_defaults();
     let mut model = resolve_model_alias(&default_model_or(DEFAULT_MODEL)).to_string();
-    let mut permission_mode = default_permission_mode();
-    let mut collaboration_mode = CollaborationMode::Build;
-    let mut reasoning_effort = None;
-    let mut fast_mode = FastMode::Off;
+    let mut permission_mode = startup_defaults.permission_mode;
+    let mut collaboration_mode = startup_defaults.collaboration_mode;
+    let mut reasoning_effort = startup_defaults.reasoning_effort;
+    let mut fast_mode = startup_defaults.fast_mode;
     let mut output_format = CliOutputFormat::Text;
     let mut allowed_tool_values = Vec::new();
     let mut rest = Vec::new();
@@ -1096,6 +1111,10 @@ fn prompt_for_session_selection(
                         .as_deref()
                         .is_some_and(|model| fuzzy_session_match(model, &filter))
                     || session
+                        .title
+                        .as_deref()
+                        .is_some_and(|title| fuzzy_session_match(title, &filter))
+                    || session
                         .last_prompt
                         .as_deref()
                         .is_some_and(|prompt| fuzzy_session_match(prompt, &filter))
@@ -1121,13 +1140,18 @@ fn prompt_for_session_selection(
             || "-".to_string(),
             |prompt| truncate_for_summary(prompt, 48),
         );
+        let title = session
+            .title
+            .as_deref()
+            .map_or_else(|| "-".to_string(), |title| truncate_for_summary(title, 28));
         println!(
-            "  {idx:>2}. {id:<22} {marker:<7} model={model:<24} msgs={msgs:<4} last={last}",
+            "  {idx:>2}. {id:<22} {marker:<7} model={model:<24} msgs={msgs:<4} title={title:<28} last={last}",
             idx = index + 1,
             id = session.id,
             marker = marker,
             model = model,
             msgs = session.message_count,
+            title = title,
             last = last_prompt,
         );
     }
@@ -2115,12 +2139,59 @@ fn parse_reasoning_effort_arg(value: &str) -> Result<Option<ReasoningEffort>, St
     }
 }
 
+fn startup_runtime_defaults() -> StartupRuntimeDefaults {
+    let state = load_model_state().ok();
+    let permission_mode = permission_mode_from_env()
+        .or_else(|| {
+            state
+                .as_ref()
+                .and_then(|state| state.permission_mode.as_deref())
+                .and_then(|value| parse_permission_mode_arg(value).ok())
+        })
+        .unwrap_or(PermissionMode::WorkspaceWrite);
+    let collaboration_mode = state
+        .as_ref()
+        .and_then(|state| state.collaboration_mode.as_deref())
+        .and_then(|value| parse_collaboration_mode_arg(value).ok())
+        .unwrap_or(CollaborationMode::Build);
+    let reasoning_effort = state
+        .as_ref()
+        .and_then(|state| state.reasoning_effort.as_deref())
+        .and_then(|value| parse_reasoning_effort_arg(value).ok())
+        .flatten();
+    let fast_mode = state.as_ref().map_or(FastMode::Off, |state| {
+        if state.fast_mode {
+            FastMode::On
+        } else {
+            FastMode::Off
+        }
+    });
+
+    StartupRuntimeDefaults {
+        permission_mode,
+        collaboration_mode,
+        reasoning_effort,
+        fast_mode,
+    }
+}
+
 fn default_permission_mode() -> PermissionMode {
+    permission_mode_from_env()
+        .or_else(|| {
+            load_model_state()
+                .ok()
+                .and_then(|state| state.permission_mode)
+                .and_then(|value| parse_permission_mode_arg(&value).ok())
+        })
+        .unwrap_or(PermissionMode::WorkspaceWrite)
+}
+
+fn permission_mode_from_env() -> Option<PermissionMode> {
     env::var("PEBBLE_PERMISSION_MODE")
         .ok()
         .as_deref()
         .and_then(normalize_permission_mode)
-        .map_or(PermissionMode::WorkspaceWrite, permission_mode_from_label)
+        .map(permission_mode_from_label)
 }
 
 fn is_clear_provider_arg(value: &str) -> bool {
@@ -3084,8 +3155,16 @@ fn format_sandbox_status(status: &runtime::SandboxStatus) -> String {
     line
 }
 
-fn format_auto_compaction_notice(removed: usize) -> String {
-    format!("[auto-compacted: removed {removed} messages]")
+fn format_auto_compaction_notice(event: runtime::AutoCompactionEvent) -> String {
+    match (event.removed_message_count, event.pruned_tool_result_count) {
+        (removed, 0) => format!("[auto-compacted: removed {removed} messages]"),
+        (0, pruned) => format!("[auto-compacted: pruned {pruned} stale tool results]"),
+        (removed, pruned) => {
+            format!(
+                "[auto-compacted: removed {removed} messages, pruned {pruned} stale tool results]"
+            )
+        }
+    }
 }
 
 fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -3171,6 +3250,7 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
             message_count: stored.map_or(derived_message_count, |metadata| {
                 metadata.message_count as usize
             }),
+            title: stored.and_then(|metadata| metadata.title.clone()),
             model: stored.map(|metadata| metadata.model.clone()),
             started_at: stored.map(|metadata| metadata.started_at.clone()),
             last_prompt: stored.and_then(|metadata| metadata.last_prompt.clone()),
@@ -3202,11 +3282,16 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
             || "-".to_string(),
             |prompt| truncate_for_summary(prompt, 36),
         );
+        let title = session
+            .title
+            .as_deref()
+            .map_or_else(|| "-".to_string(), |title| truncate_for_summary(title, 24));
         lines.push(format!(
-            "  {id:<20} {marker:<10} msgs={msgs:<4} model={model:<24} started={started} modified={modified} last={last_prompt} path={path}",
+            "  {id:<20} {marker:<10} msgs={msgs:<4} model={model:<24} title={title:<24} started={started} modified={modified} last={last_prompt} path={path}",
             id = session.id,
             msgs = session.message_count,
             model = model,
+            title = title,
             started = started,
             modified = session.modified_epoch_secs,
             last_prompt = last_prompt,
@@ -3225,6 +3310,80 @@ fn truncate_for_summary(text: &str, max_chars: usize) -> String {
     } else {
         truncated
     }
+}
+
+fn render_session_timeline(session: &Session) -> String {
+    let mut lines = vec!["Timeline".to_string()];
+    if session.messages.is_empty() {
+        lines.push("  No messages in this session.".to_string());
+        return lines.join("\n");
+    }
+    for (index, message) in session.messages.iter().enumerate() {
+        lines.push(format!(
+            "  {idx:>3}. {id:<24} {role:<9} {preview}",
+            idx = index + 1,
+            id = short_message_id(&message.id),
+            role = message_role_label(message.role),
+            preview = truncate_for_summary(&message_preview(message), 88),
+        ));
+    }
+    lines.join("\n")
+}
+
+fn resolve_timeline_target(session: &Session, target: &str) -> Option<usize> {
+    if let Ok(index) = target.parse::<usize>() {
+        return (index > 0 && index <= session.messages.len()).then_some(index - 1);
+    }
+    session
+        .messages
+        .iter()
+        .position(|message| message.id == target || message.id.starts_with(target))
+}
+
+fn short_message_id(id: &str) -> String {
+    if id.chars().count() <= 22 {
+        id.to_string()
+    } else {
+        format!("{}…", id.chars().take(21).collect::<String>())
+    }
+}
+
+fn message_role_label(role: MessageRole) -> &'static str {
+    match role {
+        MessageRole::System => "system",
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+        MessageRole::Tool => "tool",
+    }
+}
+
+fn message_preview(message: &ConversationMessage) -> String {
+    for block in &message.blocks {
+        match block {
+            ContentBlock::Text { text } => return text.clone(),
+            ContentBlock::Thinking { text, .. } => return format!("thinking: {text}"),
+            ContentBlock::ToolUse { name, input, .. } => {
+                return format!("tool use: {name} {}", summarize_tool_payload(input));
+            }
+            ContentBlock::ToolResult {
+                tool_name,
+                output,
+                is_error,
+                ..
+            } => {
+                let prefix = if *is_error {
+                    "tool error"
+                } else {
+                    "tool result"
+                };
+                return format!("{prefix}: {tool_name} {}", summarize_tool_payload(output));
+            }
+            ContentBlock::CompactionSummary { summary, .. } => {
+                return format!("compaction: {summary}");
+            }
+        }
+    }
+    String::new()
 }
 
 fn summarize_tool_payload(payload: &str) -> String {
@@ -3285,6 +3444,10 @@ fn derive_session_metadata(
             metadata.started_at.clone()
         });
     SessionMetadata {
+        title: session
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.title.clone()),
         started_at,
         model: model.to_string(),
         message_count: session.messages.len().try_into().unwrap_or(u32::MAX),
@@ -3297,7 +3460,406 @@ fn derive_session_metadata(
         fast_mode: Some(fast_mode.enabled()),
         proxy_tool_calls: Some(proxy_tool_calls),
         allowed_tools: allowed_tools.map(|allowed| allowed.iter().cloned().collect()),
+        edit_history: session
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.edit_history.clone()),
+        undo_stack: session
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.undo_stack.clone()),
+        redo_stack: session
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.redo_stack.clone()),
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct WorktreeSnapshot {
+    files: BTreeMap<String, SnapshotFileState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotFileState {
+    exists: bool,
+    content: String,
+}
+
+impl WorktreeSnapshot {
+    fn capture(cwd: &Path) -> Self {
+        let mut files = BTreeMap::new();
+        for path in git_dirty_paths(cwd) {
+            files.insert(path.clone(), read_snapshot_file_state(cwd, &path));
+        }
+        Self { files }
+    }
+}
+
+fn build_turn_snapshot(
+    cwd: &Path,
+    before_files: &WorktreeSnapshot,
+    before_message_count: usize,
+    after_session: &Session,
+) -> Option<SessionTurnSnapshot> {
+    let messages = after_session
+        .messages
+        .iter()
+        .skip(before_message_count)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut file_changes = file_changes_from_turn_messages(cwd, &messages);
+    let mut changed_paths = before_files.files.keys().cloned().collect::<BTreeSet<_>>();
+    changed_paths.extend(git_dirty_paths(cwd));
+
+    for path in changed_paths {
+        file_changes.entry(path.clone()).or_insert_with(|| {
+            let before = before_files.files.get(&path).cloned().unwrap_or_else(|| {
+                read_clean_tracked_snapshot_state(cwd, &path).unwrap_or(SnapshotFileState {
+                    exists: false,
+                    content: String::new(),
+                })
+            });
+            let after = read_snapshot_file_state(cwd, &path);
+            EditHistoryFile {
+                path,
+                before: before.content,
+                after: after.content,
+                before_exists: before.exists,
+                after_exists: after.exists,
+            }
+        });
+    }
+
+    let files = file_changes
+        .into_values()
+        .filter(|file| file.before_exists != file.after_exists || file.before != file.after)
+        .collect::<Vec<_>>();
+    if files.is_empty() && messages.is_empty() {
+        return None;
+    }
+
+    Some(SessionTurnSnapshot {
+        timestamp: current_timestamp_rfc3339ish(),
+        message_count_before: before_message_count.try_into().unwrap_or(u32::MAX),
+        prompt: messages.iter().find_map(user_text_from_message),
+        messages,
+        files,
+    })
+}
+
+fn file_changes_from_turn_messages(
+    cwd: &Path,
+    messages: &[ConversationMessage],
+) -> BTreeMap<String, EditHistoryFile> {
+    let mut changes = BTreeMap::new();
+    for message in messages {
+        for block in &message.blocks {
+            let ContentBlock::ToolResult {
+                tool_name,
+                output,
+                is_error,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            if *is_error {
+                continue;
+            }
+            for change in file_changes_from_tool_output(cwd, tool_name, output) {
+                changes
+                    .entry(change.path.clone())
+                    .and_modify(|existing: &mut EditHistoryFile| {
+                        existing.after = change.after.clone();
+                        existing.after_exists = change.after_exists;
+                    })
+                    .or_insert(change);
+            }
+        }
+    }
+    changes
+}
+
+fn file_changes_from_tool_output(
+    cwd: &Path,
+    tool_name: &str,
+    output: &str,
+) -> Vec<EditHistoryFile> {
+    let Ok(value) = serde_json::from_str::<JsonValue>(output) else {
+        return Vec::new();
+    };
+    match tool_name {
+        "write_file" => file_change_from_write_file_output(cwd, &value)
+            .into_iter()
+            .collect(),
+        "edit_file" => file_change_from_edit_file_output(cwd, &value)
+            .into_iter()
+            .collect(),
+        "apply_patch" => file_changes_from_apply_patch_output(cwd, &value),
+        _ => Vec::new(),
+    }
+}
+
+fn file_change_from_write_file_output(cwd: &Path, value: &JsonValue) -> Option<EditHistoryFile> {
+    let path = value.get("filePath")?.as_str()?;
+    let after = value.get("content")?.as_str()?.to_string();
+    let before_value = value.get("originalFile")?;
+    let before = before_value.as_str().map(ToOwned::to_owned);
+    Some(EditHistoryFile {
+        path: snapshot_path_for_output(cwd, path),
+        before: before.clone().unwrap_or_default(),
+        after,
+        before_exists: before.is_some(),
+        after_exists: true,
+    })
+}
+
+fn file_change_from_edit_file_output(cwd: &Path, value: &JsonValue) -> Option<EditHistoryFile> {
+    let path = value.get("filePath")?.as_str()?;
+    let before = value.get("originalFile")?.as_str()?.to_string();
+    let old_string = value.get("oldString")?.as_str()?;
+    let new_string = value.get("newString")?.as_str()?;
+    let replace_all = value
+        .get("replaceAll")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    let after = if replace_all {
+        before.replace(old_string, new_string)
+    } else {
+        before.replacen(old_string, new_string, 1)
+    };
+    Some(EditHistoryFile {
+        path: snapshot_path_for_output(cwd, path),
+        before,
+        after,
+        before_exists: true,
+        after_exists: true,
+    })
+}
+
+fn file_changes_from_apply_patch_output(cwd: &Path, value: &JsonValue) -> Vec<EditHistoryFile> {
+    value
+        .get("changedFiles")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|file| {
+            let path = file.get("filePath")?.as_str()?;
+            let before_exists = file
+                .get("beforeExists")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            let after_exists = file
+                .get("afterExists")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            let before = file
+                .get("beforeContent")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+                .to_string();
+            let after = file
+                .get("afterContent")
+                .and_then(JsonValue::as_str)
+                .unwrap_or("")
+                .to_string();
+            Some(EditHistoryFile {
+                path: snapshot_path_for_output(cwd, path),
+                before,
+                after,
+                before_exists,
+                after_exists,
+            })
+        })
+        .collect()
+}
+
+fn snapshot_path_for_output(cwd: &Path, path: &str) -> String {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.strip_prefix(cwd)
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned())
+    } else {
+        path.to_string_lossy().into_owned()
+    }
+}
+
+fn append_undo_snapshot(session: &mut Session, snapshot: SessionTurnSnapshot) {
+    push_undo_snapshot(session, snapshot, true);
+}
+
+fn push_undo_snapshot(session: &mut Session, snapshot: SessionTurnSnapshot, clear_redo: bool) {
+    if session.metadata.is_none() {
+        session.metadata = Some(SessionMetadata {
+            title: None,
+            started_at: current_timestamp_rfc3339ish(),
+            model: DEFAULT_MODEL.to_string(),
+            message_count: session.messages.len().try_into().unwrap_or(u32::MAX),
+            last_prompt: last_prompt_from_session(session),
+            permission_mode: None,
+            thinking_enabled: None,
+            collaboration_mode: None,
+            reasoning_effort: None,
+            fast_mode: None,
+            proxy_tool_calls: None,
+            allowed_tools: None,
+            edit_history: None,
+            undo_stack: None,
+            redo_stack: None,
+        });
+    }
+    if let Some(metadata) = &mut session.metadata {
+        metadata
+            .undo_stack
+            .get_or_insert_with(Vec::new)
+            .push(snapshot);
+        if clear_redo {
+            metadata.redo_stack = Some(Vec::new());
+        }
+    }
+}
+
+fn user_text_from_message(message: &ConversationMessage) -> Option<String> {
+    (message.role == MessageRole::User)
+        .then(|| {
+            message
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn git_dirty_paths(cwd: &Path) -> BTreeSet<String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .current_dir(cwd)
+        .output();
+    let Ok(output) = output else {
+        return BTreeSet::new();
+    };
+    if !output.status.success() {
+        return BTreeSet::new();
+    }
+
+    let mut paths = BTreeSet::new();
+    let mut pending_rename = false;
+    for record in output.stdout.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(record);
+        if pending_rename {
+            paths.insert(text.to_string());
+            pending_rename = false;
+            continue;
+        }
+        if text.len() < 4 {
+            continue;
+        }
+        let status = &text[..2];
+        let path = text[3..].to_string();
+        if status.starts_with('R') || status.ends_with('R') {
+            pending_rename = true;
+        }
+        paths.insert(path);
+    }
+    paths
+}
+
+fn read_snapshot_file_state(cwd: &Path, relative_path: &str) -> SnapshotFileState {
+    let path = cwd.join(relative_path);
+    match fs::read_to_string(path) {
+        Ok(content) => SnapshotFileState {
+            exists: true,
+            content,
+        },
+        Err(_) => SnapshotFileState {
+            exists: false,
+            content: String::new(),
+        },
+    }
+}
+
+fn read_clean_tracked_snapshot_state(cwd: &Path, relative_path: &str) -> Option<SnapshotFileState> {
+    let output = Command::new("git")
+        .args(["show", &format!("HEAD:{relative_path}")])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|content| SnapshotFileState {
+            exists: true,
+            content,
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotDirection {
+    Before,
+    After,
+}
+
+fn pop_undo_snapshot(session: &mut Session) -> Option<SessionTurnSnapshot> {
+    session
+        .metadata
+        .as_mut()
+        .and_then(|metadata| metadata.undo_stack.as_mut())
+        .and_then(Vec::pop)
+}
+
+fn pop_redo_snapshot(session: &mut Session) -> Option<SessionTurnSnapshot> {
+    session
+        .metadata
+        .as_mut()
+        .and_then(|metadata| metadata.redo_stack.as_mut())
+        .and_then(Vec::pop)
+}
+
+fn push_redo_snapshot(session: &mut Session, snapshot: SessionTurnSnapshot) {
+    if let Some(metadata) = &mut session.metadata {
+        metadata
+            .redo_stack
+            .get_or_insert_with(Vec::new)
+            .push(snapshot);
+    }
+}
+
+fn restore_snapshot_files(
+    cwd: &Path,
+    snapshot: &SessionTurnSnapshot,
+    direction: SnapshotDirection,
+) -> io::Result<()> {
+    for file in &snapshot.files {
+        let (exists, content) = match direction {
+            SnapshotDirection::Before => (file.before_exists, file.before.as_str()),
+            SnapshotDirection::After => (file.after_exists, file.after.as_str()),
+        };
+        let path = cwd.join(&file.path);
+        if exists {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(path, content)?;
+        } else if path.is_file() || path.is_symlink() {
+            fs::remove_file(path)?;
+        } else if path.is_dir() {
+            fs::remove_dir_all(path)?;
+        }
+    }
+    Ok(())
 }
 
 fn session_runtime_state(
@@ -3350,6 +3912,21 @@ fn session_runtime_state(
         fast_mode,
         proxy_tool_calls,
     }
+}
+
+fn persist_runtime_defaults(
+    permission_mode: PermissionMode,
+    collaboration_mode: CollaborationMode,
+    reasoning_effort: Option<ReasoningEffort>,
+    fast_mode: FastMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut state = load_model_state()?;
+    state.permission_mode = Some(permission_mode.as_str().to_string());
+    state.collaboration_mode = Some(collaboration_mode.as_str().to_string());
+    state.reasoning_effort =
+        reasoning_effort.map(|effort| reasoning_effort_label(Some(effort)).to_string());
+    state.fast_mode = fast_mode.enabled();
+    save_model_state(&state)
 }
 
 fn session_age_secs(modified_epoch_secs: u64) -> u64 {
@@ -3733,6 +4310,84 @@ fn render_diff_report() -> Result<String, Box<dyn std::error::Error>> {
     Ok(format!("Diff\n\n{}", sections.join("\n\n")))
 }
 
+fn render_patch_report(args: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    let (dry_run, patch, source) = load_patch_command(args)?;
+    let output = apply_patch(&patch, dry_run)?;
+    Ok(format_patch_report(&output, &source))
+}
+
+fn load_patch_command(
+    args: Option<&str>,
+) -> Result<(bool, String, String), Box<dyn std::error::Error>> {
+    let mut dry_run = true;
+    let mut source = args.unwrap_or_default().trim();
+    if source == "--apply" {
+        return Err("usage: /patch --apply <patch-file-or-inline-diff>".into());
+    } else if let Some(rest) = source.strip_prefix("--apply ") {
+        dry_run = false;
+        source = rest.trim_start();
+    } else if source == "--check" {
+        return Err("usage: /patch --check <patch-file-or-inline-diff>".into());
+    } else if let Some(rest) = source.strip_prefix("--check ") {
+        dry_run = true;
+        source = rest.trim_start();
+    }
+
+    if source.is_empty() {
+        return Err("usage: /patch [--check|--apply] <patch-file-or-inline-diff>".into());
+    }
+
+    if looks_like_inline_patch(source) {
+        return Ok((
+            dry_run,
+            source.to_string(),
+            inline_patch_source_label(source),
+        ));
+    }
+
+    let path = split_command_arguments(source)
+        .into_iter()
+        .next()
+        .ok_or("usage: /patch [--check|--apply] <patch-file-or-inline-diff>")?;
+    let content = fs::read_to_string(&path)?;
+    Ok((dry_run, content, path))
+}
+
+fn looks_like_inline_patch(value: &str) -> bool {
+    let trimmed = value.trim_start();
+    trimmed.starts_with("*** Begin Patch")
+        || trimmed.starts_with("diff --git ")
+        || trimmed.starts_with("--- ")
+}
+
+fn inline_patch_source_label(value: &str) -> String {
+    let line_count = value.lines().count().max(1);
+    format!("inline patch ({line_count} lines)")
+}
+
+fn format_patch_report(output: &runtime::ApplyPatchOutput, source: &str) -> String {
+    let mode = if output.dry_run { "check" } else { "apply" };
+    let result = if output.dry_run {
+        "validated"
+    } else {
+        "applied"
+    };
+    let mut lines = vec![
+        "Patch".to_string(),
+        format!("  Mode             {mode}"),
+        format!("  Result           {result}"),
+        format!("  Source           {source}"),
+        format!("  Summary          {}", output.summary),
+    ];
+    if !output.changed_files.is_empty() {
+        lines.push("  Files".to_string());
+        for file in &output.changed_files {
+            lines.push(format!("    {:<8} {}", file.action, file.file_path));
+        }
+    }
+    lines.join("\n")
+}
+
 fn run_git_capture(cwd: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("git").args(args).current_dir(cwd).output()?;
     if !output.status.success() {
@@ -3749,8 +4404,12 @@ fn render_version_report() -> String {
     )
 }
 
-fn render_export_text(session: &Session) -> String {
+fn render_export_text(session: &Session, session_path: Option<&Path>) -> String {
     let mut lines = vec!["# Conversation Export".to_string(), String::new()];
+    if let Some(summary) = render_export_archived_tool_summary(session, session_path) {
+        lines.push(summary);
+        lines.push(String::new());
+    }
     for (index, message) in session.messages.iter().enumerate() {
         let role = match message.role {
             MessageRole::System => "system",
@@ -3781,16 +4440,83 @@ fn render_export_text(session: &Session) -> String {
                     tool_name,
                     output,
                     is_error,
+                    compacted,
+                    archived_output_path,
                 } => {
+                    let output = get_tool_result_context_output(output, *compacted);
                     lines.push(format!(
                         "[tool_result id={tool_use_id} name={tool_name} error={is_error}] {output}"
                     ));
+                    if let Some(archived_output_path) = archived_output_path {
+                        lines.push(format!("[tool_result_archive path={archived_output_path}]"));
+                    }
                 }
+                ContentBlock::CompactionSummary {
+                    summary,
+                    recent_messages_preserved,
+                    ..
+                } => lines.push(get_compact_continuation_message(
+                    summary,
+                    true,
+                    *recent_messages_preserved,
+                )),
             }
         }
         lines.push(String::new());
     }
     lines.join("\n")
+}
+
+fn render_export_archived_tool_summary(
+    session: &Session,
+    session_path: Option<&Path>,
+) -> Option<String> {
+    let summary = summarize_archived_tool_results(session, session_path);
+    if summary.entries.is_empty() {
+        return None;
+    }
+
+    let mut lines = vec![
+        "## Archived Tool Outputs".to_string(),
+        format!("- Count: {}", summary.entries.len()),
+        format!("- Available sidecars: {}", summary.available_count),
+        format!("- Missing sidecars: {}", summary.missing_count),
+    ];
+    if summary.unrecoverable_count > 0 {
+        lines.push(format!(
+            "- Unrecoverable entries: {}",
+            summary.unrecoverable_count
+        ));
+    }
+    lines.push("- Suggested commands:".to_string());
+    lines.push("  /archives list".to_string());
+    for entry in summary.entries.iter().take(3) {
+        lines.push(format!("  /archives show {}", entry.entry.tool_use_id));
+        lines.push(format!(
+            "  /archives save {} [file]",
+            entry.entry.tool_use_id
+        ));
+    }
+    lines.push("- Archived entries:".to_string());
+    for entry in summary.entries.iter().take(8) {
+        lines.push(format!(
+            "  - tool_call={} message={} tool={} status={} file={}",
+            entry.entry.tool_use_id,
+            entry.entry.message_id,
+            entry.entry.tool_name,
+            entry.status.label(),
+            entry
+                .entry
+                .archived_output_path
+                .as_deref()
+                .unwrap_or("(none)")
+        ));
+    }
+    if summary.entries.len() > 8 {
+        lines.push(format!("  - ... and {} more", summary.entries.len() - 8));
+    }
+
+    Some(lines.join("\n"))
 }
 
 fn assistant_text_from_messages(messages: &[ConversationMessage]) -> String {
@@ -3946,7 +4672,23 @@ fn repl_completion_candidates(cli: &LiveCli) -> Vec<String> {
     candidates.insert("/agents help".to_string());
     candidates.insert("/session list".to_string());
     candidates.insert("/session switch".to_string());
+    candidates.insert("/session timeline".to_string());
+    candidates.insert("/session fork".to_string());
+    candidates.insert("/session rename".to_string());
+    candidates.insert("/timeline".to_string());
+    candidates.insert("/fork".to_string());
+    candidates.insert("/rename".to_string());
+    candidates.insert("/undo".to_string());
+    candidates.insert("/redo".to_string());
     candidates.insert("/resume last".to_string());
+
+    if let Ok(commands) =
+        load_custom_slash_commands(&env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    {
+        for name in commands.keys() {
+            candidates.insert(format!("/{name}"));
+        }
+    }
 
     for model in model_completion_candidates(&cli.model) {
         candidates.insert(format!("/model {model}"));
@@ -3981,6 +4723,191 @@ fn repl_completion_candidates(cli: &LiveCli) -> Vec<String> {
     }
 
     candidates.into_iter().collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CustomSlashCommand {
+    template: String,
+    description: Option<String>,
+}
+
+fn parse_custom_slash_invocation(input: &str) -> Option<(&str, &str)> {
+    let trimmed = input.trim();
+    let body = trimmed.strip_prefix('/')?;
+    let (name, arguments) = body
+        .split_once(char::is_whitespace)
+        .map_or((body, ""), |(name, rest)| (name, rest.trim()));
+    (!name.is_empty()).then_some((name, arguments))
+}
+
+fn load_custom_slash_commands(cwd: &Path) -> io::Result<BTreeMap<String, CustomSlashCommand>> {
+    let mut commands = BTreeMap::new();
+
+    if let Ok(config) = ConfigLoader::default_for(cwd).load() {
+        if let Some(command_map) = config.get("command").and_then(RuntimeJsonValue::as_object) {
+            for (name, value) in command_map {
+                if let Some(command) = custom_command_from_config(value) {
+                    commands.insert(name.clone(), command);
+                }
+            }
+        }
+    }
+
+    for root in custom_command_roots(cwd) {
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "md") {
+                continue;
+            }
+            let Some(name) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(ToOwned::to_owned)
+            else {
+                continue;
+            };
+            let template = fs::read_to_string(&path)?;
+            commands.insert(
+                name,
+                CustomSlashCommand {
+                    description: first_non_heading_line(&template),
+                    template,
+                },
+            );
+        }
+    }
+
+    Ok(commands)
+}
+
+fn custom_command_from_config(value: &RuntimeJsonValue) -> Option<CustomSlashCommand> {
+    if let Some(template) = value.as_str() {
+        return Some(CustomSlashCommand {
+            template: template.to_string(),
+            description: None,
+        });
+    }
+    let object = value.as_object()?;
+    let template = object.get("template").and_then(RuntimeJsonValue::as_str)?;
+    Some(CustomSlashCommand {
+        template: template.to_string(),
+        description: object
+            .get("description")
+            .and_then(RuntimeJsonValue::as_str)
+            .map(ToOwned::to_owned),
+    })
+}
+
+fn custom_command_roots(cwd: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(config_home) = resolve_pebble_config_home() {
+        roots.push(config_home.join("commands"));
+    }
+    for ancestor in cwd.ancestors().collect::<Vec<_>>().into_iter().rev() {
+        roots.push(ancestor.join(".pebble").join("commands"));
+    }
+    roots
+}
+
+fn render_custom_command_template(template: &str, arguments: &str) -> String {
+    let args = split_command_arguments(arguments);
+    let mut rendered = template.replace("$ARGUMENTS", arguments);
+    let mut last_numbered = 0_usize;
+    for token in numbered_placeholders(template) {
+        last_numbered = last_numbered.max(token);
+    }
+    for token in numbered_placeholders(template) {
+        let replacement = if token == last_numbered {
+            args.get(token.saturating_sub(1)..)
+                .map(|values| values.join(" "))
+                .unwrap_or_default()
+        } else {
+            args.get(token.saturating_sub(1))
+                .cloned()
+                .unwrap_or_default()
+        };
+        rendered = rendered.replace(&format!("${token}"), &replacement);
+    }
+    if !template.contains("$ARGUMENTS") && last_numbered == 0 && !arguments.trim().is_empty() {
+        rendered.push_str("\n\n");
+        rendered.push_str(arguments);
+    }
+    rendered.trim().to_string()
+}
+
+fn numbered_placeholders(template: &str) -> BTreeSet<usize> {
+    let mut values = BTreeSet::new();
+    let chars = template.chars().collect::<Vec<_>>();
+    let mut index = 0;
+    while index + 1 < chars.len() {
+        if chars[index] != '$' || !chars[index + 1].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let start = index + 1;
+        let mut end = start;
+        while end < chars.len() && chars[end].is_ascii_digit() {
+            end += 1;
+        }
+        if let Ok(value) = chars[start..end]
+            .iter()
+            .collect::<String>()
+            .parse::<usize>()
+        {
+            values.insert(value);
+        }
+        index = end;
+    }
+    values
+}
+
+fn split_command_arguments(arguments: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for ch in arguments.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if quote == Some(ch) {
+            quote = None;
+            continue;
+        }
+        if quote.is_none() && (ch == '"' || ch == '\'') {
+            quote = Some(ch);
+            continue;
+        }
+        if quote.is_none() && ch.is_whitespace() {
+            if !current.is_empty() {
+                args.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
+fn first_non_heading_line(markdown: &str) -> Option<String> {
+    markdown
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToOwned::to_owned)
 }
 
 fn model_completion_candidates(current_model: &str) -> Vec<String> {
@@ -4185,6 +5112,20 @@ fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                     ),
                     SlashCommand::Status => cli.print_status(),
                     SlashCommand::Compact => cli.compact()?,
+                    SlashCommand::Archives { action, target } => println!(
+                        "{}",
+                        render_archived_tool_results_report(
+                            cli.runtime.session(),
+                            Some(&cli.session.path),
+                            action.as_deref(),
+                            target.as_deref(),
+                        )?
+                    ),
+                    SlashCommand::Undo => cli.undo_turn()?,
+                    SlashCommand::Redo => cli.redo_turn()?,
+                    SlashCommand::Timeline => println!("{}", cli.render_timeline()),
+                    SlashCommand::Fork { target } => cli.fork_session(target.as_deref())?,
+                    SlashCommand::Rename { title } => cli.rename_session(title.as_deref())?,
                     SlashCommand::Reasoning { effort } => {
                         cli.set_reasoning(match effort.as_deref() {
                             Some(value) => Some(parse_reasoning_effort_arg(value)?),
@@ -4216,6 +5157,7 @@ fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                     SlashCommand::Memory => println!("{}", render_memory_report()?),
                     SlashCommand::Init => run_init_with_model(cli.service, &cli.model)?,
                     SlashCommand::Diff => println!("{}", render_diff_report()?),
+                    SlashCommand::Patch { args } => cli.run_patch_command(args.as_deref())?,
                     SlashCommand::Version => print_version(),
                     SlashCommand::Branch { action, target } => println!(
                         "{}",
@@ -4254,7 +5196,11 @@ fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
                         "{}",
                         handle_skills_slash_command(args.as_deref(), &env::current_dir()?)?
                     ),
-                    SlashCommand::Unknown(name) => eprintln!("unknown slash command: /{name}"),
+                    SlashCommand::Unknown(name) => {
+                        if !cli.run_custom_slash_command(trimmed)? {
+                            eprintln!("unknown slash command: /{name}");
+                        }
+                    }
                     SlashCommand::Model { .. }
                     | SlashCommand::Logout { .. }
                     | SlashCommand::Mcp { .. } => {
@@ -4407,6 +5353,9 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()?;
+        let before_message_count = self.runtime.session().messages.len();
+        let before_files = WorktreeSnapshot::capture(&cwd);
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         // Visual turn separator so the transcript has clear "acts": one per
@@ -4427,12 +5376,16 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 spinner.finish("done", TerminalRenderer::new().color_theme(), &mut stdout)?;
+                let mut session = self.runtime.session().clone();
+                if let Some(snapshot) =
+                    build_turn_snapshot(&cwd, &before_files, before_message_count, &session)
+                {
+                    append_undo_snapshot(&mut session, snapshot);
+                    self.runtime.replace_session(session);
+                }
                 self.persist_session()?;
                 if let Some(event) = summary.auto_compaction {
-                    println!(
-                        "{}",
-                        ui::dim_note(&format_auto_compaction_notice(event.removed_message_count))
-                    );
+                    println!("{}", ui::dim_note(&format_auto_compaction_notice(event)));
                 }
                 println!();
                 Ok(())
@@ -4449,10 +5402,20 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()?;
+        let before_message_count = self.runtime.session().messages.len();
+        let before_files = WorktreeSnapshot::capture(&cwd);
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let summary = self
             .runtime
             .run_turn(input, Some(&mut permission_prompter))?;
+        let mut session = self.runtime.session().clone();
+        if let Some(snapshot) =
+            build_turn_snapshot(&cwd, &before_files, before_message_count, &session)
+        {
+            append_undo_snapshot(&mut session, snapshot);
+            self.runtime.replace_session(session);
+        }
         self.persist_session()?;
         println!(
             "{}",
@@ -4462,7 +5425,8 @@ impl LiveCli {
                 "iterations": summary.iterations,
                 "auto_compaction": summary.auto_compaction.map(|event| serde_json::json!({
                     "removed_messages": event.removed_message_count,
-                    "notice": format_auto_compaction_notice(event.removed_message_count),
+                    "pruned_tool_results": event.pruned_tool_result_count,
+                    "notice": format_auto_compaction_notice(event),
                 })),
                 "tool_uses": collect_tool_uses(&summary),
                 "tool_results": collect_tool_results(&summary),
@@ -4474,6 +5438,47 @@ impl LiveCli {
                 }
             })
         );
+        Ok(())
+    }
+
+    fn run_patch_command(&mut self, args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        let (dry_run, patch, source) = load_patch_command(args)?;
+        let cwd = env::current_dir()?;
+        let before_message_count = self.runtime.session().messages.len();
+        let before_files = (!dry_run).then(|| WorktreeSnapshot::capture(&cwd));
+        let output = apply_patch(&patch, dry_run)?;
+        if let Some(before_files) = before_files {
+            let mut session = self.runtime.session().clone();
+            let output_json = serde_json::to_string(&output)?;
+            let synthetic_messages = vec![ConversationMessage::tool_result(
+                "patch-command",
+                "apply_patch",
+                output_json,
+                false,
+            )];
+            let mut snapshot = SessionTurnSnapshot {
+                timestamp: current_timestamp_rfc3339ish(),
+                message_count_before: before_message_count.try_into().unwrap_or(u32::MAX),
+                prompt: Some(format!("/patch {source}")),
+                messages: Vec::new(),
+                files: file_changes_from_turn_messages(&cwd, &synthetic_messages)
+                    .into_values()
+                    .collect(),
+            };
+            if snapshot.files.is_empty() {
+                if let Some(git_snapshot) =
+                    build_turn_snapshot(&cwd, &before_files, before_message_count, &session)
+                {
+                    snapshot = git_snapshot;
+                }
+            }
+            if !snapshot.files.is_empty() {
+                append_undo_snapshot(&mut session, snapshot);
+                self.runtime.replace_session(session);
+                self.persist_session()?;
+            }
+        }
+        println!("{}", format_patch_report(&output, &source));
         Ok(())
     }
 
@@ -4636,12 +5641,14 @@ impl LiveCli {
             return Ok(());
         };
         if mode == self.permission_mode {
+            self.persist_runtime_defaults()?;
             println!("Permission mode: {}", self.permission_mode.as_str());
             return Ok(());
         }
 
         self.permission_mode = mode;
         self.rebuild_runtime(self.runtime.session().clone())?;
+        self.persist_runtime_defaults()?;
         self.persist_session()?;
         println!("Permission mode: {}", self.permission_mode.as_str());
         Ok(())
@@ -4663,12 +5670,14 @@ impl LiveCli {
             return Ok(());
         };
         if mode == self.collaboration_mode {
+            self.persist_runtime_defaults()?;
             println!("{}", format_mode_report(self.collaboration_mode));
             return Ok(());
         }
 
         self.collaboration_mode = mode;
         self.rebuild_runtime(self.runtime.session().clone())?;
+        self.persist_runtime_defaults()?;
         self.persist_session()?;
         println!("{}", format_mode_switch_report(self.collaboration_mode));
         Ok(())
@@ -4686,6 +5695,7 @@ impl LiveCli {
             return Ok(());
         };
         if reasoning_effort == self.reasoning_effort {
+            self.persist_runtime_defaults()?;
             println!(
                 "{}",
                 format_reasoning_report(self.reasoning_effort, self.effective_reasoning_effort())
@@ -4695,6 +5705,7 @@ impl LiveCli {
 
         self.reasoning_effort = reasoning_effort;
         self.rebuild_runtime(self.runtime.session().clone())?;
+        self.persist_runtime_defaults()?;
         self.persist_session()?;
         println!(
             "{}",
@@ -4715,12 +5726,14 @@ impl LiveCli {
             return Ok(());
         };
         if fast_mode == self.fast_mode {
+            self.persist_runtime_defaults()?;
             println!("{}", format_fast_mode_report(self.fast_mode));
             return Ok(());
         }
 
         self.fast_mode = fast_mode;
         self.rebuild_runtime(self.runtime.session().clone())?;
+        self.persist_runtime_defaults()?;
         self.persist_session()?;
         println!("{}", format_fast_mode_switch_report(self.fast_mode));
         Ok(())
@@ -4728,6 +5741,15 @@ impl LiveCli {
 
     fn effective_reasoning_effort(&self) -> Option<ReasoningEffort> {
         effective_reasoning_effort(self.collaboration_mode, self.reasoning_effort)
+    }
+
+    fn persist_runtime_defaults(&self) -> Result<(), Box<dyn std::error::Error>> {
+        persist_runtime_defaults(
+            self.permission_mode,
+            self.collaboration_mode,
+            self.reasoning_effort,
+            self.fast_mode,
+        )
     }
 
     fn rebuild_runtime(&mut self, session: Session) -> Result<(), Box<dyn std::error::Error>> {
@@ -4824,13 +5846,159 @@ impl LiveCli {
         requested_path: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let export_path = resolve_export_path(requested_path, self.runtime.session())?;
-        fs::write(&export_path, render_export_text(self.runtime.session()))?;
+        fs::write(
+            &export_path,
+            render_export_text(self.runtime.session(), Some(&self.session.path)),
+        )?;
         println!(
             "Export\n  Result           wrote transcript\n  File             {}\n  Messages         {}",
             export_path.display(),
             self.runtime.session().messages.len(),
         );
         Ok(())
+    }
+
+    fn undo_turn(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = self.runtime.session().clone();
+        let Some(snapshot) = pop_undo_snapshot(&mut session) else {
+            println!("Undo\n  Result           nothing to undo");
+            return Ok(());
+        };
+        restore_snapshot_files(&env::current_dir()?, &snapshot, SnapshotDirection::Before)?;
+        session
+            .messages
+            .truncate(snapshot.message_count_before as usize);
+        push_redo_snapshot(&mut session, snapshot.clone());
+        self.runtime.replace_session(session);
+        self.persist_session()?;
+        println!(
+            "Undo\n  Result           restored previous turn\n  Messages removed {}\n  Files restored   {}",
+            snapshot.messages.len(),
+            snapshot.files.len()
+        );
+        Ok(())
+    }
+
+    fn redo_turn(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = self.runtime.session().clone();
+        let Some(snapshot) = pop_redo_snapshot(&mut session) else {
+            println!("Redo\n  Result           nothing to redo");
+            return Ok(());
+        };
+        restore_snapshot_files(&env::current_dir()?, &snapshot, SnapshotDirection::After)?;
+        session
+            .messages
+            .truncate(snapshot.message_count_before as usize);
+        session.messages.extend(snapshot.messages.clone());
+        push_undo_snapshot(&mut session, snapshot.clone(), false);
+        self.runtime.replace_session(session);
+        self.persist_session()?;
+        println!(
+            "Redo\n  Result           replayed turn\n  Messages restored {}\n  Files restored    {}",
+            snapshot.messages.len(),
+            snapshot.files.len()
+        );
+        Ok(())
+    }
+
+    fn render_timeline(&self) -> String {
+        render_session_timeline(self.runtime.session())
+    }
+
+    fn fork_session(&mut self, target: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        let mut forked = self.runtime.session().clone();
+        if let Some(target) = target.filter(|value| !value.trim().is_empty()) {
+            let index = resolve_timeline_target(&forked, target)
+                .ok_or_else(|| format!("unknown timeline target: {target}"))?;
+            forked.messages.truncate(index + 1);
+        }
+        let source_id = self.session.id.clone();
+        let fork_title = forked.metadata.as_ref().and_then(|metadata| {
+            metadata
+                .title
+                .as_ref()
+                .map(|title| format!("Fork of {title}"))
+        });
+        if let Some(metadata) = &mut forked.metadata {
+            metadata.undo_stack = None;
+            metadata.redo_stack = None;
+        }
+        let handle = create_managed_session_handle()?;
+        forked.metadata = Some(derive_session_metadata(
+            &forked,
+            &self.model,
+            self.allowed_tools.as_ref(),
+            self.permission_mode,
+            self.collaboration_mode,
+            self.reasoning_effort,
+            self.fast_mode,
+            self.proxy_tool_calls,
+        ));
+        if let Some(metadata) = &mut forked.metadata {
+            metadata.title = Some(fork_title.unwrap_or_else(|| format!("Fork of {source_id}")));
+            metadata.undo_stack = None;
+            metadata.redo_stack = None;
+        }
+        forked.save_to_path(&handle.path)?;
+        self.restore_session_runtime(handle.clone(), forked)?;
+        self.persist_session()?;
+        println!(
+            "Session forked\n  Source           {}\n  Active session   {}\n  File             {}",
+            source_id,
+            handle.id,
+            handle.path.display()
+        );
+        Ok(())
+    }
+
+    fn rename_session(&mut self, title: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(title) = title.map(str::trim).filter(|value| !value.is_empty()) else {
+            println!("Usage: /rename <title>");
+            return Ok(());
+        };
+        let mut session = self.runtime.session().clone();
+        if session.metadata.is_none() {
+            session.metadata = Some(derive_session_metadata(
+                &session,
+                &self.model,
+                self.allowed_tools.as_ref(),
+                self.permission_mode,
+                self.collaboration_mode,
+                self.reasoning_effort,
+                self.fast_mode,
+                self.proxy_tool_calls,
+            ));
+        }
+        if let Some(metadata) = &mut session.metadata {
+            metadata.title = Some(title.to_string());
+        }
+        self.runtime.replace_session(session);
+        self.persist_session()?;
+        println!(
+            "Session renamed\n  Active session   {}\n  Title            {}",
+            self.session.id, title
+        );
+        Ok(())
+    }
+
+    fn run_custom_slash_command(
+        &mut self,
+        input: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let Some((name, arguments)) = parse_custom_slash_invocation(input) else {
+            return Ok(false);
+        };
+        let commands = load_custom_slash_commands(&env::current_dir()?)?;
+        let Some(command) = commands.get(name) else {
+            return Ok(false);
+        };
+        let prompt = render_custom_command_template(&command.template, arguments);
+        if prompt.trim().is_empty() {
+            println!("Command /{name} expanded to an empty prompt.");
+            return Ok(true);
+        }
+        self.run_turn(&prompt)?;
+        Ok(true)
     }
 
     fn handle_session_command(
@@ -4858,8 +6026,11 @@ impl LiveCli {
                     message_count,
                 );
             }
+            Some("timeline") => println!("{}", self.render_timeline()),
+            Some("fork") => self.fork_session(target)?,
+            Some("rename") => self.rename_session(target)?,
             Some(other) => println!(
-                "Unknown /session action '{other}'. Use /session list or /session switch <session-id>."
+                "Unknown /session action '{other}'. Use /session list, /session switch <session-id>, /session timeline, /session fork [message-id], or /session rename <title>."
             ),
         }
         Ok(())
@@ -4989,7 +6160,14 @@ impl PermissionPrompter for CliPermissionPrompter {
         println!("  Tool             {}", request.tool_name);
         println!("  Current mode     {}", self.current_mode.as_str());
         println!("  Required mode    {}", request.required_mode.as_str());
-        println!("  Input            {}", request.input);
+        if let Some(preview) = render_permission_diff_preview(request) {
+            println!("{preview}");
+        } else {
+            println!(
+                "  Input            {}",
+                truncate_for_summary(&request.input, 1_000)
+            );
+        }
         print!("Approve this tool call? [y/N]: ");
         let _ = io::stdout().flush();
 
@@ -5013,6 +6191,195 @@ impl PermissionPrompter for CliPermissionPrompter {
             },
         }
     }
+}
+
+fn render_permission_diff_preview(request: &PermissionRequest) -> Option<String> {
+    match request.tool_name.as_str() {
+        "write_file" => render_write_permission_preview(&request.input),
+        "edit_file" => render_edit_permission_preview(&request.input),
+        "apply_patch" => render_apply_patch_permission_preview(&request.input),
+        _ => None,
+    }
+}
+
+fn render_write_permission_preview(input: &str) -> Option<String> {
+    let value = serde_json::from_str::<JsonValue>(input).ok()?;
+    let path = value
+        .get("path")
+        .or_else(|| value.get("file_path"))
+        .and_then(JsonValue::as_str)?;
+    let after = value.get("content").and_then(JsonValue::as_str)?;
+    let before = fs::read_to_string(path).ok();
+    Some(render_permission_file_diff(
+        path,
+        before.is_some(),
+        before.as_deref().unwrap_or(""),
+        true,
+        after,
+    ))
+}
+
+fn render_edit_permission_preview(input: &str) -> Option<String> {
+    let value = serde_json::from_str::<JsonValue>(input).ok()?;
+    let path = value
+        .get("path")
+        .or_else(|| value.get("file_path"))
+        .and_then(JsonValue::as_str)?;
+    let old_string = value.get("old_string").and_then(JsonValue::as_str)?;
+    let new_string = value.get("new_string").and_then(JsonValue::as_str)?;
+    let replace_all = value
+        .get("replace_all")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    let before = fs::read_to_string(path).ok()?;
+    let after = if replace_all {
+        before.replace(old_string, new_string)
+    } else {
+        before.replacen(old_string, new_string, 1)
+    };
+    Some(render_permission_file_diff(
+        path, true, &before, true, &after,
+    ))
+}
+
+fn render_apply_patch_permission_preview(input: &str) -> Option<String> {
+    let value = serde_json::from_str::<JsonValue>(input).ok()?;
+    let patch = value.get("patch").and_then(JsonValue::as_str)?;
+    let checked = match apply_patch(patch, true) {
+        Ok(output) => output,
+        Err(error) => {
+            return Some(format!(
+                "  Patch check      failed before approval: {error}\n  Input            {}",
+                truncate_for_summary(input, 1_000)
+            ));
+        }
+    };
+
+    let mut sections = vec![format!("  Patch check      {}", checked.summary)];
+    for file in checked.changed_files.iter().take(6) {
+        sections.push(render_permission_file_diff(
+            &file.file_path,
+            file.before_exists,
+            file.before_content.as_deref().unwrap_or(""),
+            file.after_exists,
+            file.after_content.as_deref().unwrap_or(""),
+        ));
+    }
+    if checked.changed_files.len() > 6 {
+        sections.push(format!(
+            "  ...              {} more files",
+            checked.changed_files.len() - 6
+        ));
+    }
+    Some(sections.join("\n"))
+}
+
+fn render_permission_file_diff(
+    path: &str,
+    before_exists: bool,
+    before: &str,
+    after_exists: bool,
+    after: &str,
+) -> String {
+    let before_lines = split_preview_lines(before);
+    let after_lines = split_preview_lines(after);
+    let removed = before_lines.len();
+    let added = after_lines.len();
+    let mut lines = vec![
+        format!("  Diff             {path}"),
+        format!("    --- {}", if before_exists { path } else { "/dev/null" }),
+        format!("    +++ {}", if after_exists { path } else { "/dev/null" }),
+    ];
+
+    if before_exists && after_exists {
+        let prefix = common_prefix_len(&before_lines, &after_lines);
+        let suffix = common_suffix_len(&before_lines[prefix..], &after_lines[prefix..]);
+        let before_start = prefix.saturating_sub(3);
+        let before_end = before_lines
+            .len()
+            .saturating_sub(suffix)
+            .saturating_add(3)
+            .min(before_lines.len());
+        let after_start = prefix.saturating_sub(3);
+        let after_end = after_lines
+            .len()
+            .saturating_sub(suffix)
+            .saturating_add(3)
+            .min(after_lines.len());
+        lines.push(format!(
+            "    @@ -{},{} +{},{} @@",
+            before_start + 1,
+            before_end.saturating_sub(before_start),
+            after_start + 1,
+            after_end.saturating_sub(after_start)
+        ));
+        for line in &before_lines[before_start..prefix] {
+            lines.push(format!("     {}", truncate_for_summary(line, 180)));
+        }
+        for line in &before_lines[prefix..before_lines.len().saturating_sub(suffix)] {
+            lines.push(format!("    -{}", truncate_for_summary(line, 180)));
+        }
+        for line in &after_lines[prefix..after_lines.len().saturating_sub(suffix)] {
+            lines.push(format!("    +{}", truncate_for_summary(line, 180)));
+        }
+        let suffix_start = after_lines.len().saturating_sub(suffix);
+        for line in &after_lines[suffix_start..after_end] {
+            lines.push(format!("     {}", truncate_for_summary(line, 180)));
+        }
+    } else if after_exists {
+        lines.push(format!("    @@ created file: {added} lines @@"));
+        for line in after_lines.iter().take(40) {
+            lines.push(format!("    +{}", truncate_for_summary(line, 180)));
+        }
+    } else {
+        lines.push(format!("    @@ deleted file: {removed} lines @@"));
+        for line in before_lines.iter().take(40) {
+            lines.push(format!("    -{}", truncate_for_summary(line, 180)));
+        }
+    }
+
+    truncate_diff_lines(lines, 80, 8_000).join("\n")
+}
+
+fn split_preview_lines(content: &str) -> Vec<String> {
+    if content.is_empty() {
+        Vec::new()
+    } else {
+        content.lines().map(ToOwned::to_owned).collect()
+    }
+}
+
+fn common_prefix_len(left: &[String], right: &[String]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn common_suffix_len(left: &[String], right: &[String]) -> usize {
+    left.iter()
+        .rev()
+        .zip(right.iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn truncate_diff_lines(mut lines: Vec<String>, max_lines: usize, max_chars: usize) -> Vec<String> {
+    let mut chars = 0usize;
+    let mut truncated = false;
+    let mut kept = Vec::new();
+    for line in lines.drain(..) {
+        if kept.len() == max_lines || chars.saturating_add(line.len()) > max_chars {
+            truncated = true;
+            break;
+        }
+        chars += line.len();
+        kept.push(line);
+    }
+    if truncated {
+        kept.push("    ... diff preview truncated".to_string());
+    }
+    kept
 }
 
 fn build_system_prompt(
@@ -5140,8 +6507,10 @@ fn build_runtime(
         &available_runtime_tool_specs(&tool_registry, &mcp_catalog),
     );
     let max_output_tokens = max_output_tokens_for_model_or(&model, DEFAULT_MAX_TOKENS);
+    let feature_config = build_runtime_feature_config()?;
+    let compaction_config = feature_config.compaction();
     let auto_compaction_threshold = configured_auto_compaction_threshold().unwrap_or_else(|| {
-        derive_auto_compaction_threshold(&model, max_output_tokens)
+        derive_auto_compaction_threshold(&model, max_output_tokens, compaction_config.reserved)
             .unwrap_or_else(auto_compaction_threshold_from_env)
     });
     Ok(ConversationRuntime::new_with_features(
@@ -5169,7 +6538,7 @@ fn build_runtime(
         ),
         permission_policy,
         runtime_prompt,
-        build_runtime_feature_config()?,
+        &feature_config,
     )
     .with_auto_compaction_input_tokens_threshold(auto_compaction_threshold))
 }
@@ -5181,10 +6550,19 @@ fn configured_auto_compaction_threshold() -> Option<u32> {
         .filter(|threshold| *threshold > 0)
 }
 
-fn derive_auto_compaction_threshold(model: &str, max_output_tokens: u32) -> Option<u32> {
+fn derive_auto_compaction_threshold(
+    model: &str,
+    max_output_tokens: u32,
+    reserved_override: Option<u32>,
+) -> Option<u32> {
     let context_length = context_length_for_model(model)?;
-    let reserved_output_tokens =
-        u64::from(max_output_tokens).saturating_add(AUTO_COMPACTION_CONTEXT_SAFETY_MARGIN_TOKENS);
+    let reserved_output_tokens = reserved_override.map_or_else(
+        || {
+            u64::from(max_output_tokens)
+                .saturating_add(AUTO_COMPACTION_CONTEXT_SAFETY_MARGIN_TOKENS)
+        },
+        u64::from,
+    );
     let available_input_tokens = context_length.saturating_sub(reserved_output_tokens);
     if available_input_tokens == 0 {
         return None;
@@ -5680,6 +7058,19 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
             .and_then(JsonValue::as_str)
             .unwrap_or("?")
             .to_string(),
+        "apply_patch" => {
+            let dry_run = parsed
+                .get("dry_run")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(false);
+            let patch_lines = parsed
+                .get("patch")
+                .and_then(JsonValue::as_str)
+                .map(|patch| patch.lines().count())
+                .unwrap_or(0);
+            let mode = if dry_run { "check" } else { "apply" };
+            format!("{mode} ({patch_lines} lines)")
+        }
         "glob_search" | "Glob" | "grep_search" | "Grep" => parsed
             .get("pattern")
             .and_then(JsonValue::as_str)
@@ -5856,6 +7247,7 @@ fn contains_proxy_markup(text: &str) -> bool {
         "<read_file",
         "<write_file",
         "<edit_file",
+        "<apply_patch",
         "<bash",
         "<glob_search",
         "<grep_search",
@@ -5968,6 +7360,7 @@ fn render_structured_tool_preview(tool_name: &str, output: &str) -> Option<Strin
         "grep_search" => render_grep_search_preview(&value),
         "bash" => render_bash_preview(&value),
         "write_file" | "edit_file" => render_write_edit_preview(&value),
+        "apply_patch" => render_apply_patch_preview(&value),
         _ => None,
     }
 }
@@ -6106,6 +7499,42 @@ fn render_write_edit_preview(value: &serde_json::Value) -> Option<String> {
     // Borrow the string values to match `tool_result_block`'s signature.
     let pairs: Vec<(&str, &str)> = rows.iter().map(|(k, v)| (*k, v.as_str())).collect();
     Some(ui::tool_result_block(&pairs))
+}
+
+fn render_apply_patch_preview(value: &serde_json::Value) -> Option<String> {
+    let summary = value
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("patch processed");
+    let mode = if value
+        .get("dryRun")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        "check"
+    } else {
+        "apply"
+    };
+    let mut block = ui::tool_result_block(&[("mode", mode), ("summary", summary)]);
+    let files = value
+        .get("changedFiles")
+        .and_then(serde_json::Value::as_array)
+        .map(|files| {
+            files
+                .iter()
+                .take(8)
+                .filter_map(|file| {
+                    let action = file.get("action")?.as_str()?;
+                    let path = file.get("filePath")?.as_str()?;
+                    Some(format!("{action:<8} {path}"))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !files.is_empty() {
+        block.push_str(&ui::tool_result_body("files", &files.join("\n")));
+    }
+    Some(block)
 }
 
 fn truncate_tool_text(input: &str, max_lines: usize, max_chars: usize) -> String {
@@ -6297,13 +7726,26 @@ fn convert_messages(
                             tool_use_id,
                             output,
                             is_error,
+                            compacted,
                             ..
                         } => acc.push(InputContentBlock::ToolResult {
                             tool_use_id: tool_use_id.clone(),
                             content: vec![ToolResultContentBlock::Text {
-                                text: output.clone(),
+                                text: get_tool_result_context_output(output, *compacted)
+                                    .into_owned(),
                             }],
                             is_error: *is_error,
+                        }),
+                        ContentBlock::CompactionSummary {
+                            summary,
+                            recent_messages_preserved,
+                            ..
+                        } => acc.push(InputContentBlock::Text {
+                            text: get_compact_continuation_message(
+                                summary,
+                                true,
+                                *recent_messages_preserved,
+                            ),
                         }),
                     }
                     Ok::<_, RuntimeError>(acc)
@@ -6380,6 +7822,7 @@ fn sanitize_messages_for_api(messages: &[ConversationMessage]) -> Vec<Conversati
                 return None;
             }
             Some(ConversationMessage {
+                id: message.id.clone(),
                 role: message.role,
                 blocks,
                 usage: message.usage,
@@ -6417,6 +7860,30 @@ fn prompt_to_content_blocks(input: &str, cwd: &Path) -> Result<Vec<InputContentB
                 if looks_like_image_ref(candidate, cwd) {
                     flush_text_block(&mut blocks, &mut text_buffer);
                     blocks.push(load_image_block(candidate, cwd)?);
+                    while let Some((next_index, _)) = chars.peek() {
+                        if *next_index < path_end {
+                            let _ = chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if looks_like_unsupported_image_ref(candidate) {
+                    flush_text_block(&mut blocks, &mut text_buffer);
+                    blocks.push(load_image_block(candidate, cwd)?);
+                    while let Some((next_index, _)) = chars.peek() {
+                        if *next_index < path_end {
+                            let _ = chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if looks_like_file_ref(candidate, cwd) {
+                    flush_text_block(&mut blocks, &mut text_buffer);
+                    blocks.push(load_file_reference_block(candidate, cwd)?);
                     while let Some((next_index, _)) = chars.peek() {
                         if *next_index < path_end {
                             let _ = chars.next();
@@ -6464,11 +7931,24 @@ fn find_path_end(input: &str, start: usize) -> usize {
 
 fn looks_like_image_ref(candidate: &str, cwd: &Path) -> bool {
     let resolved = resolve_prompt_path(candidate, cwd);
-    media_type_for_path(Path::new(candidate)).is_some()
-        || resolved.is_file()
-        || candidate.contains(std::path::MAIN_SEPARATOR)
-        || candidate.starts_with("./")
-        || candidate.starts_with("../")
+    media_type_for_path(Path::new(candidate)).is_some() || media_type_for_path(&resolved).is_some()
+}
+
+fn looks_like_file_ref(candidate: &str, cwd: &Path) -> bool {
+    let resolved = resolve_prompt_path(candidate, cwd);
+    (resolved.is_file() || resolved.is_dir()) && media_type_for_path(Path::new(candidate)).is_none()
+}
+
+fn looks_like_unsupported_image_ref(candidate: &str) -> bool {
+    Path::new(candidate)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "avif" | "bmp" | "heic" | "heif" | "svg" | "tif" | "tiff"
+            )
+        })
 }
 
 fn flush_text_block(blocks: &mut Vec<InputContentBlock>, text_buffer: &mut String) {
@@ -6500,6 +7980,105 @@ fn load_image_block(path_ref: &str, cwd: &Path) -> Result<InputContentBlock, Str
             data: encode_base64(&bytes),
         },
     })
+}
+
+fn load_file_reference_block(path_ref: &str, cwd: &Path) -> Result<InputContentBlock, String> {
+    let resolved = resolve_prompt_path(path_ref, cwd);
+    if resolved.is_dir() {
+        return Ok(InputContentBlock::Text {
+            text: render_directory_reference(path_ref, &resolved)?,
+        });
+    }
+
+    let metadata = fs::metadata(&resolved).map_err(|error| {
+        format!(
+            "failed to stat file reference {}: {error}",
+            resolved.display()
+        )
+    })?;
+    if metadata.len() > FILE_REF_MAX_BYTES {
+        return Err(format!(
+            "file reference {} is too large ({} bytes, limit {} bytes)",
+            resolved.display(),
+            metadata.len(),
+            FILE_REF_MAX_BYTES
+        ));
+    }
+    let content = fs::read_to_string(&resolved).map_err(|error| {
+        format!(
+            "failed to read file reference {}: {error}",
+            resolved.display()
+        )
+    })?;
+    Ok(InputContentBlock::Text {
+        text: format!(
+            "File reference: {path_ref}\n```text\n{content}\n```",
+            content = content.trim_end()
+        ),
+    })
+}
+
+fn render_directory_reference(path_ref: &str, resolved: &Path) -> Result<String, String> {
+    let mut entries = Vec::new();
+    collect_directory_reference_entries(resolved, resolved, &mut entries)?;
+    entries.sort();
+    let truncated = entries.len() > DIRECTORY_REF_MAX_ENTRIES;
+    entries.truncate(DIRECTORY_REF_MAX_ENTRIES);
+    let mut text = format!("Directory reference: {path_ref}\n");
+    if entries.is_empty() {
+        text.push_str("(empty directory)");
+    } else {
+        for entry in &entries {
+            let _ = writeln!(&mut text, "- {entry}");
+        }
+        if truncated {
+            let _ = writeln!(
+                &mut text,
+                "- ... truncated after {DIRECTORY_REF_MAX_ENTRIES} entries"
+            );
+        }
+    }
+    Ok(text)
+}
+
+fn collect_directory_reference_entries(
+    root: &Path,
+    dir: &Path,
+    entries: &mut Vec<String>,
+) -> Result<(), String> {
+    if entries.len() > DIRECTORY_REF_MAX_ENTRIES {
+        return Ok(());
+    }
+    let read_dir = fs::read_dir(dir).map_err(|error| {
+        format!(
+            "failed to read directory reference {}: {error}",
+            dir.display()
+        )
+    })?;
+    for entry in read_dir {
+        let entry =
+            entry.map_err(|error| format!("failed to read directory reference entry: {error}"))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        if path.is_dir() {
+            entries.push(format!("{relative}/"));
+            collect_directory_reference_entries(root, &path, entries)?;
+        } else {
+            entries.push(relative);
+        }
+        if entries.len() > DIRECTORY_REF_MAX_ENTRIES {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn resolve_prompt_path(path_ref: &str, cwd: &Path) -> PathBuf {
@@ -6677,15 +8256,481 @@ fn collect_tool_results(summary: &runtime::TurnSummary) -> Vec<JsonValue> {
                 tool_name,
                 output,
                 is_error,
+                compacted,
+                archived_output_path,
             } => Some(serde_json::json!({
                 "tool_use_id": tool_use_id,
                 "tool_name": tool_name,
-                "output": output,
+                "output": get_tool_result_context_output(output, *compacted),
                 "is_error": is_error,
+                "compacted": compacted,
+                "archived_output_path": archived_output_path,
             })),
             _ => None,
         })
         .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchivedToolResultEntry {
+    message_id: String,
+    tool_use_id: String,
+    tool_name: String,
+    archived_output_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchivedToolResultStatus {
+    Available,
+    Missing,
+    NotRecoverable,
+}
+
+impl ArchivedToolResultStatus {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Missing => "missing",
+            Self::NotRecoverable => "not recoverable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchivedToolResultRow {
+    entry: ArchivedToolResultEntry,
+    status: ArchivedToolResultStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchivedToolResultSummary {
+    entries: Vec<ArchivedToolResultRow>,
+    available_count: usize,
+    missing_count: usize,
+    unrecoverable_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadedArchivedToolResult {
+    entry: ArchivedToolResultEntry,
+    resolved_path: PathBuf,
+    output: String,
+}
+
+fn collect_archived_tool_results(session: &Session) -> Vec<ArchivedToolResultEntry> {
+    session
+        .messages
+        .iter()
+        .flat_map(|message| {
+            message.blocks.iter().filter_map(move |block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    compacted,
+                    archived_output_path,
+                    ..
+                } if *compacted || archived_output_path.is_some() => {
+                    Some(ArchivedToolResultEntry {
+                        message_id: message.id.clone(),
+                        tool_use_id: tool_use_id.clone(),
+                        tool_name: tool_name.clone(),
+                        archived_output_path: archived_output_path.clone(),
+                    })
+                }
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+fn summarize_archived_tool_results(
+    session: &Session,
+    session_path: Option<&Path>,
+) -> ArchivedToolResultSummary {
+    let entries = collect_archived_tool_results(session)
+        .into_iter()
+        .map(|entry| {
+            let status = archived_tool_result_status(&entry, session_path);
+            ArchivedToolResultRow { entry, status }
+        })
+        .collect::<Vec<_>>();
+    let available_count = entries
+        .iter()
+        .filter(|entry| entry.status == ArchivedToolResultStatus::Available)
+        .count();
+    let missing_count = entries
+        .iter()
+        .filter(|entry| entry.status == ArchivedToolResultStatus::Missing)
+        .count();
+    let unrecoverable_count = entries
+        .iter()
+        .filter(|entry| entry.status == ArchivedToolResultStatus::NotRecoverable)
+        .count();
+
+    ArchivedToolResultSummary {
+        entries,
+        available_count,
+        missing_count,
+        unrecoverable_count,
+    }
+}
+
+fn archived_tool_result_status(
+    entry: &ArchivedToolResultEntry,
+    session_path: Option<&Path>,
+) -> ArchivedToolResultStatus {
+    let Some(path) = entry.archived_output_path.as_deref() else {
+        return ArchivedToolResultStatus::NotRecoverable;
+    };
+    if resolve_archived_output_path(path, session_path).is_some_and(|candidate| candidate.exists())
+    {
+        ArchivedToolResultStatus::Available
+    } else {
+        ArchivedToolResultStatus::Missing
+    }
+}
+
+fn render_archived_tool_results_report(
+    session: &Session,
+    session_path: Option<&Path>,
+    action: Option<&str>,
+    target: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match action.unwrap_or("list") {
+        "list" => Ok(render_archived_tool_results_list(session, session_path)),
+        "show" => render_archived_tool_result_show(session, session_path, target),
+        "page" => page_archived_tool_result(session, session_path, target),
+        "save" => save_archived_tool_result(session, session_path, target),
+        other => Ok(format!(
+            "Archives\n  Result           unsupported action `{other}`\n  Usage            /archives [list|show <message-id-or-tool-call-id>|page <message-id-or-tool-call-id>|save <message-id-or-tool-call-id> [file]]"
+        )),
+    }
+}
+
+fn render_archived_tool_results_list(session: &Session, session_path: Option<&Path>) -> String {
+    let summary = summarize_archived_tool_results(session, session_path);
+    if summary.entries.is_empty() {
+        return "Archives\n  Result           no archived tool outputs".to_string();
+    }
+
+    let mut lines = vec![
+        "Archives".to_string(),
+        format!("  Count            {}", summary.entries.len()),
+        format!("  Available        {}", summary.available_count),
+        format!("  Missing          {}", summary.missing_count),
+    ];
+    if summary.unrecoverable_count > 0 {
+        lines.push(format!(
+            "  Unrecoverable    {}",
+            summary.unrecoverable_count
+        ));
+    }
+
+    for (index, entry) in summary.entries.iter().enumerate() {
+        lines.push(String::new());
+        lines.push(format!(
+            "{}. Message         {}",
+            index + 1,
+            entry.entry.message_id
+        ));
+        lines.push(format!("   Tool call       {}", entry.entry.tool_use_id));
+        lines.push(format!("   Tool            {}", entry.entry.tool_name));
+        lines.push(format!(
+            "   File            {}",
+            entry
+                .entry
+                .archived_output_path
+                .as_deref()
+                .unwrap_or("(none)")
+        ));
+        lines.push(format!("   Status          {}", entry.status.label()));
+    }
+
+    lines.join("\n")
+}
+
+fn render_archived_tool_result_show(
+    session: &Session,
+    session_path: Option<&Path>,
+    target: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let Some(target) = parse_archived_tool_result_target(target) else {
+        return Ok(
+            "Archives\n  Result           missing target\n  Usage            /archives show <message-id-or-tool-call-id>"
+                .to_string(),
+        );
+    };
+
+    match load_archived_tool_result(session, session_path, target) {
+        Ok(loaded) => Ok(format!(
+            "Archives\n  Result           showing archived tool output\n  Message          {}\n  Tool call        {}\n  Tool             {}\n  File             {}\n\n{}",
+            loaded.entry.message_id,
+            loaded.entry.tool_use_id,
+            loaded.entry.tool_name,
+            loaded.resolved_path.display(),
+            loaded.output
+        )),
+        Err(report) => Ok(report),
+    }
+}
+
+fn page_archived_tool_result(
+    session: &Session,
+    session_path: Option<&Path>,
+    target: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let Some(target) = parse_archived_tool_result_target(target) else {
+        return Ok(
+            "Archives\n  Result           missing target\n  Usage            /archives page <message-id-or-tool-call-id>"
+                .to_string(),
+        );
+    };
+
+    let loaded = match load_archived_tool_result(session, session_path, target) {
+        Ok(loaded) => loaded,
+        Err(report) => return Ok(report),
+    };
+
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Ok(format!(
+            "Archives\n  Result           pager unavailable outside an interactive terminal\n  Message          {}\n  Tool call        {}\n  Tool             {}\n  File             {}\n\n{}",
+            loaded.entry.message_id,
+            loaded.entry.tool_use_id,
+            loaded.entry.tool_name,
+            loaded.resolved_path.display(),
+            loaded.output
+        ));
+    }
+
+    let pager_command = env::var("PAGER")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "less -FRX".to_string());
+    let mut parts = pager_command.split_whitespace();
+    let Some(program) = parts.next() else {
+        return Ok(format!(
+            "Archives\n  Result           pager unavailable\n  Message          {}\n  Tool call        {}\n  Tool             {}\n  File             {}\n\n{}",
+            loaded.entry.message_id,
+            loaded.entry.tool_use_id,
+            loaded.entry.tool_name,
+            loaded.resolved_path.display(),
+            loaded.output
+        ));
+    };
+    let args = parts.collect::<Vec<_>>();
+
+    let mut child = match Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => {
+            return Ok(format!(
+                "Archives\n  Result           pager unavailable\n  Message          {}\n  Tool call        {}\n  Tool             {}\n  File             {}\n\n{}",
+                loaded.entry.message_id,
+                loaded.entry.tool_use_id,
+                loaded.entry.tool_name,
+                loaded.resolved_path.display(),
+                loaded.output
+            ));
+        }
+    };
+    if let Some(stdin) = child.stdin.as_mut() {
+        let header = format!(
+            "Archived tool output\nMessage: {}\nTool call: {}\nTool: {}\nFile: {}\n\n",
+            loaded.entry.message_id,
+            loaded.entry.tool_use_id,
+            loaded.entry.tool_name,
+            loaded.resolved_path.display(),
+        );
+        stdin.write_all(header.as_bytes())?;
+        stdin.write_all(loaded.output.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        return Ok(format!(
+            "Archives\n  Result           pager exited unsuccessfully\n  Message          {}\n  Tool call        {}\n  Tool             {}\n  File             {}",
+            loaded.entry.message_id,
+            loaded.entry.tool_use_id,
+            loaded.entry.tool_name,
+            loaded.resolved_path.display(),
+        ));
+    }
+
+    Ok(format!(
+        "Archives\n  Result           viewed in pager\n  Message          {}\n  Tool call        {}\n  Tool             {}\n  File             {}",
+        loaded.entry.message_id,
+        loaded.entry.tool_use_id,
+        loaded.entry.tool_name,
+        loaded.resolved_path.display(),
+    ))
+}
+
+fn save_archived_tool_result(
+    session: &Session,
+    session_path: Option<&Path>,
+    target: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let Some((target, path)) = parse_archived_tool_result_save_args(target) else {
+        return Ok(
+            "Archives\n  Result           missing target\n  Usage            /archives save <message-id-or-tool-call-id> [file]"
+                .to_string(),
+        );
+    };
+
+    let loaded = match load_archived_tool_result(session, session_path, target) {
+        Ok(loaded) => loaded,
+        Err(report) => return Ok(report),
+    };
+    let destination = match path {
+        Some(path) => resolve_archive_save_path(path)?,
+        None => env::current_dir()?.join(default_archived_tool_result_filename(
+            &loaded.entry.tool_use_id,
+            &loaded.entry.tool_name,
+        )),
+    };
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&destination, &loaded.output)?;
+
+    Ok(format!(
+        "Archives\n  Result           wrote archived tool output\n  Message          {}\n  Tool call        {}\n  Tool             {}\n  Source           {}\n  Saved to         {}",
+        loaded.entry.message_id,
+        loaded.entry.tool_use_id,
+        loaded.entry.tool_name,
+        loaded.resolved_path.display(),
+        destination.display(),
+    ))
+}
+
+fn resolve_archived_output_path(
+    archived_output_path: &str,
+    session_path: Option<&Path>,
+) -> Option<PathBuf> {
+    let relative = PathBuf::from(archived_output_path);
+    if relative.is_absolute() {
+        return Some(relative);
+    }
+
+    let cwd_candidate = env::current_dir().ok().map(|cwd| cwd.join(&relative));
+    let session_candidate = session_project_root(session_path).map(|root| root.join(&relative));
+
+    cwd_candidate
+        .as_ref()
+        .filter(|candidate| candidate.exists())
+        .cloned()
+        .or_else(|| {
+            session_candidate
+                .as_ref()
+                .filter(|candidate| candidate.exists())
+                .cloned()
+        })
+        .or(cwd_candidate)
+        .or(session_candidate)
+}
+
+fn session_project_root(session_path: Option<&Path>) -> Option<PathBuf> {
+    let session_path = session_path?;
+    let sessions_dir = session_path.parent()?;
+    let pebble_dir = sessions_dir.parent()?;
+    (pebble_dir.file_name()? == ".pebble").then(|| pebble_dir.parent().map(Path::to_path_buf))?
+}
+
+fn parse_archived_tool_result_target(target: Option<&str>) -> Option<&str> {
+    target.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn parse_archived_tool_result_save_args(target: Option<&str>) -> Option<(&str, Option<&str>)> {
+    let target = parse_archived_tool_result_target(target)?;
+    match target.split_once(char::is_whitespace) {
+        Some((identifier, path)) => {
+            let path = path.trim();
+            Some((identifier.trim(), (!path.is_empty()).then_some(path)))
+        }
+        None => Some((target, None)),
+    }
+}
+
+fn load_archived_tool_result(
+    session: &Session,
+    session_path: Option<&Path>,
+    target: &str,
+) -> Result<LoadedArchivedToolResult, String> {
+    let entries = collect_archived_tool_results(session);
+    let Some(entry) = entries
+        .into_iter()
+        .find(|entry| entry.message_id == target || entry.tool_use_id == target)
+    else {
+        return Err(format!(
+            "Archives\n  Result           no archived tool output matched `{target}`"
+        ));
+    };
+
+    let Some(archived_output_path) = entry.archived_output_path.as_deref() else {
+        return Err(format!(
+            "Archives\n  Result           archived output unavailable\n  Message          {}\n  Tool call        {}\n  Tool             {}",
+            entry.message_id, entry.tool_use_id, entry.tool_name
+        ));
+    };
+
+    let resolved_path = resolve_archived_output_path(archived_output_path, session_path)
+        .ok_or_else(|| "Archives\n  Result           unable to resolve archive path".to_string())?;
+    let output = match fs::read_to_string(&resolved_path) {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(format!(
+                "Archives\n  Result           archive file missing\n  Message          {}\n  Tool call        {}\n  Tool             {}\n  File             {}",
+                entry.message_id,
+                entry.tool_use_id,
+                entry.tool_name,
+                resolved_path.display(),
+            ));
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+
+    Ok(LoadedArchivedToolResult {
+        entry,
+        resolved_path,
+        output,
+    })
+}
+
+fn default_archived_tool_result_filename(tool_use_id: &str, tool_name: &str) -> String {
+    format!(
+        "archived-{}-{}.txt",
+        sanitize_filename_component(tool_use_id),
+        sanitize_filename_component(tool_name)
+    )
+}
+
+fn resolve_archive_save_path(path: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = PathBuf::from(path.trim());
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(env::current_dir()?.join(path))
+    }
+}
+
+fn sanitize_filename_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|char| {
+            if char.is_ascii_alphanumeric() || matches!(char, '-' | '_') {
+                char
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "item".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn run_resume_command(
@@ -6701,13 +8746,8 @@ fn run_resume_command(
             })),
         }),
         SlashCommand::Compact => {
-            let result = runtime::compact_session(
-                session,
-                CompactionConfig {
-                    max_estimated_tokens: 0,
-                    ..CompactionConfig::default()
-                },
-            );
+            let result = compact_resumed_session(session)
+                .unwrap_or_else(|_| compact_resumed_session_local(session));
             let removed = result.removed_message_count;
             let kept = result.compacted_session.messages.len();
             let skipped = removed == 0;
@@ -6724,6 +8764,15 @@ fn run_resume_command(
                 }),
             })
         }
+        SlashCommand::Archives { action, target } => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_archived_tool_results_report(
+                session,
+                Some(session_path),
+                action.as_deref(),
+                target.as_deref(),
+            )?),
+        }),
         SlashCommand::Clear { confirm } => {
             if !confirm {
                 return Ok(ResumeCommandOutcome {
@@ -6814,13 +8863,24 @@ fn run_resume_command(
             session: session.clone(),
             message: Some(render_diff_report()?),
         }),
+        SlashCommand::Patch { args } => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_patch_report(args.as_deref())?),
+        }),
         SlashCommand::Version => Ok(ResumeCommandOutcome {
             session: session.clone(),
             message: Some(render_version_report()),
         }),
+        SlashCommand::Timeline => Ok(ResumeCommandOutcome {
+            session: session.clone(),
+            message: Some(render_session_timeline(session)),
+        }),
         SlashCommand::Export { path } => {
             let export_path = resolve_export_path(path.as_deref(), session)?;
-            fs::write(&export_path, render_export_text(session))?;
+            fs::write(
+                &export_path,
+                render_export_text(session, Some(session_path)),
+            )?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format!(
@@ -6831,6 +8891,10 @@ fn run_resume_command(
             })
         }
         SlashCommand::Resume { .. }
+        | SlashCommand::Undo
+        | SlashCommand::Redo
+        | SlashCommand::Fork { .. }
+        | SlashCommand::Rename { .. }
         | SlashCommand::Model { .. }
         | SlashCommand::Logout { .. }
         | SlashCommand::Mcp { .. }
@@ -6846,6 +8910,59 @@ fn run_resume_command(
         | SlashCommand::Agents { .. }
         | SlashCommand::Skills { .. }
         | SlashCommand::Unknown(_) => Err("unsupported resumed slash command".into()),
+    }
+}
+
+fn compact_resumed_session(
+    session: &Session,
+) -> Result<runtime::CompactionResult, Box<dyn std::error::Error>> {
+    let fallback_model = session
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.model.clone())
+        .unwrap_or_else(|| default_model_or(DEFAULT_MODEL));
+    let restored = session_runtime_state(
+        session,
+        &fallback_model,
+        None,
+        default_permission_mode(),
+        CollaborationMode::Build,
+        None,
+        FastMode::Off,
+        proxy_tool_calls_enabled(),
+    );
+    let system_prompt = build_system_prompt(
+        restored.service,
+        &restored.model,
+        restored.collaboration_mode,
+    )?;
+    let mcp_catalog = load_mcp_catalog(&env::current_dir()?)?;
+    let mut runtime = build_runtime(
+        session.clone(),
+        restored.service,
+        restored.model,
+        system_prompt,
+        true,
+        restored.proxy_tool_calls,
+        mcp_catalog,
+        restored.allowed_tools,
+        restored.permission_mode,
+        restored.collaboration_mode,
+        restored.reasoning_effort,
+        restored.fast_mode,
+        false,
+    )?;
+    Ok(runtime.compact(force_compaction_config()))
+}
+
+fn compact_resumed_session_local(session: &Session) -> runtime::CompactionResult {
+    runtime::compact_session(session, force_compaction_config())
+}
+
+fn force_compaction_config() -> CompactionConfig {
+    CompactionConfig {
+        max_estimated_tokens: 0,
+        ..CompactionConfig::default()
     }
 }
 
@@ -8115,23 +10232,30 @@ fn check_system_info(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> Dia
 mod tests {
     use super::{
         append_proxy_text_events, available_runtime_tool_specs, build_system_prompt,
-        extract_first_json_object, filter_runtime_tool_specs, format_status_report,
-        format_web_tools_status, login_model_guidance, normalize_generated_pebble_md, parse_args,
-        parse_auth_command, parse_checksum_for_asset, parse_logout_command, parse_mcp_command,
-        parse_model_command, parse_permissions_command, parse_provider_command,
-        parse_proxy_command, parse_tool_input_value, prompt_to_content_blocks,
+        build_turn_snapshot, extract_first_json_object, filter_runtime_tool_specs,
+        format_status_report, format_web_tools_status, load_custom_slash_commands,
+        login_model_guidance, normalize_generated_pebble_md, parse_args, parse_auth_command,
+        parse_checksum_for_asset, parse_logout_command, parse_mcp_command, parse_model_command,
+        parse_permissions_command, parse_provider_command, parse_proxy_command,
+        parse_tool_input_value, persist_runtime_defaults, prompt_to_content_blocks,
         proxy_response_to_events, push_output_block, remove_saved_credentials,
-        render_streamed_tool_call_start, render_tool_result_block, render_update_report,
-        resolve_model_alias, response_to_events, should_ignore_stale_secret_submit,
-        should_retry_proxy_tool_prompt, strip_markdown_code_fence, trim_trailing_line_endings,
-        tuned_tool_description, AssistantEvent, AuthService, CliAction, CliOutputFormat,
-        CollaborationMode, CredentialRemovalOutcome, FastMode, GitHubRelease, GitHubReleaseAsset,
-        LoginCommand, LogoutCommand, McpCatalog, McpCommand, PebbleRuntimeClient, RuntimeToolSpec,
-        StatusContext, StatusUsage, DEFAULT_MAX_TOKENS, DEFAULT_MODEL,
+        render_archived_tool_results_report, render_custom_command_template, render_export_text,
+        render_permission_diff_preview, render_session_timeline, render_streamed_tool_call_start,
+        render_tool_result_block, render_update_report, resolve_model_alias, response_to_events,
+        should_ignore_stale_secret_submit, should_retry_proxy_tool_prompt,
+        strip_markdown_code_fence, trim_trailing_line_endings, tuned_tool_description,
+        AssistantEvent, AuthService, CliAction, CliOutputFormat, CollaborationMode,
+        CredentialRemovalOutcome, FastMode, GitHubRelease, GitHubReleaseAsset, LoginCommand,
+        LogoutCommand, McpCatalog, McpCommand, PebbleRuntimeClient, RuntimeToolSpec, StatusContext,
+        StatusUsage, WorktreeSnapshot, DEFAULT_MAX_TOKENS, DEFAULT_MODEL,
     };
     use crate::proxy::ProxyCommand;
-    use api::{ApiService, InputContentBlock, MessageResponse, OutputContentBlock, Usage};
-    use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode, TokenUsage};
+    use api::{
+        ApiService, InputContentBlock, MessageResponse, OutputContentBlock, ReasoningEffort, Usage,
+    };
+    use runtime::{
+        ContentBlock, ConversationMessage, PermissionMode, PermissionRequest, Session, TokenUsage,
+    };
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
@@ -8178,6 +10302,64 @@ mod tests {
                     model: DEFAULT_MODEL.to_string(),
                     allowed_tools: None,
                     permission_mode: PermissionMode::WorkspaceWrite,
+                    collaboration_mode: CollaborationMode::Build,
+                    reasoning_effort: None,
+                    fast_mode: FastMode::Off,
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn uses_persisted_runtime_defaults_for_new_repl() {
+        with_isolated_config_home(|| {
+            persist_runtime_defaults(
+                PermissionMode::DangerFullAccess,
+                CollaborationMode::Plan,
+                Some(ReasoningEffort::High),
+                FastMode::On,
+            )
+            .expect("runtime defaults should persist");
+
+            assert_eq!(
+                parse_args(&[]).expect("args should parse"),
+                CliAction::Repl {
+                    model: DEFAULT_MODEL.to_string(),
+                    allowed_tools: None,
+                    permission_mode: PermissionMode::DangerFullAccess,
+                    collaboration_mode: CollaborationMode::Plan,
+                    reasoning_effort: Some(ReasoningEffort::High),
+                    fast_mode: FastMode::On,
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn permission_env_overrides_persisted_runtime_default() {
+        with_isolated_config_home(|| {
+            persist_runtime_defaults(
+                PermissionMode::DangerFullAccess,
+                CollaborationMode::Build,
+                None,
+                FastMode::Off,
+            )
+            .expect("runtime defaults should persist");
+            let original = std::env::var("PEBBLE_PERMISSION_MODE").ok();
+            std::env::set_var("PEBBLE_PERMISSION_MODE", "read-only");
+
+            let parsed = parse_args(&[]).expect("args should parse");
+
+            match original {
+                Some(value) => std::env::set_var("PEBBLE_PERMISSION_MODE", value),
+                None => std::env::remove_var("PEBBLE_PERMISSION_MODE"),
+            }
+            assert_eq!(
+                parsed,
+                CliAction::Repl {
+                    model: DEFAULT_MODEL.to_string(),
+                    allowed_tools: None,
+                    permission_mode: PermissionMode::ReadOnly,
                     collaboration_mode: CollaborationMode::Build,
                     reasoning_effort: None,
                     fast_mode: FastMode::Off,
@@ -8937,16 +11119,7 @@ mod tests {
                 name: "bash".to_string(),
                 input: "{\"command\":\"pwd\"}".to_string(),
             }]),
-            ConversationMessage {
-                role: MessageRole::Tool,
-                blocks: vec![ContentBlock::ToolResult {
-                    tool_use_id: "tool-1".to_string(),
-                    tool_name: "bash".to_string(),
-                    output: "ok".to_string(),
-                    is_error: false,
-                }],
-                usage: None,
-            },
+            ConversationMessage::tool_result("tool-1", "bash", "ok", false),
         ];
 
         let converted = super::convert_messages(&messages, ApiService::NanoGpt)
@@ -8954,6 +11127,176 @@ mod tests {
         assert_eq!(converted.len(), 3);
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
+    }
+
+    #[test]
+    fn archives_report_lists_archived_tool_results() {
+        let temp = std::env::temp_dir().join(format!(
+            "pebble-archives-list-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        ));
+        let session_path = temp.join(".pebble/sessions/test.json");
+        let archive_path = temp.join(".pebble/tool-results/tool-1-bash.txt");
+        std::fs::create_dir_all(session_path.parent().expect("session dir")).expect("session dir");
+        std::fs::create_dir_all(archive_path.parent().expect("archive dir")).expect("archive dir");
+        std::fs::write(&archive_path, "archived output").expect("archive file");
+
+        let mut message = ConversationMessage::compacted_tool_result("tool-1", "bash", "", false);
+        let message_id = message.id.clone();
+        if let ContentBlock::ToolResult {
+            archived_output_path,
+            ..
+        } = &mut message.blocks[0]
+        {
+            *archived_output_path = Some(".pebble/tool-results/tool-1-bash.txt".to_string());
+        }
+        let session = Session {
+            version: 1,
+            messages: vec![message],
+            metadata: None,
+        };
+
+        let report = render_archived_tool_results_report(&session, Some(&session_path), None, None)
+            .expect("archives report should render");
+        std::fs::remove_dir_all(&temp).expect("cleanup temp dir");
+
+        assert!(report.contains("Archives"));
+        assert!(report.contains(&message_id));
+        assert!(report.contains("tool-1"));
+        assert!(report.contains("available"));
+    }
+
+    #[test]
+    fn archives_report_shows_archived_tool_result_contents() {
+        let temp = std::env::temp_dir().join(format!(
+            "pebble-archives-show-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        ));
+        let session_path = temp.join(".pebble/sessions/test.json");
+        let archive_path = temp.join(".pebble/tool-results/tool-1-bash.txt");
+        std::fs::create_dir_all(session_path.parent().expect("session dir")).expect("session dir");
+        std::fs::create_dir_all(archive_path.parent().expect("archive dir")).expect("archive dir");
+        std::fs::write(&archive_path, "archived output").expect("archive file");
+
+        let mut message = ConversationMessage::compacted_tool_result("tool-1", "bash", "", false);
+        if let ContentBlock::ToolResult {
+            archived_output_path,
+            ..
+        } = &mut message.blocks[0]
+        {
+            *archived_output_path = Some(".pebble/tool-results/tool-1-bash.txt".to_string());
+        }
+        let session = Session {
+            version: 1,
+            messages: vec![message],
+            metadata: None,
+        };
+
+        let report = render_archived_tool_results_report(
+            &session,
+            Some(&session_path),
+            Some("show"),
+            Some("tool-1"),
+        )
+        .expect("archives report should render");
+        std::fs::remove_dir_all(&temp).expect("cleanup temp dir");
+
+        assert!(report.contains("showing archived tool output"));
+        assert!(report.contains("archived output"));
+        assert!(report.contains("tool-1"));
+    }
+
+    #[test]
+    fn archives_report_saves_archived_tool_result_to_requested_path() {
+        let temp = std::env::temp_dir().join(format!(
+            "pebble-archives-save-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        ));
+        let session_path = temp.join(".pebble/sessions/test.json");
+        let archive_path = temp.join(".pebble/tool-results/tool-1-bash.txt");
+        let save_path = temp.join("restored/tool-output.txt");
+        std::fs::create_dir_all(session_path.parent().expect("session dir")).expect("session dir");
+        std::fs::create_dir_all(archive_path.parent().expect("archive dir")).expect("archive dir");
+        std::fs::write(&archive_path, "archived output").expect("archive file");
+
+        let mut message = ConversationMessage::compacted_tool_result("tool-1", "bash", "", false);
+        if let ContentBlock::ToolResult {
+            archived_output_path,
+            ..
+        } = &mut message.blocks[0]
+        {
+            *archived_output_path = Some(".pebble/tool-results/tool-1-bash.txt".to_string());
+        }
+        let session = Session {
+            version: 1,
+            messages: vec![message],
+            metadata: None,
+        };
+
+        let report = render_archived_tool_results_report(
+            &session,
+            Some(&session_path),
+            Some("save"),
+            Some(&format!("tool-1 {}", save_path.display())),
+        )
+        .expect("archives report should render");
+        let restored = std::fs::read_to_string(&save_path).expect("restored file should exist");
+        std::fs::remove_dir_all(&temp).expect("cleanup temp dir");
+
+        assert!(report.contains("wrote archived tool output"));
+        assert!(report.contains(&save_path.display().to_string()));
+        assert_eq!(restored, "archived output");
+    }
+
+    #[test]
+    fn export_includes_archived_tool_summary_and_commands() {
+        let temp = std::env::temp_dir().join(format!(
+            "pebble-export-archives-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        ));
+        let session_path = temp.join(".pebble/sessions/test.json");
+        let archive_path = temp.join(".pebble/tool-results/tool-1-bash.txt");
+        std::fs::create_dir_all(session_path.parent().expect("session dir")).expect("session dir");
+        std::fs::create_dir_all(archive_path.parent().expect("archive dir")).expect("archive dir");
+        std::fs::write(&archive_path, "archived output").expect("archive file");
+
+        let mut message = ConversationMessage::compacted_tool_result("tool-1", "bash", "", false);
+        let message_id = message.id.clone();
+        if let ContentBlock::ToolResult {
+            archived_output_path,
+            ..
+        } = &mut message.blocks[0]
+        {
+            *archived_output_path = Some(".pebble/tool-results/tool-1-bash.txt".to_string());
+        }
+        let session = Session {
+            version: 1,
+            messages: vec![ConversationMessage::user_text("hello"), message],
+            metadata: None,
+        };
+
+        let export = render_export_text(&session, Some(&session_path));
+        std::fs::remove_dir_all(&temp).expect("cleanup temp dir");
+
+        assert!(export.contains("## Archived Tool Outputs"));
+        assert!(export.contains("- Count: 1"));
+        assert!(export.contains("- Available sidecars: 1"));
+        assert!(export.contains("/archives list"));
+        assert!(export.contains("/archives show tool-1"));
+        assert!(export.contains("/archives save tool-1 [file]"));
+        assert!(export.contains(&format!("message={message_id}")));
     }
 
     #[test]
@@ -9092,6 +11435,203 @@ mod tests {
             .expect_err("unsupported image ref should fail");
 
         assert!(error.contains("unsupported image format"));
+    }
+
+    #[test]
+    fn prompt_to_content_blocks_embeds_text_file_refs() {
+        let temp = temp_fixture_dir("file-ref");
+        let file_path = temp.join("README.md");
+        std::fs::write(&file_path, "hello\nworld\n").expect("fixture write");
+        let prompt = format!("read @{}", file_path.display());
+
+        let blocks =
+            prompt_to_content_blocks(&prompt, Path::new(".")).expect("file ref should parse");
+
+        assert!(matches!(
+            &blocks[1],
+            InputContentBlock::Text { text }
+                if text.contains("File reference:")
+                    && text.contains("hello\nworld")
+        ));
+    }
+
+    #[test]
+    fn prompt_to_content_blocks_embeds_directory_refs() {
+        let temp = temp_fixture_dir("directory-ref");
+        std::fs::create_dir_all(temp.join("src")).expect("src dir");
+        std::fs::write(temp.join("src/lib.rs"), "pub fn demo() {}\n").expect("fixture write");
+        let prompt = format!("inspect @{}", temp.join("src").display());
+
+        let blocks =
+            prompt_to_content_blocks(&prompt, Path::new(".")).expect("directory ref should parse");
+
+        assert!(matches!(
+            &blocks[1],
+            InputContentBlock::Text { text }
+                if text.contains("Directory reference:")
+                    && text.contains("lib.rs")
+        ));
+    }
+
+    #[test]
+    fn custom_command_templates_expand_arguments() {
+        assert_eq!(
+            render_custom_command_template("Review $1 then $2", r#"api "web app""#),
+            "Review api then web app"
+        );
+        assert_eq!(
+            render_custom_command_template("Review: $ARGUMENTS", "all changes"),
+            "Review: all changes"
+        );
+        assert_eq!(
+            render_custom_command_template("Review this", "extra context"),
+            "Review this\n\nextra context"
+        );
+    }
+
+    #[test]
+    fn renders_session_timeline_with_message_previews() {
+        let mut session = Session::new();
+        session
+            .messages
+            .push(ConversationMessage::user_text("hello timeline"));
+        let timeline = render_session_timeline(&session);
+        assert!(timeline.contains("Timeline"));
+        assert!(timeline.contains("user"));
+        assert!(timeline.contains("hello timeline"));
+    }
+
+    #[test]
+    fn loads_custom_commands_from_config_and_command_dir() {
+        let _guard = env_lock();
+        let temp = temp_fixture_dir("custom-commands");
+        std::fs::create_dir_all(temp.join(".pebble/commands")).expect("commands dir");
+        std::fs::write(
+            temp.join(".pebble/settings.json"),
+            r#"{"command":{"review":{"template":"Review $ARGUMENTS","description":"review work"}}}"#,
+        )
+        .expect("settings write");
+        std::fs::write(temp.join(".pebble/commands/fix.md"), "Fix $1").expect("command write");
+
+        let commands = load_custom_slash_commands(&temp).expect("commands load");
+
+        assert_eq!(commands["review"].template, "Review $ARGUMENTS");
+        assert_eq!(commands["fix"].template, "Fix $1");
+    }
+
+    #[test]
+    fn turn_snapshots_record_messages_and_git_file_changes() {
+        let _guard = env_lock();
+        let temp = temp_fixture_dir("turn-snapshot");
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&temp)
+            .output()
+            .expect("git init");
+        std::fs::write(temp.join("tracked.txt"), "old\n").expect("tracked write");
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(&temp)
+            .output()
+            .expect("git add");
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=a@example.test",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-m",
+                "init",
+            ])
+            .current_dir(&temp)
+            .output()
+            .expect("git commit");
+
+        let before = WorktreeSnapshot::capture(&temp);
+        std::fs::write(temp.join("tracked.txt"), "new\n").expect("tracked edit");
+        std::fs::write(temp.join("new.txt"), "created\n").expect("new write");
+        let mut session = Session::new();
+        session
+            .messages
+            .push(ConversationMessage::user_text("change files"));
+
+        let snapshot =
+            build_turn_snapshot(&temp, &before, 0, &session).expect("snapshot should exist");
+
+        assert_eq!(snapshot.messages.len(), 1);
+        assert!(snapshot.files.iter().any(|file| file.path == "tracked.txt"
+            && file.before == "old\n"
+            && file.after == "new\n"));
+        assert!(snapshot
+            .files
+            .iter()
+            .any(|file| file.path == "new.txt" && !file.before_exists && file.after_exists));
+    }
+
+    #[test]
+    fn turn_snapshots_record_file_tool_outputs_without_git() {
+        let _guard = env_lock();
+        let temp = temp_fixture_dir("turn-snapshot-nongit");
+        let file = temp.join("plain.txt");
+        std::fs::write(&file, "old\n").expect("fixture write");
+        let before = WorktreeSnapshot::capture(&temp);
+        std::fs::write(&file, "new\n").expect("fixture edit");
+
+        let mut session = Session::new();
+        session
+            .messages
+            .push(ConversationMessage::user_text("edit"));
+        session.messages.push(ConversationMessage::tool_result(
+            "tool-1",
+            "write_file",
+            serde_json::json!({
+                "type": "update",
+                "filePath": file.display().to_string(),
+                "content": "new\n",
+                "originalFile": "old\n",
+                "structuredPatch": [],
+                "gitDiff": null
+            })
+            .to_string(),
+            false,
+        ));
+
+        let snapshot =
+            build_turn_snapshot(&temp, &before, 0, &session).expect("snapshot should exist");
+        let change = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == "plain.txt")
+            .expect("plain file change should be tracked");
+        assert_eq!(change.before, "old\n");
+        assert_eq!(change.after, "new\n");
+        assert!(change.before_exists);
+        assert!(change.after_exists);
+    }
+
+    #[test]
+    fn permission_preview_shows_file_diff_for_write() {
+        let _guard = env_lock();
+        let temp = temp_fixture_dir("permission-diff");
+        let file = temp.join("demo.txt");
+        std::fs::write(&file, "alpha\nbeta\n").expect("fixture write");
+        let request = PermissionRequest {
+            tool_name: "write_file".to_string(),
+            input: serde_json::json!({
+                "path": file.display().to_string(),
+                "content": "alpha\nomega\n"
+            })
+            .to_string(),
+            current_mode: PermissionMode::ReadOnly,
+            required_mode: PermissionMode::WorkspaceWrite,
+            reason: None,
+        };
+
+        let preview = render_permission_diff_preview(&request).expect("preview should render");
+        assert!(preview.contains("Diff"));
+        assert!(preview.contains("-beta"));
+        assert!(preview.contains("+omega"));
     }
 
     #[test]

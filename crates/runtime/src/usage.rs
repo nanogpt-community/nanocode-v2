@@ -211,7 +211,7 @@ impl UsageTracker {
 #[cfg(test)]
 mod tests {
     use super::{format_usd, pricing_for_model, TokenUsage, UsageTracker};
-    use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+    use crate::session::{ContentBlock, ConversationMessage, Session};
 
     #[test]
     fn tracks_true_cumulative_usage() {
@@ -288,18 +288,17 @@ mod tests {
     fn reconstructs_usage_from_session_messages() {
         let session = Session {
             version: 1,
-            messages: vec![ConversationMessage {
-                role: MessageRole::Assistant,
-                blocks: vec![ContentBlock::Text {
+            messages: vec![ConversationMessage::assistant_with_usage(
+                vec![ContentBlock::Text {
                     text: "done".to_string(),
                 }],
-                usage: Some(TokenUsage {
+                Some(TokenUsage {
                     input_tokens: 5,
                     output_tokens: 2,
                     cache_creation_input_tokens: 1,
                     cache_read_input_tokens: 0,
                 }),
-            }],
+            )],
             metadata: None,
         };
 

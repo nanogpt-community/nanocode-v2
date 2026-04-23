@@ -2,9 +2,10 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
 use crate::compact::{
-    compact_session, estimate_session_tokens, CompactionConfig, CompactionResult,
+    compact_session_with_summary, estimate_session_tokens, prepare_compaction,
+    prune_old_tool_results, CompactionConfig, CompactionResult,
 };
-use crate::config::RuntimeFeatureConfig;
+use crate::config::{RuntimeCompactionConfig, RuntimeFeatureConfig};
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
@@ -96,9 +97,10 @@ pub struct TurnSummary {
     pub auto_compaction: Option<AutoCompactionEvent>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AutoCompactionEvent {
     pub removed_message_count: usize,
+    pub pruned_tool_result_count: usize,
 }
 
 pub struct ConversationRuntime<C, T> {
@@ -110,6 +112,7 @@ pub struct ConversationRuntime<C, T> {
     max_iterations: usize,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
+    compaction_config: RuntimeCompactionConfig,
     auto_compaction_input_tokens_threshold: u32,
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
@@ -134,7 +137,7 @@ where
             tool_executor,
             permission_policy,
             system_prompt,
-            RuntimeFeatureConfig::default(),
+            &RuntimeFeatureConfig::default(),
         )
     }
 
@@ -145,7 +148,7 @@ where
         tool_executor: T,
         permission_policy: PermissionPolicy,
         system_prompt: Vec<String>,
-        feature_config: RuntimeFeatureConfig,
+        feature_config: &RuntimeFeatureConfig,
     ) -> Self {
         let usage_tracker = UsageTracker::from_session(&session);
         Self {
@@ -156,7 +159,8 @@ where
             system_prompt,
             max_iterations: usize::MAX,
             usage_tracker,
-            hook_runner: HookRunner::from_feature_config(&feature_config),
+            hook_runner: HookRunner::from_feature_config(feature_config),
+            compaction_config: feature_config.compaction(),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
@@ -261,6 +265,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn run_turn(
         &mut self,
         user_input: impl Into<String>,
@@ -274,7 +279,7 @@ where
         let mut tool_results = Vec::new();
         let mut iterations = 0;
         let mut max_turn_input_tokens = 0;
-        let mut auto_compaction_removed_message_count = 0;
+        let mut auto_compaction_event = AutoCompactionEvent::default();
 
         loop {
             iterations += 1;
@@ -284,9 +289,12 @@ where
                 ));
             }
 
+            let mut compacted_for_overflow = false;
             let events = loop {
-                if let Some(event) = self.maybe_auto_compact_by_estimate() {
-                    auto_compaction_removed_message_count += event.removed_message_count;
+                if !compacted_for_overflow {
+                    if let Some(event) = self.maybe_auto_compact_by_estimate() {
+                        auto_compaction_event.merge(event);
+                    }
                 }
 
                 let request = ApiRequest {
@@ -300,7 +308,8 @@ where
                         let Some(event) = self.force_compact_for_context_overflow() else {
                             return Err(error);
                         };
-                        auto_compaction_removed_message_count += event.removed_message_count;
+                        compacted_for_overflow = true;
+                        auto_compaction_event.merge(event);
                     }
                     Err(error) => return Err(error),
                 }
@@ -433,13 +442,12 @@ where
             }
         }
 
-        if let Some(event) = self.maybe_auto_compact(max_turn_input_tokens) {
-            auto_compaction_removed_message_count += event.removed_message_count;
+        if auto_compaction_event.is_empty() {
+            if let Some(event) = self.maybe_auto_compact(max_turn_input_tokens) {
+                auto_compaction_event.merge(event);
+            }
         }
-        let auto_compaction =
-            (auto_compaction_removed_message_count > 0).then_some(AutoCompactionEvent {
-                removed_message_count: auto_compaction_removed_message_count,
-            });
+        let auto_compaction = (!auto_compaction_event.is_empty()).then_some(auto_compaction_event);
 
         Ok(TurnSummary {
             assistant_messages,
@@ -451,8 +459,10 @@ where
     }
 
     #[must_use]
-    pub fn compact(&self, config: CompactionConfig) -> CompactionResult {
-        compact_session(&self.session, config)
+    pub fn compact(&mut self, config: CompactionConfig) -> CompactionResult {
+        let config = self.apply_configured_compaction_defaults(config);
+        let summary = self.generate_compaction_summary(config).ok();
+        compact_session_with_summary(&self.session, config, summary)
     }
 
     #[must_use]
@@ -470,65 +480,160 @@ where
         &self.session
     }
 
+    pub fn replace_session(&mut self, session: Session) {
+        self.usage_tracker = UsageTracker::from_session(&session);
+        self.session = session;
+    }
+
     #[must_use]
     pub fn into_session(self) -> Session {
         self.session
     }
 
     fn maybe_auto_compact(&mut self, turn_input_tokens: u32) -> Option<AutoCompactionEvent> {
+        if !self.compaction_config.auto {
+            return None;
+        }
         if turn_input_tokens < self.auto_compaction_input_tokens_threshold {
             return None;
         }
 
-        let result = compact_session(
-            &self.session,
-            CompactionConfig {
+        self.apply_context_reduction(
+            usize::try_from(self.auto_compaction_input_tokens_threshold).unwrap_or(usize::MAX),
+            self.apply_configured_compaction_defaults(CompactionConfig {
                 max_estimated_tokens: usize::try_from(self.auto_compaction_input_tokens_threshold)
                     .unwrap_or(usize::MAX),
+                auto: true,
                 ..CompactionConfig::default()
-            },
-        );
-
-        if result.removed_message_count == 0 {
-            return None;
-        }
-
-        self.session = result.compacted_session;
-        Some(AutoCompactionEvent {
-            removed_message_count: result.removed_message_count,
-        })
+            }),
+        )
     }
 
     fn maybe_auto_compact_by_estimate(&mut self) -> Option<AutoCompactionEvent> {
+        if !self.compaction_config.auto {
+            return None;
+        }
         if self.estimated_tokens()
             < usize::try_from(self.auto_compaction_input_tokens_threshold).unwrap_or(usize::MAX)
         {
             return None;
         }
-        self.apply_compaction(CompactionConfig {
-            max_estimated_tokens: usize::try_from(self.auto_compaction_input_tokens_threshold)
-                .unwrap_or(usize::MAX),
-            ..CompactionConfig::default()
-        })
+        self.apply_context_reduction(
+            usize::try_from(self.auto_compaction_input_tokens_threshold).unwrap_or(usize::MAX),
+            self.apply_configured_compaction_defaults(CompactionConfig {
+                max_estimated_tokens: usize::try_from(self.auto_compaction_input_tokens_threshold)
+                    .unwrap_or(usize::MAX),
+                auto: true,
+                ..CompactionConfig::default()
+            }),
+        )
     }
 
     fn force_compact_for_context_overflow(&mut self) -> Option<AutoCompactionEvent> {
-        self.apply_compaction(CompactionConfig {
-            max_estimated_tokens: 0,
-            ..CompactionConfig::default()
-        })
-    }
-
-    fn apply_compaction(&mut self, config: CompactionConfig) -> Option<AutoCompactionEvent> {
-        let result = compact_session(&self.session, config);
-        if result.removed_message_count == 0 {
+        if !self.compaction_config.auto {
             return None;
         }
+        self.apply_context_reduction(
+            usize::try_from(self.auto_compaction_input_tokens_threshold).unwrap_or(usize::MAX),
+            self.apply_configured_compaction_defaults(CompactionConfig {
+                max_estimated_tokens: 0,
+                preserve_recent_messages: 1,
+                preserve_recent_tokens: Some(usize::MAX / 2),
+                auto: true,
+                overflow: true,
+            }),
+        )
+    }
 
-        self.session = result.compacted_session;
-        Some(AutoCompactionEvent {
-            removed_message_count: result.removed_message_count,
-        })
+    fn apply_context_reduction(
+        &mut self,
+        prune_target_tokens: usize,
+        config: CompactionConfig,
+    ) -> Option<AutoCompactionEvent> {
+        let mut event = AutoCompactionEvent::default();
+        if self.compaction_config.prune {
+            let prune_result = prune_old_tool_results(&self.session, prune_target_tokens);
+            if prune_result.pruned_tool_result_count > 0 {
+                self.session = prune_result.session;
+                event.pruned_tool_result_count = prune_result.pruned_tool_result_count;
+                if prune_target_tokens > 0 && self.estimated_tokens() < prune_target_tokens {
+                    return Some(event);
+                }
+            }
+        }
+
+        let summary = self.generate_compaction_summary(config).ok();
+        let result = compact_session_with_summary(&self.session, config, summary);
+        if result.removed_message_count > 0 {
+            self.session = result.compacted_session;
+            event.removed_message_count = result.removed_message_count;
+        }
+
+        (!event.is_empty()).then_some(event)
+    }
+
+    fn apply_configured_compaction_defaults(
+        &self,
+        mut config: CompactionConfig,
+    ) -> CompactionConfig {
+        if let Some(tail_turns) = self.compaction_config.tail_turns {
+            config.preserve_recent_messages = tail_turns;
+        }
+        if config.preserve_recent_tokens.is_none() {
+            config.preserve_recent_tokens = self.compaction_config.preserve_recent_tokens;
+        }
+        config
+    }
+
+    fn generate_compaction_summary(
+        &mut self,
+        config: CompactionConfig,
+    ) -> Result<String, RuntimeError> {
+        let Some(prepared) = prepare_compaction(&self.session, config) else {
+            return Err(RuntimeError::new(
+                "session is below the compaction threshold",
+            ));
+        };
+        let mut messages = prepared.summary_input_session.messages;
+        messages.push(ConversationMessage::user_text(prepared.prompt));
+        let events = self.api_client.stream(ApiRequest {
+            system_prompt: vec![
+                "You are a compaction agent. Summarize the supplied conversation state without using tools."
+                    .to_string(),
+            ],
+            messages,
+        })?;
+        let (message, usage) = build_assistant_message(events)?;
+        if let Some(usage) = usage {
+            self.usage_tracker.record(usage);
+        }
+        let summary = message
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.trim()),
+                _ => None,
+            })
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if summary.is_empty() {
+            return Err(RuntimeError::new(
+                "compaction summary response did not include text",
+            ));
+        }
+        Ok(summary)
+    }
+}
+
+impl AutoCompactionEvent {
+    fn is_empty(self) -> bool {
+        self.removed_message_count == 0 && self.pruned_tool_result_count == 0
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.removed_message_count += other.removed_message_count;
+        self.pruned_tool_result_count += other.pruned_tool_result_count;
     }
 }
 
@@ -706,7 +811,9 @@ mod tests {
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
     use crate::session::{ContentBlock, MessageRole, Session};
     use crate::usage::TokenUsage;
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct ScriptedApiClient {
         call_count: usize,
@@ -910,7 +1017,7 @@ mod tests {
             }),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
-            RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
+            &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
                 vec![shell_snippet("printf 'blocked by hook'; exit 2")],
                 Vec::new(),
                 Vec::new(),
@@ -977,7 +1084,7 @@ mod tests {
             StaticToolExecutor::new().register("add", |_input| Ok("4".to_string())),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
-            RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
+            &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
                 vec![shell_snippet("printf 'pre hook ran'")],
                 vec![shell_snippet("printf 'post hook ran'")],
                 Vec::new(),
@@ -1000,7 +1107,7 @@ mod tests {
             "post hook should preserve non-error result: {output:?}"
         );
         assert!(
-            output.contains("4"),
+            output.contains('4'),
             "tool output missing value: {output:?}"
         );
         assert!(
@@ -1053,7 +1160,7 @@ mod tests {
                 .register("explode", |_input| Err(super::ToolError::new("kaboom"))),
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
-            RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
+            &RuntimeFeatureConfig::default().with_hooks(RuntimeHookConfig::new(
                 Vec::new(),
                 Vec::new(),
                 vec![shell_snippet("printf 'failure hook ran'")],
@@ -1119,18 +1226,6 @@ mod tests {
 
     #[test]
     fn compacts_session_after_turns() {
-        let _guard = crate::test_env_lock();
-        let temp = std::env::temp_dir().join(format!(
-            "runtime-conversation-compact-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time after epoch")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&temp).expect("temp dir");
-        let previous = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&temp).expect("set cwd");
-
         struct SimpleApi;
         impl ApiClient for SimpleApi {
             fn stream(
@@ -1143,6 +1238,18 @@ mod tests {
                 ])
             }
         }
+
+        let _guard = crate::test_env_lock();
+        let temp = std::env::temp_dir().join(format!(
+            "runtime-conversation-compact-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp).expect("temp dir");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&temp).expect("set cwd");
 
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -1158,8 +1265,10 @@ mod tests {
         let result = runtime.compact(CompactionConfig {
             preserve_recent_messages: 2,
             max_estimated_tokens: 1,
+            preserve_recent_tokens: None,
+            ..CompactionConfig::default()
         });
-        assert!(result.summary.contains("Conversation summary"));
+        assert_eq!(result.summary, "done");
         assert_eq!(
             result.compacted_session.messages[0].role,
             MessageRole::System
@@ -1232,6 +1341,7 @@ mod tests {
             summary.auto_compaction,
             Some(AutoCompactionEvent {
                 removed_message_count: 2,
+                pruned_tool_result_count: 0,
             })
         );
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
@@ -1242,6 +1352,16 @@ mod tests {
         struct AssertCompactedApi;
         impl ApiClient for AssertCompactedApi {
             fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                if request
+                    .system_prompt
+                    .first()
+                    .is_some_and(|prompt| prompt.contains("compaction agent"))
+                {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("summary".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
                 assert_eq!(
                     request.messages.first().map(|message| message.role),
                     Some(MessageRole::System)
@@ -1256,11 +1376,11 @@ mod tests {
         let session = Session {
             version: 1,
             messages: vec![
-                crate::session::ConversationMessage::user_text(&"one ".repeat(80)),
+                crate::session::ConversationMessage::user_text("one ".repeat(80)),
                 crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
                     text: "two ".repeat(80),
                 }]),
-                crate::session::ConversationMessage::user_text(&"three ".repeat(80)),
+                crate::session::ConversationMessage::user_text("three ".repeat(80)),
                 crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
                     text: "four ".repeat(80),
                 }]),
@@ -1284,10 +1404,112 @@ mod tests {
         assert_eq!(
             summary.auto_compaction,
             Some(AutoCompactionEvent {
-                removed_message_count: 1,
+                removed_message_count: 2,
+                pruned_tool_result_count: 0,
             })
         );
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+    }
+
+    #[test]
+    fn preflight_prunes_old_tool_results_before_full_compaction() {
+        struct AssertPrunedApi;
+        impl ApiClient for AssertPrunedApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                assert_ne!(
+                    request.messages.first().map(|message| message.role),
+                    Some(MessageRole::System)
+                );
+                assert!(request.messages.iter().any(|message| {
+                    matches!(
+                        message.blocks.first(),
+                        Some(ContentBlock::ToolResult {
+                            compacted: true,
+                            ..
+                        })
+                    )
+                }));
+                Ok(vec![
+                    AssistantEvent::TextDelta("done".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let _guard = crate::test_env_lock();
+        let temp = std::env::temp_dir().join(format!(
+            "runtime-conversation-pruned-tool-results-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("temp dir");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&temp).expect("set cwd");
+
+        let session = Session {
+            version: 1,
+            messages: vec![
+                crate::session::ConversationMessage::user_text("first"),
+                crate::session::ConversationMessage::tool_result(
+                    "tool-1",
+                    "bash",
+                    "x".repeat(250_000),
+                    false,
+                ),
+                crate::session::ConversationMessage::user_text("second"),
+                crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "working".to_string(),
+                }]),
+                crate::session::ConversationMessage::user_text("third"),
+                crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "still working".to_string(),
+                }]),
+            ],
+            metadata: None,
+        };
+
+        let mut runtime = ConversationRuntime::new(
+            session,
+            AssertPrunedApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(10_000);
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+        std::env::set_current_dir(previous).expect("restore cwd");
+
+        assert_eq!(
+            summary.auto_compaction,
+            Some(AutoCompactionEvent {
+                removed_message_count: 0,
+                pruned_tool_result_count: 1,
+            })
+        );
+        let archived_path = match &runtime.session().messages[1].blocks[0] {
+            ContentBlock::ToolResult {
+                compacted: true,
+                output,
+                archived_output_path,
+                ..
+            } => {
+                assert!(output.is_empty());
+                archived_output_path
+                    .clone()
+                    .expect("archived output path should be recorded")
+            }
+            _ => panic!("expected compacted tool result"),
+        };
+        let archived_output =
+            fs::read_to_string(temp.join(&archived_path)).expect("archived tool result readable");
+        fs::remove_dir_all(temp).expect("cleanup temp dir");
+
+        assert_eq!(archived_output.len(), 250_000);
     }
 
     #[test]
@@ -1299,11 +1521,21 @@ mod tests {
         impl ApiClient for OverflowThenSuccessApi {
             fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
                 self.calls += 1;
+                if request
+                    .system_prompt
+                    .first()
+                    .is_some_and(|prompt| prompt.contains("compaction agent"))
+                {
+                    return Ok(vec![
+                        AssistantEvent::TextDelta("summary".to_string()),
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
                 match self.calls {
                     1 => Err(RuntimeError::new(
                         "api stream returned context_length_exceeded",
                     )),
-                    2 => {
+                    3 => {
                         assert_eq!(
                             request.messages.first().map(|message| message.role),
                             Some(MessageRole::System)
@@ -1313,7 +1545,10 @@ mod tests {
                             AssistantEvent::MessageStop,
                         ])
                     }
-                    _ => Err(RuntimeError::new("unexpected extra API call")),
+                    _ => Err(RuntimeError::new(format!(
+                        "unexpected API call {}",
+                        self.calls
+                    ))),
                 }
             }
         }
@@ -1349,7 +1584,8 @@ mod tests {
         assert_eq!(
             summary.auto_compaction,
             Some(AutoCompactionEvent {
-                removed_message_count: 1,
+                removed_message_count: 4,
+                pruned_tool_result_count: 0,
             })
         );
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);

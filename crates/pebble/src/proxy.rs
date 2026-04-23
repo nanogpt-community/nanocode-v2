@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode};
+use runtime::{
+    get_compact_continuation_message, get_tool_result_context_output, ContentBlock,
+    ConversationMessage, MessageRole, PermissionMode,
+};
 use serde_json::{Map, Number, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -345,11 +348,22 @@ fn render_proxy_message_content(message: &ConversationMessage) -> Result<String,
                 tool_name,
                 output,
                 is_error,
+                compacted,
+                ..
             } => chunks.push(render_tool_result_xml(
                 tool_use_id,
                 tool_name,
-                output,
+                get_tool_result_context_output(output, *compacted).as_ref(),
                 *is_error,
+            )),
+            ContentBlock::CompactionSummary {
+                summary,
+                recent_messages_preserved,
+                ..
+            } => chunks.push(get_compact_continuation_message(
+                summary,
+                true,
+                *recent_messages_preserved,
             )),
         }
     }
@@ -709,7 +723,7 @@ fn unescape_xml_text(value: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use runtime::{ContentBlock, ConversationMessage, MessageRole};
+    use runtime::{ContentBlock, ConversationMessage};
     use serde_json::json;
 
     use super::{
@@ -760,16 +774,7 @@ mod tests {
                 name: "bash".to_string(),
                 input: json!({"command":"pwd","timeout":1}).to_string(),
             }]),
-            ConversationMessage {
-                role: MessageRole::Tool,
-                blocks: vec![ContentBlock::ToolResult {
-                    tool_use_id: "tool-1".to_string(),
-                    tool_name: "bash".to_string(),
-                    output: "{\"ok\":true}".to_string(),
-                    is_error: false,
-                }],
-                usage: None,
-            },
+            ConversationMessage::tool_result("tool-1", "bash", "{\"ok\":true}", false),
         ];
 
         let converted =
@@ -784,6 +789,25 @@ mod tests {
         assert!(converted[1]
             .content
             .contains("<tool_result id=\"tool-1\" name=\"bash\" error=\"false\">"));
+    }
+
+    #[test]
+    fn renders_compacted_tool_results_as_placeholder() {
+        let messages = vec![ConversationMessage::compacted_tool_result(
+            "tool-1",
+            "bash",
+            "sensitive output",
+            false,
+        )];
+
+        let converted =
+            convert_messages_for_proxy(&messages).expect("proxy conversion should work");
+
+        assert_eq!(converted.len(), 1);
+        assert!(converted[0]
+            .content
+            .contains("[Old tool result content cleared]"));
+        assert!(!converted[0].content.contains("sensitive output"));
     }
 
     #[test]

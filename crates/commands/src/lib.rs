@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -94,6 +95,62 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         category: SlashCommandCategory::Session,
         detail: "Condenses older messages into a resumable summary while keeping the active session usable.",
         resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "archives",
+        aliases: &[],
+        summary: "List or inspect archived tool outputs",
+        argument_hint: Some(
+            "[list|show <message-id-or-tool-call-id>|page <message-id-or-tool-call-id>|save <message-id-or-tool-call-id> [file]]",
+        ),
+        category: SlashCommandCategory::Session,
+        detail: "Shows tool outputs that were archived during compaction and can print, page, or restore a specific archived result by message ID or tool call ID.",
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "undo",
+        aliases: &[],
+        summary: "Undo the previous turn and restore changed files",
+        argument_hint: None,
+        category: SlashCommandCategory::Session,
+        detail: "Restores the workspace and conversation to the state before the most recent prompt.",
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "redo",
+        aliases: &[],
+        summary: "Redo the most recently undone turn",
+        argument_hint: None,
+        category: SlashCommandCategory::Session,
+        detail: "Reapplies the last undone conversation turn and its tracked file changes.",
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "timeline",
+        aliases: &[],
+        summary: "Show message timeline for the active session",
+        argument_hint: None,
+        category: SlashCommandCategory::Session,
+        detail: "Lists message ids, roles, and short previews for selecting fork points.",
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "fork",
+        aliases: &[],
+        summary: "Fork the active session",
+        argument_hint: Some("[message-id-or-index]"),
+        category: SlashCommandCategory::Session,
+        detail: "Creates a new managed session from the current history, optionally truncated after a message.",
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "rename",
+        aliases: &[],
+        summary: "Rename the active session",
+        argument_hint: Some("<title>"),
+        category: SlashCommandCategory::Session,
+        detail: "Stores a display title in session metadata for session lists and filtering.",
+        resume_supported: false,
     },
     SlashCommandSpec {
         name: "reasoning",
@@ -213,6 +270,15 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "patch",
+        aliases: &[],
+        summary: "Check or apply a patch",
+        argument_hint: Some("[--check|--apply] [patch-file-or-inline-diff]"),
+        category: SlashCommandCategory::Workspace,
+        detail: "Validates or applies a unified diff/OpenAI-style patch block. Defaults to --check unless --apply is provided.",
+        resume_supported: true,
+    },
+    SlashCommandSpec {
         name: "version",
         aliases: &[],
         summary: "Show CLI version and build information",
@@ -252,9 +318,9 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "session",
         aliases: &[],
         summary: "List or switch managed local sessions",
-        argument_hint: Some("[list|switch <session-id>]"),
+        argument_hint: Some("[list|switch <session-id>|timeline|fork [message-id]|rename <title>]"),
         category: SlashCommandCategory::Session,
-        detail: "Use `switch` to move between saved sessions without leaving the REPL.",
+        detail: "Use `switch` to move between saved sessions, `timeline` to inspect message ids, `fork` to branch, or `rename` to store a title.",
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -339,6 +405,10 @@ pub enum SlashCommand {
     },
     Status,
     Compact,
+    Archives {
+        action: Option<String>,
+        target: Option<String>,
+    },
     Reasoning {
         effort: Option<String>,
     },
@@ -372,6 +442,9 @@ pub enum SlashCommand {
     Memory,
     Init,
     Diff,
+    Patch {
+        args: Option<String>,
+    },
     Version,
     Branch {
         action: Option<String>,
@@ -384,6 +457,15 @@ pub enum SlashCommand {
     },
     Export {
         path: Option<String>,
+    },
+    Undo,
+    Redo,
+    Timeline,
+    Fork {
+        target: Option<String>,
+    },
+    Rename {
+        title: Option<String>,
     },
     Session {
         action: Option<String>,
@@ -405,6 +487,7 @@ pub enum SlashCommand {
 
 impl SlashCommand {
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn parse(input: &str) -> Option<Self> {
         let trimmed = input.trim();
         if !trimmed.starts_with('/') {
@@ -419,6 +502,25 @@ impl SlashCommand {
             },
             "status" => Self::Status,
             "compact" => Self::Compact,
+            "archives" => Self::Archives {
+                action: parts.next().map(ToOwned::to_owned),
+                target: {
+                    let remainder = parts.collect::<Vec<_>>().join(" ");
+                    (!remainder.is_empty()).then_some(remainder)
+                },
+            },
+            "undo" => Self::Undo,
+            "redo" => Self::Redo,
+            "timeline" => Self::Timeline,
+            "fork" => Self::Fork {
+                target: parts.next().map(ToOwned::to_owned),
+            },
+            "rename" => Self::Rename {
+                title: {
+                    let remainder = parts.collect::<Vec<_>>().join(" ");
+                    (!remainder.is_empty()).then_some(remainder)
+                },
+            },
             "reasoning" | "thinking" => Self::Reasoning {
                 effort: parts.next().map(ToOwned::to_owned),
             },
@@ -459,6 +561,9 @@ impl SlashCommand {
             "memory" => Self::Memory,
             "init" => Self::Init,
             "diff" => Self::Diff,
+            "patch" => Self::Patch {
+                args: remainder_after_command(trimmed, command),
+            },
             "version" => Self::Version,
             "branch" => Self::Branch {
                 action: parts.next().map(ToOwned::to_owned),
@@ -474,7 +579,10 @@ impl SlashCommand {
             },
             "session" => Self::Session {
                 action: parts.next().map(ToOwned::to_owned),
-                target: parts.next().map(ToOwned::to_owned),
+                target: {
+                    let remainder = parts.collect::<Vec<_>>().join(" ");
+                    (!remainder.is_empty()).then_some(remainder)
+                },
             },
             "sessions" => Self::Sessions,
             "plugin" | "plugins" | "marketplace" => Self::Plugins {
@@ -527,7 +635,7 @@ pub fn render_slash_command_help_topic(topic: Option<&str>) -> String {
     let topic = topic
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| value.to_ascii_lowercase());
+        .map(str::to_ascii_lowercase);
     let Some(topic) = topic else {
         return render_full_slash_command_help();
     };
@@ -676,7 +784,13 @@ pub fn handle_slash_command(
             message: render_slash_command_help_topic(topic.as_deref()),
             session: session.clone(),
         }),
-        SlashCommand::Status
+        SlashCommand::Archives { .. }
+        | SlashCommand::Status
+        | SlashCommand::Undo
+        | SlashCommand::Redo
+        | SlashCommand::Timeline
+        | SlashCommand::Fork { .. }
+        | SlashCommand::Rename { .. }
         | SlashCommand::Reasoning { .. }
         | SlashCommand::Fast { .. }
         | SlashCommand::Mode { .. }
@@ -690,6 +804,7 @@ pub fn handle_slash_command(
         | SlashCommand::Memory
         | SlashCommand::Init
         | SlashCommand::Diff
+        | SlashCommand::Patch { .. }
         | SlashCommand::Version
         | SlashCommand::Branch { .. }
         | SlashCommand::Worktree { .. }
@@ -771,7 +886,7 @@ pub fn handle_branch_slash_command(
             Ok(if trimmed.is_empty() {
                 "Branch\n  Result           no branches found".to_string()
             } else {
-                format!("Branch\n  Result           listed\n\n{}", trimmed)
+                format!("Branch\n  Result           listed\n\n{trimmed}")
             })
         }
         Some("create") => {
@@ -811,7 +926,7 @@ pub fn handle_worktree_slash_command(
             Ok(if trimmed.is_empty() {
                 "Worktree\n  Result           no worktrees found".to_string()
             } else {
-                format!("Worktree\n  Result           listed\n\n{}", trimmed)
+                format!("Worktree\n  Result           listed\n\n{trimmed}")
             })
         }
         Some("add") => {
@@ -959,8 +1074,7 @@ fn branch_exists(cwd: &Path, branch: &str) -> bool {
         ])
         .current_dir(cwd)
         .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|output| output.status.success())
 }
 
 fn discover_definition_roots(cwd: &Path, leaf: &str) -> Vec<(DefinitionSource, PathBuf)> {
@@ -1178,15 +1292,15 @@ fn render_agents_report(agents: &[AgentSummary]) -> String {
     for agent in agents {
         let mut line = format!("  {}", agent.name);
         if let Some(model) = &agent.model {
-            line.push_str(&format!("  model={model}"));
+            let _ = write!(line, "  model={model}");
         }
-        line.push_str(&format!("  source={}", agent.source.label()));
+        let _ = write!(line, "  source={}", agent.source.label());
         if let Some(shadowed_by) = agent.shadowed_by {
-            line.push_str(&format!("  shadowed-by={}", shadowed_by.label()));
+            let _ = write!(line, "  shadowed-by={}", shadowed_by.label());
         }
         lines.push(line);
         if let Some(description) = &agent.description {
-            lines.push(format!("    {}", description));
+            lines.push(format!("    {description}"));
         }
         if let Some(reasoning_effort) = &agent.reasoning_effort {
             lines.push(format!("    reasoning_effort={reasoning_effort}"));
@@ -1206,14 +1320,14 @@ fn render_skills_report(skills: &[SkillSummary]) -> String {
     for skill in skills {
         let mut line = format!("  {}  source={}", skill.name, skill.source.label());
         if let Some(detail) = skill.origin.detail_label() {
-            line.push_str(&format!("  type={detail}"));
+            let _ = write!(line, "  type={detail}");
         }
         if let Some(shadowed_by) = skill.shadowed_by {
-            line.push_str(&format!("  shadowed-by={}", shadowed_by.label()));
+            let _ = write!(line, "  shadowed-by={}", shadowed_by.label());
         }
         lines.push(line);
         if let Some(description) = &skill.description {
-            lines.push(format!("    {}", description));
+            lines.push(format!("    {description}"));
         }
     }
 
@@ -1253,6 +1367,7 @@ mod tests {
     use runtime::{CompactionConfig, ContentBlock, ConversationMessage, MessageRole, Session};
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn parses_supported_slash_commands() {
         assert_eq!(
             SlashCommand::parse("/help"),
@@ -1324,6 +1439,38 @@ mod tests {
             })
         );
         assert_eq!(
+            SlashCommand::parse("/archives"),
+            Some(SlashCommand::Archives {
+                action: None,
+                target: None,
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/archives show tool-1"),
+            Some(SlashCommand::Archives {
+                action: Some("show".to_string()),
+                target: Some("tool-1".to_string()),
+            })
+        );
+        assert_eq!(SlashCommand::parse("/undo"), Some(SlashCommand::Undo));
+        assert_eq!(SlashCommand::parse("/redo"), Some(SlashCommand::Redo));
+        assert_eq!(
+            SlashCommand::parse("/timeline"),
+            Some(SlashCommand::Timeline)
+        );
+        assert_eq!(
+            SlashCommand::parse("/fork msg-1"),
+            Some(SlashCommand::Fork {
+                target: Some("msg-1".to_string())
+            })
+        );
+        assert_eq!(
+            SlashCommand::parse("/rename Working title"),
+            Some(SlashCommand::Rename {
+                title: Some("Working title".to_string())
+            })
+        );
+        assert_eq!(
             SlashCommand::parse("/config"),
             Some(SlashCommand::Config { section: None })
         );
@@ -1336,6 +1483,12 @@ mod tests {
         assert_eq!(SlashCommand::parse("/memory"), Some(SlashCommand::Memory));
         assert_eq!(SlashCommand::parse("/init"), Some(SlashCommand::Init));
         assert_eq!(SlashCommand::parse("/diff"), Some(SlashCommand::Diff));
+        assert_eq!(
+            SlashCommand::parse("/patch --apply changes.diff"),
+            Some(SlashCommand::Patch {
+                args: Some("--apply changes.diff".to_string())
+            })
+        );
         assert_eq!(SlashCommand::parse("/version"), Some(SlashCommand::Version));
         assert_eq!(
             SlashCommand::parse("/branch create feat/demo"),
@@ -1398,6 +1551,14 @@ mod tests {
         assert!(help.contains("/help"));
         assert!(help.contains("/status"));
         assert!(help.contains("/compact"));
+        assert!(help.contains(
+            "/archives [list|show <message-id-or-tool-call-id>|page <message-id-or-tool-call-id>|save <message-id-or-tool-call-id> [file]]"
+        ));
+        assert!(help.contains("/undo"));
+        assert!(help.contains("/redo"));
+        assert!(help.contains("/timeline"));
+        assert!(help.contains("/fork [message-id-or-index]"));
+        assert!(help.contains("/rename <title>"));
         assert!(help.contains("/reasoning [default|minimal|low|medium|high|xhigh]"));
         assert!(help.contains("aliases: thinking"));
         assert!(help.contains("/fast [on|off]"));
@@ -1413,11 +1574,14 @@ mod tests {
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
+        assert!(help.contains("/patch [--check|--apply] [patch-file-or-inline-diff]"));
         assert!(help.contains("/version"));
         assert!(help.contains("/branch [list|create <name>|switch <name>]"));
         assert!(help.contains("/worktree [list|add <path> [branch]|remove <path>|prune]"));
         assert!(help.contains("/export [file]"));
-        assert!(help.contains("/session [list|switch <session-id>]"));
+        assert!(help.contains(
+            "/session [list|switch <session-id>|timeline|fork [message-id]|rename <title>]"
+        ));
         assert!(help.contains("/sessions"));
         assert!(help.contains(
             "/plugins [list|help|install <path>|enable <id>|disable <id>|uninstall <id>|update <id>]"
@@ -1425,8 +1589,8 @@ mod tests {
         assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|help|init <name>]"));
         assert!(help.contains("Help topics"));
-        assert_eq!(slash_command_specs().len(), 25);
-        assert_eq!(resume_supported_slash_commands().len(), 12);
+        assert_eq!(slash_command_specs().len(), 32);
+        assert_eq!(resume_supported_slash_commands().len(), 15);
     }
 
     #[test]
@@ -1463,6 +1627,8 @@ mod tests {
             CompactionConfig {
                 preserve_recent_messages: 2,
                 max_estimated_tokens: 1,
+                preserve_recent_tokens: None,
+                ..CompactionConfig::default()
             },
         )
         .expect("slash command should be handled");
@@ -1470,7 +1636,7 @@ mod tests {
         std::env::set_current_dir(previous).expect("restore cwd");
         let _ = std::fs::remove_dir_all(root);
 
-        assert!(result.message.contains("Compacted 2 messages"));
+        assert!(result.message.contains("Compacted 4 messages"));
         assert_eq!(result.session.messages[0].role, MessageRole::System);
     }
 
@@ -1488,6 +1654,7 @@ mod tests {
         let session = Session::new();
         assert!(handle_slash_command("/unknown", &session, CompactionConfig::default()).is_none());
         assert!(handle_slash_command("/status", &session, CompactionConfig::default()).is_none());
+        assert!(handle_slash_command("/archives", &session, CompactionConfig::default()).is_none());
         assert!(
             handle_slash_command("/model claude", &session, CompactionConfig::default()).is_none()
         );
@@ -1517,6 +1684,10 @@ mod tests {
             handle_slash_command("/config env", &session, CompactionConfig::default()).is_none()
         );
         assert!(handle_slash_command("/diff", &session, CompactionConfig::default()).is_none());
+        assert!(
+            handle_slash_command("/patch changes.diff", &session, CompactionConfig::default())
+                .is_none()
+        );
         assert!(handle_slash_command("/version", &session, CompactionConfig::default()).is_none());
         assert!(
             handle_slash_command("/branch list", &session, CompactionConfig::default()).is_none()

@@ -502,6 +502,7 @@ fn get_simple_doing_tasks_section() -> String {
         "Read relevant code before changing it and keep changes tightly scoped to the request.".to_string(),
         "Do not add speculative abstractions, compatibility shims, or unrelated cleanup.".to_string(),
         "Do not create files unless they are required to complete the task.".to_string(),
+        "When editing files, use edit_file for small exact replacements, write_file for new or complete file rewrites, and apply_patch for multi-hunk or multi-file changes.".to_string(),
         "If an approach fails, diagnose the failure before switching tactics.".to_string(),
         "Be careful not to introduce security vulnerabilities such as command injection, XSS, or SQL injection.".to_string(),
         "Report outcomes faithfully: if verification fails or was not run, say so explicitly.".to_string(),
@@ -537,14 +538,17 @@ mod tests {
     use crate::{test_env_lock, ConfigLoader};
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("runtime-prompt-{nanos}"))
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("runtime-prompt-{nanos}-{counter}"))
     }
 
     #[test]

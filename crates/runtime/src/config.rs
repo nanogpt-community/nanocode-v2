@@ -55,6 +55,7 @@ pub struct RuntimeFeatureConfig {
     model: Option<String>,
     permission_mode: Option<ResolvedPermissionMode>,
     sandbox: SandboxConfig,
+    compaction: RuntimeCompactionConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -62,6 +63,27 @@ pub struct RuntimeHookConfig {
     pre_tool_use: Vec<String>,
     post_tool_use: Vec<String>,
     post_tool_use_failure: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeCompactionConfig {
+    pub auto: bool,
+    pub prune: bool,
+    pub tail_turns: Option<usize>,
+    pub preserve_recent_tokens: Option<usize>,
+    pub reserved: Option<u32>,
+}
+
+impl Default for RuntimeCompactionConfig {
+    fn default() -> Self {
+        Self {
+            auto: true,
+            prune: true,
+            tail_turns: None,
+            preserve_recent_tokens: None,
+            reserved: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -248,6 +270,7 @@ impl ConfigLoader {
             model: parse_optional_model(&merged_value),
             permission_mode: parse_optional_permission_mode(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
+            compaction: parse_optional_compaction_config(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -327,6 +350,11 @@ impl RuntimeConfig {
     pub fn sandbox(&self) -> &SandboxConfig {
         &self.feature_config.sandbox
     }
+
+    #[must_use]
+    pub fn compaction(&self) -> RuntimeCompactionConfig {
+        self.feature_config.compaction
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -375,6 +403,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn sandbox(&self) -> &SandboxConfig {
         &self.sandbox
+    }
+
+    #[must_use]
+    pub fn compaction(&self) -> RuntimeCompactionConfig {
+        self.compaction
     }
 }
 
@@ -615,6 +648,60 @@ fn parse_optional_plugin_config(root: &JsonValue) -> Result<RuntimePluginConfig,
     Ok(config)
 }
 
+fn parse_optional_compaction_config(
+    root: &JsonValue,
+) -> Result<RuntimeCompactionConfig, ConfigError> {
+    let mut config = RuntimeCompactionConfig::default();
+    let Some(object) = root.as_object() else {
+        return Ok(config);
+    };
+    let Some(compaction_value) = object.get("compaction") else {
+        apply_compaction_env_overrides(&mut config);
+        return Ok(config);
+    };
+    let compaction = expect_object(compaction_value, "merged settings.compaction")?;
+    if let Some(auto) = optional_bool(compaction, "auto", "merged settings.compaction")? {
+        config.auto = auto;
+    }
+    if let Some(prune) = optional_bool(compaction, "prune", "merged settings.compaction")? {
+        config.prune = prune;
+    }
+    config.tail_turns = optional_usize(compaction, "tail_turns", "merged settings.compaction")?.or(
+        optional_usize(compaction, "tailTurns", "merged settings.compaction")?,
+    );
+    config.preserve_recent_tokens = optional_usize(
+        compaction,
+        "preserve_recent_tokens",
+        "merged settings.compaction",
+    )?
+    .or(optional_usize(
+        compaction,
+        "preserveRecentTokens",
+        "merged settings.compaction",
+    )?);
+    config.reserved = optional_u32(compaction, "reserved", "merged settings.compaction")?;
+    apply_compaction_env_overrides(&mut config);
+    Ok(config)
+}
+
+fn apply_compaction_env_overrides(config: &mut RuntimeCompactionConfig) {
+    if env_truthy("PEBBLE_DISABLE_AUTOCOMPACT") || env_truthy("OPENCODE_DISABLE_AUTOCOMPACT") {
+        config.auto = false;
+    }
+    if env_truthy("PEBBLE_DISABLE_PRUNE") || env_truthy("OPENCODE_DISABLE_PRUNE") {
+        config.prune = false;
+    }
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 fn parse_optional_permission_mode(
     root: &JsonValue,
 ) -> Result<Option<ResolvedPermissionMode>, ConfigError> {
@@ -836,6 +923,48 @@ fn optional_u16(
     }
 }
 
+fn optional_u32(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Option<u32>, ConfigError> {
+    match object.get(key) {
+        Some(value) => {
+            let Some(number) = value.as_i64() else {
+                return Err(ConfigError::Parse(format!(
+                    "{context}: field {key} must be an integer"
+                )));
+            };
+            let number = u32::try_from(number).map_err(|_| {
+                ConfigError::Parse(format!("{context}: field {key} is out of range"))
+            })?;
+            Ok(Some(number))
+        }
+        None => Ok(None),
+    }
+}
+
+fn optional_usize(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Option<usize>, ConfigError> {
+    match object.get(key) {
+        Some(value) => {
+            let Some(number) = value.as_i64() else {
+                return Err(ConfigError::Parse(format!(
+                    "{context}: field {key} must be an integer"
+                )));
+            };
+            let number = usize::try_from(number).map_err(|_| {
+                ConfigError::Parse(format!("{context}: field {key} is out of range"))
+            })?;
+            Ok(Some(number))
+        }
+        None => Ok(None),
+    }
+}
+
 fn optional_string_array(
     object: &BTreeMap<String, JsonValue>,
     key: &str,
@@ -937,14 +1066,20 @@ mod tests {
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("runtime-config-{nanos}"))
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "runtime-config-{}-{counter}-{nanos}",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -1064,6 +1199,42 @@ mod tests {
             Some(FilesystemIsolationMode::AllowList)
         );
         assert_eq!(loaded.sandbox().allowed_mounts, vec!["logs", "tmp/cache"]);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_compaction_config() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".pebble");
+        fs::create_dir_all(cwd.join(".pebble")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            cwd.join(".pebble").join("settings.json"),
+            r#"{
+              "compaction": {
+                "auto": false,
+                "prune": false,
+                "tail_turns": 3,
+                "preserve_recent_tokens": 1234,
+                "reserved": 9000
+              }
+            }"#,
+        )
+        .expect("write project settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        let compaction = loaded.compaction();
+
+        assert!(!compaction.auto);
+        assert!(!compaction.prune);
+        assert_eq!(compaction.tail_turns, Some(3));
+        assert_eq!(compaction.preserve_recent_tokens, Some(1234));
+        assert_eq!(compaction.reserved, Some(9000));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

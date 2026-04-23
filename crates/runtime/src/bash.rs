@@ -65,7 +65,14 @@ pub struct BashCommandOutput {
 }
 
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
-    let cwd = env::current_dir()?;
+    let cwd = env::current_dir().or_else(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            Ok(env::temp_dir())
+        } else {
+            Err(error)
+        }
+    })?;
+    let cwd = if cwd.is_dir() { cwd } else { env::temp_dir() };
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
 
     if input.run_in_background.unwrap_or(false) {
@@ -179,6 +186,7 @@ fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> 
     resolve_sandbox_status_for_request(&request, cwd)
 }
 
+#[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
 fn prepare_command(
     command: &str,
     cwd: &std::path::Path,
@@ -193,12 +201,17 @@ fn prepare_command(
         let mut prepared = Command::new(launcher.program);
         prepared.args(launcher.args);
         prepared.current_dir(cwd);
+        prepared.env("PWD", cwd);
         prepared.envs(launcher.env);
         return Ok(prepared);
     }
 
-    let mut prepared = Command::new(default_shell_program()?);
+    let shell_program = default_shell_program();
+    #[cfg(windows)]
+    let shell_program = shell_program?;
+    let mut prepared = Command::new(shell_program);
     prepared.arg("-lc").arg(command).current_dir(cwd);
+    prepared.env("PWD", cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
@@ -206,6 +219,7 @@ fn prepare_command(
     Ok(prepared)
 }
 
+#[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
 fn prepare_tokio_command(
     command: &str,
     cwd: &std::path::Path,
@@ -220,12 +234,17 @@ fn prepare_tokio_command(
         let mut prepared = TokioCommand::new(launcher.program);
         prepared.args(launcher.args);
         prepared.current_dir(cwd);
+        prepared.env("PWD", cwd);
         prepared.envs(launcher.env);
         return Ok(prepared);
     }
 
-    let mut prepared = TokioCommand::new(default_shell_program()?);
+    let shell_program = default_shell_program();
+    #[cfg(windows)]
+    let shell_program = shell_program?;
+    let mut prepared = TokioCommand::new(shell_program);
     prepared.arg("-lc").arg(command).current_dir(cwd);
+    prepared.env("PWD", cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
@@ -238,25 +257,23 @@ fn prepare_sandbox_dirs(cwd: &std::path::Path) {
     let _ = std::fs::create_dir_all(cwd.join(".sandbox-tmp"));
 }
 
+#[cfg(windows)]
 fn default_shell_program() -> io::Result<&'static str> {
-    #[cfg(windows)]
-    {
-        if command_exists("sh") {
-            return Ok("sh");
-        }
-        if command_exists("bash") {
-            return Ok("bash");
-        }
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "bash tool requires a POSIX shell on Windows; install Git Bash/MSYS2 or use the PowerShell tool instead",
-        ));
+    if command_exists("sh") {
+        return Ok("sh");
     }
+    if command_exists("bash") {
+        return Ok("bash");
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "bash tool requires a POSIX shell on Windows; install Git Bash/MSYS2 or use the PowerShell tool instead",
+    ))
+}
 
-    #[cfg(not(windows))]
-    {
-        Ok("sh")
-    }
+#[cfg(not(windows))]
+fn default_shell_program() -> &'static str {
+    "sh"
 }
 
 #[cfg(windows)]

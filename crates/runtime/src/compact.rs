@@ -1,5 +1,7 @@
+use std::borrow::Cow;
+use std::cmp;
 use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
 
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
@@ -7,18 +9,83 @@ const COMPACT_CONTINUATION_PREAMBLE: &str =
     "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n";
 const COMPACT_RECENT_MESSAGES_NOTE: &str = "Recent messages are preserved verbatim.";
 const COMPACT_DIRECT_RESUME_INSTRUCTION: &str = "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, and do not preface with continuation text.";
+const MIN_PRESERVE_RECENT_TOKENS: usize = 2_000;
+const MAX_PRESERVE_RECENT_TOKENS: usize = 8_000;
+const TOOL_RESULT_PRUNE_MIN_TOKENS: usize = 20_000;
+const TOOL_RESULT_PRUNE_PROTECT_TOKENS: usize = 40_000;
+const TOOL_RESULT_PRUNE_RECENT_TURNS: usize = 2;
+const TOOL_RESULT_CONTEXT_PLACEHOLDER: &str = "[Old tool result content cleared]";
+const TOOL_RESULT_PRUNE_PROTECTED_TOOLS: &[&str] = &["skill"];
+const TOOL_RESULT_ARCHIVE_DIR: &str = "tool-results";
+const SUMMARY_TEMPLATE: &str = r#"Output exactly this Markdown structure and keep the section order unchanged:
+---
+## Goal
+- [single-sentence task summary]
+
+## Constraints & Preferences
+- [user constraints, preferences, specs, or "(none)"]
+
+## Progress
+### Done
+- [completed work or "(none)"]
+
+### In Progress
+- [current work or "(none)"]
+
+### Blocked
+- [blockers or "(none)"]
+
+## Key Decisions
+- [decision and why, or "(none)"]
+
+## Next Steps
+- [ordered next actions or "(none)"]
+
+## Critical Context
+- [important technical facts, errors, open questions, or "(none)"]
+
+## Relevant Files
+- [file or directory path: why it matters, or "(none)"]
+---
+
+Rules:
+- Keep every section, even when empty.
+- Use terse bullets, not prose paragraphs.
+- Preserve exact file paths, commands, error strings, and identifiers when known.
+- Do not mention the summary process or that context was compacted."#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionConfig {
     pub preserve_recent_messages: usize,
     pub max_estimated_tokens: usize,
+    pub preserve_recent_tokens: Option<usize>,
+    pub auto: bool,
+    pub overflow: bool,
+}
+
+impl CompactionConfig {
+    #[must_use]
+    pub fn preserve_recent_token_budget(&self) -> usize {
+        self.preserve_recent_tokens.unwrap_or_else(|| {
+            if self.max_estimated_tokens == 0 {
+                return MAX_PRESERVE_RECENT_TOKENS;
+            }
+
+            self.max_estimated_tokens
+                .saturating_div(4)
+                .clamp(MIN_PRESERVE_RECENT_TOKENS, MAX_PRESERVE_RECENT_TOKENS)
+        })
+    }
 }
 
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
-            preserve_recent_messages: 4,
+            preserve_recent_messages: 2,
             max_estimated_tokens: 10_000,
+            preserve_recent_tokens: None,
+            auto: false,
+            overflow: false,
         }
     }
 }
@@ -31,6 +98,31 @@ pub struct CompactionResult {
     pub removed_message_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedCompaction {
+    pub previous_summary: Option<String>,
+    pub prompt: String,
+    pub summary_input_session: Session,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolResultPruneResult {
+    pub session: Session,
+    pub pruned_tool_result_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedTail {
+    keep_from: usize,
+    tail_start_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Turn {
+    start: usize,
+    end: usize,
+}
+
 #[must_use]
 pub fn estimate_session_tokens(session: &Session) -> usize {
     session.messages.iter().map(estimate_message_tokens).sum()
@@ -40,13 +132,17 @@ pub fn estimate_session_tokens(session: &Session) -> usize {
 pub fn should_compact(session: &Session, config: CompactionConfig) -> bool {
     let start = compacted_summary_prefix_len(session);
     let compactable = &session.messages[start..];
+    let total_tokens = compactable
+        .iter()
+        .map(estimate_message_tokens)
+        .sum::<usize>();
+
+    if total_tokens < config.max_estimated_tokens {
+        return false;
+    }
 
     compactable.len() > config.preserve_recent_messages
-        && compactable
-            .iter()
-            .map(estimate_message_tokens)
-            .sum::<usize>()
-            >= config.max_estimated_tokens
+        || (start > 0 && total_tokens > config.preserve_recent_token_budget())
 }
 
 #[must_use]
@@ -89,7 +185,122 @@ pub fn get_compact_continuation_message(
 }
 
 #[must_use]
+pub fn get_tool_result_context_output(output: &str, compacted: bool) -> Cow<'_, str> {
+    if compacted {
+        Cow::Borrowed(TOOL_RESULT_CONTEXT_PLACEHOLDER)
+    } else {
+        Cow::Borrowed(output)
+    }
+}
+
+#[must_use]
+pub(crate) fn prune_old_tool_results(
+    session: &Session,
+    max_estimated_tokens: usize,
+) -> ToolResultPruneResult {
+    if max_estimated_tokens > 0 && estimate_session_tokens(session) < max_estimated_tokens {
+        return ToolResultPruneResult {
+            session: session.clone(),
+            pruned_tool_result_count: 0,
+        };
+    }
+
+    let mut recent_user_turns = 0;
+    let mut protected_tokens = 0;
+    let mut prunable_tokens = 0;
+    let mut candidate_indexes = Vec::new();
+    let start = compacted_summary_prefix_len(session);
+
+    for index in (start..session.messages.len()).rev() {
+        let message = &session.messages[index];
+        if message.role == MessageRole::User {
+            recent_user_turns += 1;
+        }
+        if recent_user_turns < TOOL_RESULT_PRUNE_RECENT_TURNS {
+            continue;
+        }
+
+        let Some(ContentBlock::ToolResult {
+            tool_name,
+            output,
+            is_error,
+            compacted,
+            ..
+        }) = message.blocks.first()
+        else {
+            continue;
+        };
+
+        if *is_error
+            || *compacted
+            || TOOL_RESULT_PRUNE_PROTECTED_TOOLS.contains(&tool_name.as_str())
+        {
+            continue;
+        }
+
+        let estimate = estimate_tool_result_tokens(tool_name, output, false);
+        protected_tokens += estimate;
+        if protected_tokens <= TOOL_RESULT_PRUNE_PROTECT_TOKENS {
+            continue;
+        }
+
+        prunable_tokens += estimate;
+        candidate_indexes.push(index);
+    }
+
+    if prunable_tokens < TOOL_RESULT_PRUNE_MIN_TOKENS {
+        return ToolResultPruneResult {
+            session: session.clone(),
+            pruned_tool_result_count: 0,
+        };
+    }
+
+    let mut pruned_session = session.clone();
+    let mut pruned_tool_result_count = 0;
+
+    for index in candidate_indexes {
+        let Some(message) = pruned_session.messages.get_mut(index) else {
+            continue;
+        };
+        let message_id = message.id.clone();
+        let Some(ContentBlock::ToolResult {
+            tool_name,
+            output,
+            compacted,
+            archived_output_path,
+            ..
+        }) = message.blocks.first_mut()
+        else {
+            continue;
+        };
+        if !*compacted {
+            let Some(path) = archive_tool_result_output(&message_id, tool_name, output) else {
+                continue;
+            };
+            output.clear();
+            *compacted = true;
+            *archived_output_path = Some(path);
+            pruned_tool_result_count += 1;
+        }
+    }
+
+    ToolResultPruneResult {
+        session: pruned_session,
+        pruned_tool_result_count,
+    }
+}
+
+#[must_use]
 pub fn compact_session(session: &Session, config: CompactionConfig) -> CompactionResult {
+    compact_session_with_summary(session, config, None)
+}
+
+#[must_use]
+pub fn compact_session_with_summary(
+    session: &Session,
+    config: CompactionConfig,
+    generated_summary: Option<String>,
+) -> CompactionResult {
     if !should_compact(session, config) {
         return CompactionResult {
             summary: String::new(),
@@ -104,23 +315,31 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         .first()
         .and_then(extract_existing_compacted_summary);
     let compacted_prefix_len = usize::from(existing_summary.is_some());
-    let keep_from = session
-        .messages
-        .len()
-        .saturating_sub(config.preserve_recent_messages);
-    let removed = &session.messages[compacted_prefix_len..keep_from];
-    let preserved = session.messages[keep_from..].to_vec();
-    let summary =
-        merge_compact_summaries(existing_summary.as_deref(), &summarize_messages(removed));
+    let selected_tail = select_retained_tail(session, config);
+    let summarize_all =
+        selected_tail.tail_start_id.is_none() && selected_tail.keep_from == compacted_prefix_len;
+    let removed = if summarize_all {
+        &session.messages[compacted_prefix_len..]
+    } else {
+        &session.messages[compacted_prefix_len..selected_tail.keep_from]
+    };
+    let preserved = if summarize_all {
+        Vec::new()
+    } else {
+        session.messages[selected_tail.keep_from..].to_vec()
+    };
+    let summary = match generated_summary.filter(|summary| !summary.trim().is_empty()) {
+        Some(summary) => summary.trim().to_string(),
+        None => merge_compact_summaries(existing_summary.as_deref(), &summarize_messages(removed)),
+    };
     let formatted_summary = format_compact_summary(&summary);
-    persist_compact_summary(&formatted_summary);
-    let continuation = get_compact_continuation_message(&summary, true, !preserved.is_empty());
-
-    let mut compacted_messages = vec![ConversationMessage {
-        role: MessageRole::System,
-        blocks: vec![ContentBlock::Text { text: continuation }],
-        usage: None,
-    }];
+    let mut compacted_messages = vec![ConversationMessage::compaction_summary(
+        summary.clone(),
+        !preserved.is_empty(),
+        config.auto,
+        config.overflow,
+        selected_tail.tail_start_id,
+    )];
     compacted_messages.extend(preserved);
 
     CompactionResult {
@@ -135,6 +354,177 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
     }
 }
 
+#[must_use]
+pub fn prepare_compaction(
+    session: &Session,
+    config: CompactionConfig,
+) -> Option<PreparedCompaction> {
+    if !should_compact(session, config) {
+        return None;
+    }
+
+    let previous_summary = session
+        .messages
+        .first()
+        .and_then(extract_existing_compacted_summary);
+    let compacted_prefix_len = usize::from(previous_summary.is_some());
+    let selected_tail = select_retained_tail(session, config);
+    let summarize_all =
+        selected_tail.tail_start_id.is_none() && selected_tail.keep_from == compacted_prefix_len;
+    let input_messages = if summarize_all {
+        session.messages[compacted_prefix_len..].to_vec()
+    } else {
+        session.messages[compacted_prefix_len..selected_tail.keep_from].to_vec()
+    };
+    if input_messages.is_empty() && previous_summary.is_none() {
+        return None;
+    }
+
+    Some(PreparedCompaction {
+        prompt: build_compaction_prompt(previous_summary.as_deref(), &[]),
+        previous_summary,
+        summary_input_session: Session {
+            version: session.version,
+            messages: input_messages,
+            metadata: session.metadata.clone(),
+        },
+    })
+}
+
+#[must_use]
+pub fn build_compaction_prompt(previous_summary: Option<&str>, context: &[String]) -> String {
+    let anchor = previous_summary.map_or_else(
+        || "Create a new anchored summary from the conversation history above.".to_string(),
+        |summary| {
+            [
+                "Update the anchored summary below using the conversation history above.",
+                "Preserve still-true details, remove stale details, and merge in the new facts.",
+                "<previous-summary>",
+                summary,
+                "</previous-summary>",
+            ]
+            .join("\n")
+        },
+    );
+    let mut sections = vec![anchor, SUMMARY_TEMPLATE.to_string()];
+    sections.extend(
+        context
+            .iter()
+            .filter(|value| !value.trim().is_empty())
+            .cloned(),
+    );
+    sections.join("\n\n")
+}
+
+fn select_retained_tail(session: &Session, config: CompactionConfig) -> SelectedTail {
+    let start = compacted_summary_prefix_len(session);
+    let compactable = &session.messages[start..];
+    if compactable.is_empty() {
+        return SelectedTail {
+            keep_from: session.messages.len(),
+            tail_start_id: None,
+        };
+    }
+
+    let budget = config.preserve_recent_token_budget();
+    if config.preserve_recent_messages == 0 {
+        return SelectedTail {
+            keep_from: start,
+            tail_start_id: None,
+        };
+    }
+
+    let turns = collect_turns(session, start);
+    if turns.is_empty() {
+        let preferred_tail = cmp::min(config.preserve_recent_messages, compactable.len());
+        let mut keep_from = session.messages.len().saturating_sub(preferred_tail);
+        while keep_from < session.messages.len()
+            && estimate_messages_tokens(&session.messages[keep_from..]) > budget
+        {
+            keep_from += 1;
+        }
+        if keep_from <= start {
+            return SelectedTail {
+                keep_from: start,
+                tail_start_id: None,
+            };
+        }
+        return SelectedTail {
+            tail_start_id: session
+                .messages
+                .get(keep_from)
+                .map(|message| message.id.clone()),
+            keep_from,
+        };
+    }
+
+    let recent_start = turns.len().saturating_sub(config.preserve_recent_messages);
+    let recent = &turns[recent_start..];
+    let mut total = 0;
+    let mut keep_from = None;
+
+    for turn in recent.iter().rev() {
+        let size = estimate_messages_tokens(&session.messages[turn.start..turn.end]);
+        if total + size <= budget {
+            total += size;
+            keep_from = Some(turn.start);
+            continue;
+        }
+
+        let remaining = budget.saturating_sub(total);
+        let split = split_turn(session, *turn, remaining);
+        if split.is_some() {
+            keep_from = split;
+        }
+        break;
+    }
+
+    let keep_from = keep_from.unwrap_or(start);
+    if keep_from <= start {
+        return SelectedTail {
+            keep_from: start,
+            tail_start_id: None,
+        };
+    }
+    SelectedTail {
+        tail_start_id: session
+            .messages
+            .get(keep_from)
+            .map(|message| message.id.clone()),
+        keep_from,
+    }
+}
+
+fn collect_turns(session: &Session, start: usize) -> Vec<Turn> {
+    let mut turns = Vec::new();
+    for index in start..session.messages.len() {
+        if session.messages[index].role != MessageRole::User {
+            continue;
+        }
+        turns.push(Turn {
+            start: index,
+            end: session.messages.len(),
+        });
+    }
+    for index in 0..turns.len().saturating_sub(1) {
+        turns[index].end = turns[index + 1].start;
+    }
+    turns
+}
+
+fn split_turn(session: &Session, turn: Turn, budget: usize) -> Option<usize> {
+    if budget == 0 || turn.end.saturating_sub(turn.start) <= 1 {
+        return None;
+    }
+
+    for start in (turn.start + 1)..turn.end {
+        if estimate_messages_tokens(&session.messages[start..turn.end]) <= budget {
+            return Some(start);
+        }
+    }
+    None
+}
+
 fn compacted_summary_prefix_len(session: &Session) -> usize {
     usize::from(
         session
@@ -145,33 +535,49 @@ fn compacted_summary_prefix_len(session: &Session) -> usize {
     )
 }
 
-fn persist_compact_summary(formatted_summary: &str) {
-    if formatted_summary.trim().is_empty() {
-        return;
-    }
-
-    let Ok(cwd) = std::env::current_dir() else {
-        return;
-    };
-    let memory_dir = cwd.join(".pebble").join("memory");
-    if fs::create_dir_all(&memory_dir).is_err() {
-        return;
-    }
-
-    let path = memory_dir.join(compact_summary_filename());
-    let _ = fs::write(path, render_memory_file(formatted_summary));
-}
-
-fn compact_summary_filename() -> String {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    format!("summary-{timestamp}.md")
-}
-
+#[cfg(test)]
 fn render_memory_file(formatted_summary: &str) -> String {
     format!("# Project memory\n\n{}\n", formatted_summary.trim())
+}
+
+fn archive_tool_result_output(message_id: &str, tool_name: &str, output: &str) -> Option<String> {
+    let cwd = std::env::current_dir().ok()?;
+    let archive_dir = cwd.join(".pebble").join(TOOL_RESULT_ARCHIVE_DIR);
+    fs::create_dir_all(&archive_dir).ok()?;
+
+    let filename = format!(
+        "{}-{}.txt",
+        sanitize_filename_component(message_id),
+        sanitize_filename_component(tool_name)
+    );
+    let absolute_path = archive_dir.join(filename);
+    fs::write(&absolute_path, output).ok()?;
+
+    Some(
+        PathBuf::from(".pebble")
+            .join(TOOL_RESULT_ARCHIVE_DIR)
+            .join(absolute_path.file_name()?)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+fn sanitize_filename_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|char| {
+            if char.is_ascii_alphanumeric() || matches!(char, '-' | '_') {
+                char
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "item".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn summarize_messages(messages: &[ConversationMessage]) -> String {
@@ -194,7 +600,9 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
         .filter_map(|block| match block {
             ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
             ContentBlock::ToolResult { tool_name, .. } => Some(tool_name.as_str()),
-            ContentBlock::Text { .. } | ContentBlock::Thinking { .. } => None,
+            ContentBlock::Text { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::CompactionSummary { .. } => None,
         })
         .collect::<Vec<_>>();
     tool_names.sort_unstable();
@@ -305,11 +713,16 @@ fn summarize_block(block: &ContentBlock) -> String {
             tool_name,
             output,
             is_error,
+            compacted,
             ..
         } => format!(
-            "tool_result {tool_name}: {}{output}",
-            if *is_error { "error " } else { "" }
+            "tool_result {tool_name}: {}{}",
+            if *is_error { "error " } else { "" },
+            get_tool_result_context_output(output, *compacted)
         ),
+        ContentBlock::CompactionSummary { summary, .. } => {
+            format!("compaction summary {}", format_compact_summary(summary))
+        }
     };
     truncate_summary(&raw, 160)
 }
@@ -357,13 +770,7 @@ fn collect_key_files(messages: &[ConversationMessage]) -> Vec<String> {
     let mut files = messages
         .iter()
         .flat_map(|message| message.blocks.iter())
-        .map(|block| match block {
-            ContentBlock::Text { text } => text.as_str(),
-            ContentBlock::Thinking { text, .. } => text.as_str(),
-            ContentBlock::ToolUse { input, .. } => input.as_str(),
-            ContentBlock::ToolResult { output, .. } => output.as_str(),
-        })
-        .flat_map(extract_file_candidates)
+        .flat_map(|block| extract_file_candidates(block_context_text(block).as_ref()))
         .collect::<Vec<_>>();
     files.sort();
     files.dedup();
@@ -382,9 +789,10 @@ fn infer_current_work(messages: &[ConversationMessage]) -> Option<String> {
 fn first_text_block(message: &ConversationMessage) -> Option<&str> {
     message.blocks.iter().find_map(|block| match block {
         ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
-        ContentBlock::Thinking { .. } => None,
-        ContentBlock::ToolUse { .. }
+        ContentBlock::Thinking { .. }
+        | ContentBlock::ToolUse { .. }
         | ContentBlock::ToolResult { .. }
+        | ContentBlock::CompactionSummary { .. }
         | ContentBlock::Text { .. } => None,
     })
 }
@@ -430,14 +838,39 @@ fn estimate_message_tokens(message: &ConversationMessage) -> usize {
         .blocks
         .iter()
         .map(|block| match block {
-            ContentBlock::Text { text } => text.len() / 4 + 1,
-            ContentBlock::Thinking { text, .. } => text.len() / 4 + 1,
+            ContentBlock::Text { text } | ContentBlock::Thinking { text, .. } => text.len() / 4 + 1,
             ContentBlock::ToolUse { name, input, .. } => (name.len() + input.len()) / 4 + 1,
             ContentBlock::ToolResult {
-                tool_name, output, ..
-            } => (tool_name.len() + output.len()) / 4 + 1,
+                tool_name,
+                output,
+                compacted,
+                ..
+            } => estimate_tool_result_tokens(tool_name, output, *compacted),
+            ContentBlock::CompactionSummary { summary, .. } => summary.len() / 4 + 1,
         })
         .sum()
+}
+
+fn estimate_tool_result_tokens(tool_name: &str, output: &str, compacted: bool) -> usize {
+    let output = get_tool_result_context_output(output, compacted);
+    (tool_name.len() + output.len()) / 4 + 1
+}
+
+fn block_context_text(block: &ContentBlock) -> Cow<'_, str> {
+    match block {
+        ContentBlock::Text { text } | ContentBlock::Thinking { text, .. } => {
+            Cow::Borrowed(text.as_str())
+        }
+        ContentBlock::ToolUse { input, .. } => Cow::Borrowed(input.as_str()),
+        ContentBlock::ToolResult {
+            output, compacted, ..
+        } => get_tool_result_context_output(output, *compacted),
+        ContentBlock::CompactionSummary { summary, .. } => Cow::Borrowed(summary.as_str()),
+    }
+}
+
+fn estimate_messages_tokens(messages: &[ConversationMessage]) -> usize {
+    messages.iter().map(estimate_message_tokens).sum()
 }
 
 fn extract_tag_block(content: &str, tag: &str) -> Option<String> {
@@ -480,6 +913,10 @@ fn collapse_blank_lines(content: &str) -> String {
 fn extract_existing_compacted_summary(message: &ConversationMessage) -> Option<String> {
     if message.role != MessageRole::System {
         return None;
+    }
+
+    if let Some(ContentBlock::CompactionSummary { summary, .. }) = message.blocks.first() {
+        return Some(summary.trim().to_string());
     }
 
     let text = first_text_block(message)?;
@@ -541,8 +978,8 @@ fn extract_summary_timeline(summary: &str) -> Vec<String> {
 mod tests {
     use super::{
         collect_key_files, compact_session, estimate_session_tokens, format_compact_summary,
-        get_compact_continuation_message, infer_pending_work, render_memory_file, should_compact,
-        CompactionConfig,
+        get_tool_result_context_output, infer_pending_work, prune_old_tool_results,
+        render_memory_file, should_compact, CompactionConfig,
     };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use std::fs;
@@ -559,22 +996,44 @@ mod tests {
     }
 
     #[test]
-    fn leaves_small_sessions_unchanged() {
+    fn does_not_compact_when_only_preserved_recent_messages_remain() {
         let session = Session {
             version: 1,
-            messages: vec![ConversationMessage::user_text("hello")],
+            messages: vec![
+                ConversationMessage::user_text("small one"),
+                ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "small two".to_string(),
+                }]),
+            ],
             metadata: None,
         };
 
-        let result = compact_session(&session, CompactionConfig::default());
+        assert!(!should_compact(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 4,
+                max_estimated_tokens: 1,
+                preserve_recent_tokens: None,
+                ..CompactionConfig::default()
+            }
+        ));
+
+        let result = compact_session(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 4,
+                max_estimated_tokens: 1,
+                preserve_recent_tokens: None,
+                ..CompactionConfig::default()
+            },
+        );
+
         assert_eq!(result.removed_message_count, 0);
         assert_eq!(result.compacted_session, session);
-        assert!(result.summary.is_empty());
-        assert!(result.formatted_summary.is_empty());
     }
 
     #[test]
-    fn persists_compacted_summaries_under_dot_pebble_memory() {
+    fn does_not_persist_compacted_summaries_as_project_memory() {
         let _guard = crate::test_env_lock();
         let temp = std::env::temp_dir().join(format!(
             "runtime-compact-memory-{}",
@@ -595,13 +1054,9 @@ mod tests {
                     text: "two ".repeat(200),
                 }]),
                 ConversationMessage::tool_result("1", "bash", "ok ".repeat(200), false),
-                ConversationMessage {
-                    role: MessageRole::Assistant,
-                    blocks: vec![ContentBlock::Text {
-                        text: "recent".to_string(),
-                    }],
-                    usage: None,
-                },
+                ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "recent".to_string(),
+                }]),
             ],
             metadata: None,
         };
@@ -611,24 +1066,16 @@ mod tests {
             CompactionConfig {
                 preserve_recent_messages: 2,
                 max_estimated_tokens: 1,
+                preserve_recent_tokens: None,
+                ..CompactionConfig::default()
             },
         );
+        assert_eq!(result.removed_message_count, 4);
         let memory_dir = temp.join(".pebble").join("memory");
-        let files = fs::read_dir(&memory_dir)
-            .expect("memory dir exists")
-            .flatten()
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>();
-
-        assert_eq!(result.removed_message_count, 2);
-        assert_eq!(files.len(), 1);
-        let persisted = fs::read_to_string(&files[0]).expect("memory file readable");
+        assert!(!memory_dir.exists());
 
         std::env::set_current_dir(previous).expect("restore cwd");
         fs::remove_dir_all(temp).expect("cleanup temp dir");
-
-        assert!(persisted.contains("# Project memory"));
-        assert!(persisted.contains("Summary:"));
     }
 
     #[test]
@@ -653,13 +1100,9 @@ mod tests {
                     text: "two ".repeat(200),
                 }]),
                 ConversationMessage::tool_result("1", "bash", "ok ".repeat(200), false),
-                ConversationMessage {
-                    role: MessageRole::Assistant,
-                    blocks: vec![ContentBlock::Text {
-                        text: "recent".to_string(),
-                    }],
-                    usage: None,
-                },
+                ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "recent".to_string(),
+                }]),
             ],
             metadata: None,
         };
@@ -669,17 +1112,21 @@ mod tests {
             CompactionConfig {
                 preserve_recent_messages: 2,
                 max_estimated_tokens: 1,
+                preserve_recent_tokens: None,
+                ..CompactionConfig::default()
             },
         );
 
-        assert_eq!(result.removed_message_count, 2);
+        assert_eq!(result.removed_message_count, 4);
         assert_eq!(
             result.compacted_session.messages[0].role,
             MessageRole::System
         );
+        assert_eq!(result.compacted_session.messages.len(), 1);
         assert!(matches!(
             &result.compacted_session.messages[0].blocks[0],
-            ContentBlock::Text { text } if text.contains("Summary:")
+            ContentBlock::CompactionSummary { summary, .. }
+                if summary.contains("Conversation summary")
         ));
         assert!(result.formatted_summary.contains("Scope:"));
         assert!(result.formatted_summary.contains("Key timeline:"));
@@ -688,6 +1135,8 @@ mod tests {
             CompactionConfig {
                 preserve_recent_messages: 2,
                 max_estimated_tokens: 1,
+                preserve_recent_tokens: None,
+                ..CompactionConfig::default()
             }
         ));
         assert!(
@@ -719,6 +1168,8 @@ mod tests {
         let config = CompactionConfig {
             preserve_recent_messages: 2,
             max_estimated_tokens: 1,
+            preserve_recent_tokens: Some(1),
+            ..CompactionConfig::default()
         };
 
         let first = compact_session(&initial_session, config);
@@ -744,23 +1195,17 @@ mod tests {
             .contains("Previously compacted context:"));
         assert!(second
             .formatted_summary
-            .contains("Scope: 2 earlier messages compacted"));
+            .contains("Scope: 4 earlier messages compacted"));
         assert!(second
             .formatted_summary
             .contains("Newly compacted context:"));
-        assert!(second
-            .formatted_summary
-            .contains("Also update rust/crates/runtime/src/conversation.rs"));
         assert!(matches!(
             &second.compacted_session.messages[0].blocks[0],
-            ContentBlock::Text { text }
-                if text.contains("Previously compacted context:")
-                    && text.contains("Newly compacted context:")
+            ContentBlock::CompactionSummary { summary, .. }
+                if summary.contains("Previously compacted context:")
+                    && summary.contains("Newly compacted context:")
         ));
-        assert!(matches!(
-            &second.compacted_session.messages[1].blocks[0],
-            ContentBlock::Text { text } if text.contains("Please add regression tests for compaction.")
-        ));
+        assert_eq!(second.compacted_session.messages.len(), 1);
     }
 
     #[test]
@@ -769,13 +1214,7 @@ mod tests {
         let session = Session {
             version: 1,
             messages: vec![
-                ConversationMessage {
-                    role: MessageRole::System,
-                    blocks: vec![ContentBlock::Text {
-                        text: get_compact_continuation_message(summary, true, true),
-                    }],
-                    usage: None,
-                },
+                ConversationMessage::compaction_summary(summary, true, false, false, None),
                 ConversationMessage::user_text("tiny"),
                 ConversationMessage::assistant(vec![ContentBlock::Text {
                     text: "recent".to_string(),
@@ -789,17 +1228,150 @@ mod tests {
             CompactionConfig {
                 preserve_recent_messages: 2,
                 max_estimated_tokens: 1,
+                preserve_recent_tokens: None,
+                ..CompactionConfig::default()
             }
         ));
     }
 
     #[test]
-    fn truncates_long_blocks_in_summary() {
-        let summary = super::summarize_block(&ContentBlock::Text {
-            text: "x".repeat(400),
-        });
-        assert!(summary.ends_with('…'));
-        assert!(summary.chars().count() <= 161);
+    fn compacts_more_than_fixed_recent_window_when_needed() {
+        let session = Session {
+            version: 1,
+            messages: vec![
+                ConversationMessage::user_text("old request"),
+                ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "old response".to_string(),
+                }]),
+                ConversationMessage::user_text("recent but large ".repeat(120)),
+                ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "recent answer ".repeat(120),
+                }]),
+            ],
+            metadata: None,
+        };
+
+        let result = compact_session(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 450,
+                preserve_recent_tokens: Some(450),
+                ..CompactionConfig::default()
+            },
+        );
+
+        assert!(result.removed_message_count >= 3);
+        assert_eq!(result.compacted_session.messages.len(), 2);
+        assert!(matches!(
+            &result.compacted_session.messages[1].blocks[0],
+            ContentBlock::Text { text } if text.contains("recent answer")
+        ));
+    }
+
+    #[test]
+    fn compacts_all_non_summary_messages_when_recent_tail_alone_is_too_large() {
+        let summary = "<summary>Conversation summary:\n- Scope: earlier work preserved.\n- Key timeline:\n  - user: large preserved context\n</summary>";
+        let session = Session {
+            version: 1,
+            messages: vec![
+                ConversationMessage::compaction_summary(summary, true, false, false, None),
+                ConversationMessage::user_text("recent request ".repeat(120)),
+                ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "recent response ".repeat(120),
+                }]),
+            ],
+            metadata: None,
+        };
+
+        let result = compact_session(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 300,
+                preserve_recent_tokens: Some(300),
+                ..CompactionConfig::default()
+            },
+        );
+
+        assert_eq!(result.removed_message_count, 2);
+        assert_eq!(result.compacted_session.messages.len(), 1);
+        assert!(matches!(
+            &result.compacted_session.messages[0].blocks[0],
+            ContentBlock::CompactionSummary { summary, .. }
+                if summary.contains("Previously compacted context:")
+                    && summary.contains("recent request")
+        ));
+    }
+
+    #[test]
+    fn prunes_old_tool_results_before_full_compaction() {
+        let _guard = crate::test_env_lock();
+        let temp = std::env::temp_dir().join(format!(
+            "runtime-pruned-tool-results-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp).expect("temp dir");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&temp).expect("set cwd");
+
+        let session = Session {
+            version: 1,
+            messages: vec![
+                ConversationMessage::user_text("first"),
+                ConversationMessage::tool_result("tool-1", "bash", "x".repeat(250_000), false),
+                ConversationMessage::user_text("second"),
+                ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "working".to_string(),
+                }]),
+                ConversationMessage::user_text("third"),
+                ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "still working".to_string(),
+                }]),
+            ],
+            metadata: None,
+        };
+
+        let result = prune_old_tool_results(&session, 10_000);
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+
+        assert_eq!(result.pruned_tool_result_count, 1);
+        assert!(estimate_session_tokens(&result.session) < estimate_session_tokens(&session));
+        let archived_path = match &result.session.messages[1].blocks[0] {
+            ContentBlock::ToolResult {
+                compacted: true,
+                output,
+                archived_output_path,
+                ..
+            } => {
+                assert!(output.is_empty());
+                archived_output_path
+                    .clone()
+                    .expect("archived output path should be recorded")
+            }
+            _ => panic!("expected compacted tool result"),
+        };
+        let archived_output =
+            fs::read_to_string(temp.join(&archived_path)).expect("archived tool result readable");
+        fs::remove_dir_all(temp).expect("cleanup temp dir");
+
+        assert_eq!(archived_output.len(), 250_000);
+    }
+
+    #[test]
+    fn uses_placeholder_for_compacted_tool_result_context() {
+        assert_eq!(
+            get_tool_result_context_output("secret output", true),
+            "[Old tool result content cleared]"
+        );
+        assert_eq!(
+            get_tool_result_context_output("secret output", false),
+            "secret output"
+        );
     }
 
     #[test]

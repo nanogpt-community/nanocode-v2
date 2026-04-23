@@ -20,30 +20,33 @@ mod usage;
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
 pub use compact::{
-    compact_session, estimate_session_tokens, format_compact_summary,
-    get_compact_continuation_message, should_compact, CompactionConfig, CompactionResult,
+    build_compaction_prompt, compact_session, compact_session_with_summary,
+    estimate_session_tokens, format_compact_summary, get_compact_continuation_message,
+    get_tool_result_context_output, prepare_compaction, should_compact, CompactionConfig,
+    CompactionResult, PreparedCompaction,
 };
 pub use config::{
     default_config_home, ConfigEntry, ConfigError, ConfigLoader, ConfigSource,
     McpClaudeAiProxyServerConfig, McpConfigCollection, McpOAuthConfig, McpRemoteServerConfig,
     McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpStdioStderrMode, McpTransport,
-    McpWebSocketServerConfig, OAuthConfig, ResolvedPermissionMode, RuntimeConfig,
-    RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig, ScopedMcpServerConfig,
-    PEBBLE_SETTINGS_SCHEMA_NAME,
+    McpWebSocketServerConfig, OAuthConfig, ResolvedPermissionMode, RuntimeCompactionConfig,
+    RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig,
+    ScopedMcpServerConfig, PEBBLE_SETTINGS_SCHEMA_NAME,
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
     ConversationRuntime, RuntimeError, StaticToolExecutor, ToolError, ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
-    edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
-    GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
-    WriteFileOutput,
+    apply_patch, edit_file, glob_search, grep_search, read_file, write_file, ApplyPatchFileChange,
+    ApplyPatchOutput, EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,
+    ReadFileOutput, StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
 pub use hooks::{
     HookAbortSignal, HookEvent, HookPermissionDecision, HookProgressEvent, HookProgressReporter,
     HookRunResult, HookRunner,
 };
+pub use json::{JsonError, JsonValue as RuntimeJsonValue};
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
     scoped_mcp_config_hash, unwrap_ccr_proxy_url,
@@ -86,7 +89,8 @@ pub use sandbox::{
     SandboxRequest, SandboxStatus,
 };
 pub use session::{
-    ContentBlock, ConversationMessage, MessageRole, Session, SessionError, SessionMetadata,
+    ContentBlock, ConversationMessage, EditHistoryEntry, EditHistoryFile, MessageRole, Session,
+    SessionError, SessionMetadata, SessionTurnSnapshot,
 };
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,

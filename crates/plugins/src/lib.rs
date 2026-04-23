@@ -573,8 +573,8 @@ impl PluginManager {
         copy_dir_recursive(path, &record.install_path)?;
         let old_version = record.version.clone();
         let install_path = record.install_path.clone();
-        record.version = plugin.metadata.version.clone();
-        record.description = plugin.metadata.description.clone();
+        record.version.clone_from(&plugin.metadata.version);
+        record.description.clone_from(&plugin.metadata.description);
         record.updated_at_unix_ms = unix_time_ms();
         let new_version = plugin.metadata.version.clone();
         let plugin_id = plugin_id.to_string();
@@ -750,9 +750,9 @@ impl Display for PluginError {
         match self {
             Self::Io(error) => write!(f, "{error}"),
             Self::Json(error) => write!(f, "{error}"),
-            Self::InvalidManifest(error) => write!(f, "{error}"),
-            Self::NotFound(error) => write!(f, "{error}"),
-            Self::CommandFailed(error) => write!(f, "{error}"),
+            Self::InvalidManifest(error) | Self::NotFound(error) | Self::CommandFailed(error) => {
+                write!(f, "{error}")
+            }
         }
     }
 }

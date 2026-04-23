@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::json::{JsonError, JsonValue};
 use crate::usage::TokenUsage;
@@ -33,11 +35,21 @@ pub enum ContentBlock {
         tool_name: String,
         output: String,
         is_error: bool,
+        compacted: bool,
+        archived_output_path: Option<String>,
+    },
+    CompactionSummary {
+        summary: String,
+        recent_messages_preserved: bool,
+        auto: bool,
+        overflow: bool,
+        tail_start_id: Option<String>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationMessage {
+    pub id: String,
     pub role: MessageRole,
     pub blocks: Vec<ContentBlock>,
     pub usage: Option<TokenUsage>,
@@ -45,6 +57,7 @@ pub struct ConversationMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMetadata {
+    pub title: Option<String>,
     pub started_at: String,
     pub model: String,
     pub message_count: u32,
@@ -56,6 +69,34 @@ pub struct SessionMetadata {
     pub fast_mode: Option<bool>,
     pub proxy_tool_calls: Option<bool>,
     pub allowed_tools: Option<Vec<String>>,
+    pub edit_history: Option<Vec<EditHistoryEntry>>,
+    pub undo_stack: Option<Vec<SessionTurnSnapshot>>,
+    pub redo_stack: Option<Vec<SessionTurnSnapshot>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditHistoryEntry {
+    pub timestamp: String,
+    pub tool_name: String,
+    pub files: Vec<EditHistoryFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditHistoryFile {
+    pub path: String,
+    pub before: String,
+    pub after: String,
+    pub before_exists: bool,
+    pub after_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTurnSnapshot {
+    pub timestamp: String,
+    pub message_count_before: u32,
+    pub prompt: Option<String>,
+    pub messages: Vec<ConversationMessage>,
+    pub files: Vec<EditHistoryFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,10 +214,24 @@ impl Default for Session {
     }
 }
 
+static MESSAGE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn generate_message_id() -> String {
+    let counter = MESSAGE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("msg-{timestamp:x}-{counter:x}")
+}
+
 impl SessionMetadata {
     #[must_use]
     pub fn to_json(&self) -> JsonValue {
         let mut object = BTreeMap::new();
+        if let Some(title) = &self.title {
+            object.insert("title".to_string(), JsonValue::String(title.clone()));
+        }
         object.insert(
             "started_at".to_string(),
             JsonValue::String(self.started_at.clone()),
@@ -237,6 +292,34 @@ impl SessionMetadata {
                 ),
             );
         }
+        if let Some(edit_history) = &self.edit_history {
+            object.insert(
+                "edit_history".to_string(),
+                JsonValue::Array(edit_history.iter().map(EditHistoryEntry::to_json).collect()),
+            );
+        }
+        if let Some(undo_stack) = &self.undo_stack {
+            object.insert(
+                "undo_stack".to_string(),
+                JsonValue::Array(
+                    undo_stack
+                        .iter()
+                        .map(SessionTurnSnapshot::to_json)
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(redo_stack) = &self.redo_stack {
+            object.insert(
+                "redo_stack".to_string(),
+                JsonValue::Array(
+                    redo_stack
+                        .iter()
+                        .map(SessionTurnSnapshot::to_json)
+                        .collect(),
+                ),
+            );
+        }
         JsonValue::Object(object)
     }
 
@@ -245,6 +328,7 @@ impl SessionMetadata {
             SessionError::Format("session metadata must be an object".to_string())
         })?;
         Ok(Self {
+            title: optional_string(object, "title"),
             started_at: required_string(object, "started_at")?,
             model: required_string(object, "model")?,
             message_count: required_u32(object, "message_count")?,
@@ -256,36 +340,183 @@ impl SessionMetadata {
             fast_mode: optional_bool(object, "fast_mode"),
             proxy_tool_calls: optional_bool(object, "proxy_tool_calls"),
             allowed_tools: optional_string_array(object, "allowed_tools")?,
+            edit_history: optional_edit_history(object, "edit_history")?,
+            undo_stack: optional_turn_snapshots(object, "undo_stack")?,
+            redo_stack: optional_turn_snapshots(object, "redo_stack")?,
+        })
+    }
+}
+
+impl EditHistoryEntry {
+    #[must_use]
+    pub fn to_json(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert(
+            "timestamp".to_string(),
+            JsonValue::String(self.timestamp.clone()),
+        );
+        object.insert(
+            "tool_name".to_string(),
+            JsonValue::String(self.tool_name.clone()),
+        );
+        object.insert(
+            "files".to_string(),
+            JsonValue::Array(self.files.iter().map(EditHistoryFile::to_json).collect()),
+        );
+        JsonValue::Object(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        let object = value.as_object().ok_or_else(|| {
+            SessionError::Format("edit history entry must be an object".to_string())
+        })?;
+        Ok(Self {
+            timestamp: required_string(object, "timestamp")?,
+            tool_name: required_string(object, "tool_name")?,
+            files: required_edit_history_files(object, "files")?,
+        })
+    }
+}
+
+impl EditHistoryFile {
+    #[must_use]
+    pub fn to_json(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert("path".to_string(), JsonValue::String(self.path.clone()));
+        object.insert("before".to_string(), JsonValue::String(self.before.clone()));
+        object.insert("after".to_string(), JsonValue::String(self.after.clone()));
+        object.insert(
+            "before_exists".to_string(),
+            JsonValue::Bool(self.before_exists),
+        );
+        object.insert(
+            "after_exists".to_string(),
+            JsonValue::Bool(self.after_exists),
+        );
+        JsonValue::Object(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        let object = value.as_object().ok_or_else(|| {
+            SessionError::Format("edit history file must be an object".to_string())
+        })?;
+        Ok(Self {
+            path: required_string(object, "path")?,
+            before: required_string(object, "before")?,
+            after: required_string(object, "after")?,
+            before_exists: object
+                .get("before_exists")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(true),
+            after_exists: object
+                .get("after_exists")
+                .and_then(JsonValue::as_bool)
+                .unwrap_or(true),
+        })
+    }
+}
+
+impl SessionTurnSnapshot {
+    #[must_use]
+    pub fn to_json(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert(
+            "timestamp".to_string(),
+            JsonValue::String(self.timestamp.clone()),
+        );
+        object.insert(
+            "message_count_before".to_string(),
+            JsonValue::Number(i64::from(self.message_count_before)),
+        );
+        if let Some(prompt) = &self.prompt {
+            object.insert("prompt".to_string(), JsonValue::String(prompt.clone()));
+        }
+        object.insert(
+            "messages".to_string(),
+            JsonValue::Array(
+                self.messages
+                    .iter()
+                    .map(ConversationMessage::to_json)
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "files".to_string(),
+            JsonValue::Array(self.files.iter().map(EditHistoryFile::to_json).collect()),
+        );
+        JsonValue::Object(object)
+    }
+
+    fn from_json(value: &JsonValue) -> Result<Self, SessionError> {
+        let object = value.as_object().ok_or_else(|| {
+            SessionError::Format("session turn snapshot must be an object".to_string())
+        })?;
+        let messages = object
+            .get("messages")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| SessionError::Format("missing messages".to_string()))?
+            .iter()
+            .map(ConversationMessage::from_json)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            timestamp: required_string(object, "timestamp")?,
+            message_count_before: required_u32(object, "message_count_before")?,
+            prompt: optional_string(object, "prompt"),
+            messages,
+            files: required_edit_history_files(object, "files")?,
         })
     }
 }
 
 impl ConversationMessage {
     #[must_use]
-    pub fn user_text(text: impl Into<String>) -> Self {
+    pub fn new(role: MessageRole, blocks: Vec<ContentBlock>, usage: Option<TokenUsage>) -> Self {
         Self {
-            role: MessageRole::User,
-            blocks: vec![ContentBlock::Text { text: text.into() }],
-            usage: None,
+            id: generate_message_id(),
+            role,
+            blocks,
+            usage,
         }
+    }
+
+    #[must_use]
+    pub fn user_text(text: impl Into<String>) -> Self {
+        Self::new(
+            MessageRole::User,
+            vec![ContentBlock::Text { text: text.into() }],
+            None,
+        )
     }
 
     #[must_use]
     pub fn assistant(blocks: Vec<ContentBlock>) -> Self {
-        Self {
-            role: MessageRole::Assistant,
-            blocks,
-            usage: None,
-        }
+        Self::new(MessageRole::Assistant, blocks, None)
     }
 
     #[must_use]
     pub fn assistant_with_usage(blocks: Vec<ContentBlock>, usage: Option<TokenUsage>) -> Self {
-        Self {
-            role: MessageRole::Assistant,
-            blocks,
-            usage,
-        }
+        Self::new(MessageRole::Assistant, blocks, usage)
+    }
+
+    #[must_use]
+    pub fn compaction_summary(
+        summary: impl Into<String>,
+        recent_messages_preserved: bool,
+        auto: bool,
+        overflow: bool,
+        tail_start_id: Option<String>,
+    ) -> Self {
+        Self::new(
+            MessageRole::System,
+            vec![ContentBlock::CompactionSummary {
+                summary: summary.into(),
+                recent_messages_preserved,
+                auto,
+                overflow,
+                tail_start_id,
+            }],
+            None,
+        )
     }
 
     #[must_use]
@@ -295,21 +526,45 @@ impl ConversationMessage {
         output: impl Into<String>,
         is_error: bool,
     ) -> Self {
-        Self {
-            role: MessageRole::Tool,
-            blocks: vec![ContentBlock::ToolResult {
+        Self::new(
+            MessageRole::Tool,
+            vec![ContentBlock::ToolResult {
                 tool_use_id: tool_use_id.into(),
                 tool_name: tool_name.into(),
                 output: output.into(),
                 is_error,
+                compacted: false,
+                archived_output_path: None,
             }],
-            usage: None,
-        }
+            None,
+        )
+    }
+
+    #[must_use]
+    pub fn compacted_tool_result(
+        tool_use_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        output: impl Into<String>,
+        is_error: bool,
+    ) -> Self {
+        Self::new(
+            MessageRole::Tool,
+            vec![ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.into(),
+                tool_name: tool_name.into(),
+                output: output.into(),
+                is_error,
+                compacted: true,
+                archived_output_path: None,
+            }],
+            None,
+        )
     }
 
     #[must_use]
     pub fn to_json(&self) -> JsonValue {
         let mut object = BTreeMap::new();
+        object.insert("id".to_string(), JsonValue::String(self.id.clone()));
         object.insert(
             "role".to_string(),
             JsonValue::String(
@@ -360,6 +615,7 @@ impl ConversationMessage {
             .collect::<Result<Vec<_>, _>>()?;
         let usage = object.get("usage").map(usage_from_json).transpose()?;
         Ok(Self {
+            id: optional_string(object, "id").unwrap_or_else(generate_message_id),
             role,
             blocks,
             usage,
@@ -403,6 +659,8 @@ impl ContentBlock {
                 tool_name,
                 output,
                 is_error,
+                compacted,
+                archived_output_path,
             } => {
                 object.insert(
                     "type".to_string(),
@@ -418,6 +676,40 @@ impl ContentBlock {
                 );
                 object.insert("output".to_string(), JsonValue::String(output.clone()));
                 object.insert("is_error".to_string(), JsonValue::Bool(*is_error));
+                if *compacted {
+                    object.insert("compacted".to_string(), JsonValue::Bool(true));
+                }
+                if let Some(archived_output_path) = archived_output_path {
+                    object.insert(
+                        "archived_output_path".to_string(),
+                        JsonValue::String(archived_output_path.clone()),
+                    );
+                }
+            }
+            Self::CompactionSummary {
+                summary,
+                recent_messages_preserved,
+                auto,
+                overflow,
+                tail_start_id,
+            } => {
+                object.insert(
+                    "type".to_string(),
+                    JsonValue::String("compaction_summary".to_string()),
+                );
+                object.insert("summary".to_string(), JsonValue::String(summary.clone()));
+                object.insert(
+                    "recent_messages_preserved".to_string(),
+                    JsonValue::Bool(*recent_messages_preserved),
+                );
+                object.insert("auto".to_string(), JsonValue::Bool(*auto));
+                object.insert("overflow".to_string(), JsonValue::Bool(*overflow));
+                if let Some(tail_start_id) = tail_start_id {
+                    object.insert(
+                        "tail_start_id".to_string(),
+                        JsonValue::String(tail_start_id.clone()),
+                    );
+                }
             }
         }
         JsonValue::Object(object)
@@ -452,6 +744,27 @@ impl ContentBlock {
                     .get("is_error")
                     .and_then(JsonValue::as_bool)
                     .ok_or_else(|| SessionError::Format("missing is_error".to_string()))?,
+                compacted: object
+                    .get("compacted")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false),
+                archived_output_path: optional_string(object, "archived_output_path"),
+            }),
+            "compaction_summary" => Ok(Self::CompactionSummary {
+                summary: required_string(object, "summary")?,
+                recent_messages_preserved: object
+                    .get("recent_messages_preserved")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false),
+                auto: object
+                    .get("auto")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false),
+                overflow: object
+                    .get("overflow")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false),
+                tail_start_id: optional_string(object, "tail_start_id"),
             }),
             other => Err(SessionError::Format(format!(
                 "unsupported block type: {other}"
@@ -544,17 +857,67 @@ fn optional_string_array(
     Ok(Some(strings))
 }
 
+fn optional_edit_history(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Result<Option<Vec<EditHistoryEntry>>, SessionError> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| SessionError::Format(format!("{key} must be an array")))?;
+    values
+        .iter()
+        .map(EditHistoryEntry::from_json)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn optional_turn_snapshots(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Result<Option<Vec<SessionTurnSnapshot>>, SessionError> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| SessionError::Format(format!("{key} must be an array")))?;
+    values
+        .iter()
+        .map(SessionTurnSnapshot::from_json)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+fn required_edit_history_files(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Result<Vec<EditHistoryFile>, SessionError> {
+    let values = object
+        .get(key)
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| SessionError::Format(format!("missing {key}")))?;
+    values.iter().map(EditHistoryFile::from_json).collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ContentBlock, ConversationMessage, MessageRole, Session, SessionMetadata};
+    use super::{
+        ContentBlock, ConversationMessage, EditHistoryEntry, EditHistoryFile, MessageRole, Session,
+        SessionMetadata, SessionTurnSnapshot,
+    };
     use crate::usage::TokenUsage;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn persists_and_restores_session_json() {
         let mut session = Session::new();
         session.metadata = Some(SessionMetadata {
+            title: Some("Demo session".to_string()),
             started_at: "2026-04-01T00:00:00Z".to_string(),
             model: "zai-org/glm-5.1".to_string(),
             message_count: 3,
@@ -566,6 +929,31 @@ mod tests {
             fast_mode: Some(true),
             proxy_tool_calls: Some(false),
             allowed_tools: Some(vec!["read_file".to_string(), "glob_search".to_string()]),
+            edit_history: Some(vec![EditHistoryEntry {
+                timestamp: "2026-04-01T00:01:00Z".to_string(),
+                tool_name: "edit_file".to_string(),
+                files: vec![EditHistoryFile {
+                    path: "src/lib.rs".to_string(),
+                    before: "old".to_string(),
+                    after: "new".to_string(),
+                    before_exists: true,
+                    after_exists: true,
+                }],
+            }]),
+            undo_stack: Some(vec![SessionTurnSnapshot {
+                timestamp: "2026-04-01T00:02:00Z".to_string(),
+                message_count_before: 0,
+                prompt: Some("hello".to_string()),
+                messages: vec![ConversationMessage::user_text("hello")],
+                files: vec![EditHistoryFile {
+                    path: "src/main.rs".to_string(),
+                    before: String::new(),
+                    after: "fn main() {}\n".to_string(),
+                    before_exists: false,
+                    after_exists: true,
+                }],
+            }]),
+            redo_stack: Some(Vec::new()),
         });
         session
             .messages
@@ -593,6 +981,21 @@ mod tests {
         session.messages.push(ConversationMessage::tool_result(
             "tool-1", "bash", "hi", false,
         ));
+        session
+            .messages
+            .push(ConversationMessage::compacted_tool_result(
+                "tool-2",
+                "bash",
+                "long output",
+                false,
+            ));
+        if let ContentBlock::ToolResult {
+            archived_output_path,
+            ..
+        } = &mut session.messages[3].blocks[0]
+        {
+            *archived_output_path = Some(".pebble/tool-results/tool-2-bash.txt".to_string());
+        }
 
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -605,6 +1008,14 @@ mod tests {
 
         assert_eq!(restored, session);
         assert_eq!(restored.messages[2].role, MessageRole::Tool);
+        assert!(matches!(
+            &restored.messages[3].blocks[0],
+            ContentBlock::ToolResult {
+                compacted: true,
+                archived_output_path: Some(path),
+                ..
+            } if path == ".pebble/tool-results/tool-2-bash.txt"
+        ));
         assert_eq!(
             restored.messages[1].usage.expect("usage").total_tokens(),
             17
