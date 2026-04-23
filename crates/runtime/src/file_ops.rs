@@ -1622,7 +1622,7 @@ mod tests {
         }
     }
 
-    fn assert_error_contains(error: std::io::Error, expected: &str) {
+    fn assert_error_contains(error: &std::io::Error, expected: &str) {
         let message = error.to_string();
         assert!(
             message.contains(expected),
@@ -1681,11 +1681,11 @@ mod tests {
 
             let error = read_file(outside.to_string_lossy().as_ref(), None, None)
                 .expect_err("outside read should fail");
-            assert_error_contains(error, "path escapes workspace:");
+            assert_error_contains(&error, "path escapes workspace:");
 
             let error = write_file(outside.to_string_lossy().as_ref(), "changed")
                 .expect_err("outside write should fail");
-            assert_error_contains(error, "path escapes workspace:");
+            assert_error_contains(&error, "path escapes workspace:");
             assert_eq!(
                 std::fs::read_to_string(&outside).expect("outside fixture read"),
                 "secret"
@@ -1699,10 +1699,10 @@ mod tests {
     fn rejects_parent_directory_escape() {
         with_temp_workspace("parent-escape", |_| {
             let error = write_file("../escape.txt", "nope").expect_err("parent escape should fail");
-            assert_error_contains(error, "path escapes workspace:");
+            assert_error_contains(&error, "path escapes workspace:");
 
             let error = glob_search("../*.txt", None).expect_err("glob escape should fail");
-            assert_error_contains(error, "path escapes workspace:");
+            assert_error_contains(&error, "path escapes workspace:");
         });
     }
 
@@ -1729,15 +1729,15 @@ mod tests {
 
             let error =
                 read_file("link.txt", None, None).expect_err("symlink read escape should fail");
-            assert_error_contains(error, "path escapes workspace:");
+            assert_error_contains(&error, "path escapes workspace:");
 
             let error =
                 write_file("link.txt", "changed").expect_err("symlink write escape should fail");
-            assert_error_contains(error, "path escapes workspace:");
+            assert_error_contains(&error, "path escapes workspace:");
 
             let error = edit_file("link.txt", "secret", "changed", false)
                 .expect_err("symlink edit escape should fail");
-            assert_error_contains(error, "path escapes workspace:");
+            assert_error_contains(&error, "path escapes workspace:");
 
             assert_eq!(
                 std::fs::read_to_string(&outside).expect("outside fixture read"),
@@ -1763,7 +1763,7 @@ mod tests {
 +changed
 *** End Patch";
             let error = apply_patch(patch, true).expect_err("symlink patch should fail");
-            assert_error_contains(error, "path escapes workspace:");
+            assert_error_contains(&error, "path escapes workspace:");
             assert_eq!(
                 std::fs::read_to_string(&outside).expect("outside fixture read"),
                 "secret\n"
@@ -2004,7 +2004,7 @@ mod tests {
             let error = grep_search(&grep_input("alpha", None, "bad_mode"))
                 .expect_err("invalid output mode should fail");
             assert_error_contains(
-                error,
+                &error,
                 "unsupported grep_search output_mode `bad_mode` (expected content, files_with_matches, or count)",
             );
         });

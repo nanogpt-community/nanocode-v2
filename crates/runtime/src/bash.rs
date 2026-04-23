@@ -273,7 +273,11 @@ fn default_shell_program() -> io::Result<&'static str> {
 
 #[cfg(not(windows))]
 fn default_shell_program() -> &'static str {
-    "sh"
+    if std::path::Path::new("/bin/sh").exists() {
+        "/bin/sh"
+    } else {
+        "sh"
+    }
 }
 
 #[cfg(windows)]

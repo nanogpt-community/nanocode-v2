@@ -1,5 +1,11 @@
 # CHANGELOG (STARTING FROM v0.4.0)
 
+## v0.4.4
+
+- Fix CI instability in tools tests by resolving non-Windows bash commands through `/bin/sh` when available, avoiding sensitivity to tests that temporarily mutate `PATH`.
+- Recover from poisoned test environment locks in the local skill-loading test so later tests can continue after prior panics.
+- Address clippy's needless pass-by-value warning in runtime file operation tests.
+
 ## v0.4.3
 
 - Clarify timeout units in built-in `bash`, `REPL`, and `PowerShell` tool schemas and descriptions so model-facing docs explicitly state milliseconds.

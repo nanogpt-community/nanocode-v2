@@ -93,6 +93,7 @@ const MAX_INIT_TOP_LEVEL_ENTRIES: usize = 40;
 const MCP_DISCOVERY_TIMEOUT_SECS: u64 = 30;
 const AUTO_COMPACTION_CONTEXT_UTILIZATION_PERCENT: u64 = 85;
 const AUTO_COMPACTION_CONTEXT_SAFETY_MARGIN_TOKENS: u64 = 8_192;
+const MAX_TURN_SNAPSHOT_STACK_ENTRIES: usize = 20;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("PEBBLE_BUILD_TARGET");
 const IMAGE_REF_PREFIX: &str = "@";
@@ -2872,9 +2873,24 @@ struct StatusContext {
 struct StatusUsage {
     message_count: usize,
     turns: u32,
+    undo_count: usize,
+    redo_count: usize,
     latest: TokenUsage,
     cumulative: TokenUsage,
     estimated_tokens: usize,
+}
+
+fn session_undo_redo_counts(session: &Session) -> (usize, usize) {
+    session
+        .metadata
+        .as_ref()
+        .map(|metadata| {
+            (
+                metadata.undo_stack.as_ref().map_or(0, Vec::len),
+                metadata.redo_stack.as_ref().map_or(0, Vec::len),
+            )
+        })
+        .unwrap_or((0, 0))
 }
 
 #[derive(Debug, Clone)]
@@ -2970,7 +2986,7 @@ fn format_status_report(
         .unwrap_or_default();
     [
         format!(
-            "{}\n  {}\n    {} {}\n    {} {}{}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}",
+            "{}\n  {}\n    {} {}\n    {} {}{}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}\n    {} {}",
             report_title("Pebble Status"),
             report_section("Session"),
             report_label("service"),
@@ -2992,6 +3008,10 @@ fn format_status_report(
             usage.message_count,
             report_label("turns"),
             usage.turns,
+            report_label("undo_available"),
+            usage.undo_count,
+            report_label("redo_available"),
+            usage.redo_count,
             report_label("estimated_tokens"),
             usage.estimated_tokens,
         ),
@@ -3716,9 +3736,20 @@ fn push_undo_snapshot(session: &mut Session, snapshot: SessionTurnSnapshot, clea
             .undo_stack
             .get_or_insert_with(Vec::new)
             .push(snapshot);
+        trim_turn_snapshot_stack(metadata.undo_stack.as_mut());
         if clear_redo {
             metadata.redo_stack = Some(Vec::new());
         }
+    }
+}
+
+fn trim_turn_snapshot_stack(stack: Option<&mut Vec<SessionTurnSnapshot>>) {
+    let Some(stack) = stack else {
+        return;
+    };
+    let overflow = stack.len().saturating_sub(MAX_TURN_SNAPSHOT_STACK_ENTRIES);
+    if overflow > 0 {
+        stack.drain(0..overflow);
     }
 }
 
@@ -3834,6 +3865,7 @@ fn push_redo_snapshot(session: &mut Session, snapshot: SessionTurnSnapshot) {
             .redo_stack
             .get_or_insert_with(Vec::new)
             .push(snapshot);
+        trim_turn_snapshot_stack(metadata.redo_stack.as_mut());
     }
 }
 
@@ -5506,6 +5538,7 @@ impl LiveCli {
         let cumulative = self.runtime.usage().cumulative_usage();
         let latest = self.runtime.usage().current_turn_usage();
         let context = status_context(Some(&self.session.path)).expect("status context should load");
+        let (undo_count, redo_count) = session_undo_redo_counts(self.runtime.session());
         println!(
             "{}",
             format_status_report(
@@ -5514,6 +5547,8 @@ impl LiveCli {
                 StatusUsage {
                     message_count: self.runtime.session().messages.len(),
                     turns: self.runtime.usage().turns(),
+                    undo_count,
+                    redo_count,
                     latest,
                     cumulative,
                     estimated_tokens: self.runtime.estimated_tokens(),
@@ -8804,6 +8839,7 @@ fn run_resume_command(
                 FastMode::Off,
                 false,
             );
+            let (undo_count, redo_count) = session_undo_redo_counts(session);
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 message: Some(format_status_report(
@@ -8812,6 +8848,8 @@ fn run_resume_command(
                     StatusUsage {
                         message_count: session.messages.len(),
                         turns: tracker.turns(),
+                        undo_count,
+                        redo_count,
                         latest: tracker.current_turn_usage(),
                         cumulative: usage,
                         estimated_tokens: 0,
@@ -10231,17 +10269,18 @@ fn check_system_info(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> Dia
 #[cfg(test)]
 mod tests {
     use super::{
-        append_proxy_text_events, available_runtime_tool_specs, build_system_prompt,
-        build_turn_snapshot, extract_first_json_object, filter_runtime_tool_specs,
-        format_status_report, format_web_tools_status, load_custom_slash_commands,
-        login_model_guidance, normalize_generated_pebble_md, parse_args, parse_auth_command,
-        parse_checksum_for_asset, parse_logout_command, parse_mcp_command, parse_model_command,
-        parse_permissions_command, parse_provider_command, parse_proxy_command,
-        parse_tool_input_value, persist_runtime_defaults, prompt_to_content_blocks,
-        proxy_response_to_events, push_output_block, remove_saved_credentials,
-        render_archived_tool_results_report, render_custom_command_template, render_export_text,
-        render_permission_diff_preview, render_session_timeline, render_streamed_tool_call_start,
-        render_tool_result_block, render_update_report, resolve_model_alias, response_to_events,
+        append_proxy_text_events, append_undo_snapshot, available_runtime_tool_specs,
+        build_system_prompt, build_turn_snapshot, extract_first_json_object,
+        filter_runtime_tool_specs, format_status_report, format_web_tools_status,
+        load_custom_slash_commands, login_model_guidance, normalize_generated_pebble_md,
+        parse_args, parse_auth_command, parse_checksum_for_asset, parse_logout_command,
+        parse_mcp_command, parse_model_command, parse_permissions_command, parse_provider_command,
+        parse_proxy_command, parse_tool_input_value, persist_runtime_defaults,
+        prompt_to_content_blocks, proxy_response_to_events, push_output_block,
+        remove_saved_credentials, render_archived_tool_results_report,
+        render_custom_command_template, render_export_text, render_permission_diff_preview,
+        render_session_timeline, render_streamed_tool_call_start, render_tool_result_block,
+        render_update_report, resolve_model_alias, response_to_events,
         should_ignore_stale_secret_submit, should_retry_proxy_tool_prompt,
         strip_markdown_code_fence, trim_trailing_line_endings, tuned_tool_description,
         AssistantEvent, AuthService, CliAction, CliOutputFormat, CollaborationMode,
@@ -10472,6 +10511,8 @@ mod tests {
             StatusUsage {
                 message_count: 0,
                 turns: 0,
+                undo_count: 0,
+                redo_count: 0,
                 latest: TokenUsage {
                     input_tokens: 0,
                     output_tokens: 0,
@@ -11608,6 +11649,32 @@ mod tests {
         assert_eq!(change.after, "new\n");
         assert!(change.before_exists);
         assert!(change.after_exists);
+    }
+
+    #[test]
+    fn turn_snapshot_stacks_are_bounded() {
+        let mut session = Session::new();
+        for index in 0..(super::MAX_TURN_SNAPSHOT_STACK_ENTRIES + 5) {
+            append_undo_snapshot(
+                &mut session,
+                runtime::SessionTurnSnapshot {
+                    timestamp: format!("snapshot-{index}"),
+                    message_count_before: index as u32,
+                    prompt: None,
+                    messages: Vec::new(),
+                    files: Vec::new(),
+                },
+            );
+        }
+
+        let undo_stack = session
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.undo_stack.as_ref())
+            .expect("undo stack should be initialized");
+        assert_eq!(undo_stack.len(), super::MAX_TURN_SNAPSHOT_STACK_ENTRIES);
+        assert_eq!(undo_stack.first().unwrap().timestamp, "snapshot-5");
+        assert_eq!(undo_stack.last().unwrap().timestamp, "snapshot-24");
     }
 
     #[test]
