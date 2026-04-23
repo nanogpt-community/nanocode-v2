@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use platform::pebble_config_home;
+use platform::{pebble_config_home, write_atomic};
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -861,7 +861,7 @@ pub fn save_openai_codex_credentials(
         parsed = serde_json::json!({});
     }
     parsed[OPENAI_CODEX_CREDENTIALS_KEY] = serde_json::to_value(credentials)?;
-    fs::write(&path, serde_json::to_string_pretty(&parsed)?)?;
+    write_atomic(&path, serde_json::to_string_pretty(&parsed)?)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

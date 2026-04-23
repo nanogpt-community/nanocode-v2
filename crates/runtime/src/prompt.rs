@@ -548,7 +548,39 @@ mod tests {
             .expect("time should be after epoch")
             .as_nanos();
         let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("runtime-prompt-{nanos}-{counter}"))
+        temp_base_dir().join(format!("runtime-prompt-{nanos}-{counter}"))
+    }
+
+    fn temp_base_dir() -> PathBuf {
+        let configured = std::env::temp_dir();
+        if !has_project_context_markers_in_ancestors(&configured) {
+            return configured;
+        }
+
+        #[cfg(unix)]
+        {
+            let system_tmp = PathBuf::from("/tmp");
+            if !has_project_context_markers_in_ancestors(&system_tmp) {
+                return system_tmp;
+            }
+        }
+
+        configured
+    }
+
+    fn has_project_context_markers_in_ancestors(path: &Path) -> bool {
+        path.ancestors().any(|dir| {
+            [
+                dir.join("PEBBLE.md"),
+                dir.join("PEBBLE.local.md"),
+                dir.join(".pebble").join("PEBBLE.md"),
+                dir.join("CLAUDE.md"),
+                dir.join("CLAUDE.local.md"),
+            ]
+            .iter()
+            .any(|path| path.is_file())
+                || dir.join(".pebble").join("memory").is_dir()
+        })
     }
 
     #[test]

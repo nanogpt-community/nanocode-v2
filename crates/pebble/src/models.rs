@@ -13,7 +13,7 @@ use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size, Clear, ClearType};
-use platform::pebble_config_home as resolve_pebble_config_home;
+use platform::{pebble_config_home as resolve_pebble_config_home, write_atomic};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_SYNTHETIC_MODELS_URL: &str = "https://api.synthetic.new/openai/v1/models";
@@ -82,7 +82,7 @@ pub fn save_model_state(state: &ModelState) -> Result<(), Box<dyn std::error::Er
     let config_home = pebble_config_home()?;
     fs::create_dir_all(&config_home)?;
     let path = state_path()?;
-    fs::write(&path, serde_json::to_string_pretty(state)?)?;
+    write_atomic(&path, serde_json::to_string_pretty(state)?)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

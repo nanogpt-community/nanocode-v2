@@ -5,6 +5,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use platform::write_atomic;
+
 use crate::json::{JsonError, JsonValue};
 use crate::usage::TokenUsage;
 
@@ -148,7 +150,7 @@ impl Session {
     }
 
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), SessionError> {
-        fs::write(path, self.to_json().render())?;
+        write_atomic(path, self.to_json().render())?;
         Ok(())
     }
 

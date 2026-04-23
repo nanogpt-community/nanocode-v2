@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use platform::write_atomic;
+
 const STARTER_SETTINGS_LOCAL_JSON: &str =
     concat!("{\n", "  \"permissionMode\": \"workspace-write\"\n", "}\n",);
 const GITIGNORE_COMMENT: &str = "# Pebble local artifacts";
@@ -129,7 +131,7 @@ fn write_file_if_missing(path: &Path, content: &str) -> Result<InitStatus, std::
     if path.exists() {
         return Ok(InitStatus::Skipped);
     }
-    fs::write(path, content)?;
+    write_atomic(path, content)?;
     Ok(InitStatus::Created)
 }
 
@@ -137,7 +139,7 @@ fn ensure_gitignore_entries(path: &Path) -> Result<InitStatus, std::io::Error> {
     if !path.exists() {
         let mut lines = vec![GITIGNORE_COMMENT.to_string()];
         lines.extend(GITIGNORE_ENTRIES.iter().map(|entry| (*entry).to_string()));
-        fs::write(path, format!("{}\n", lines.join("\n")))?;
+        write_atomic(path, format!("{}\n", lines.join("\n")))?;
         return Ok(InitStatus::Created);
     }
 
@@ -161,7 +163,7 @@ fn ensure_gitignore_entries(path: &Path) -> Result<InitStatus, std::io::Error> {
         return Ok(InitStatus::Skipped);
     }
 
-    fs::write(path, format!("{}\n", lines.join("\n")))?;
+    write_atomic(path, format!("{}\n", lines.join("\n")))?;
     Ok(InitStatus::Updated)
 }
 

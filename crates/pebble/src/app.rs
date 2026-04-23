@@ -24,7 +24,7 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::style::{Color, Stylize};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use platform::pebble_config_home as resolve_pebble_config_home;
+use platform::{pebble_config_home as resolve_pebble_config_home, write_atomic};
 use plugins::{PluginError, PluginManager, PluginSummary};
 use reqwest::blocking::Client as BlockingClient;
 use reqwest::header::{HeaderName, HeaderValue};
@@ -1681,7 +1681,7 @@ fn add_mcp_server_interactive(
         return Err("mcpServers must be an object".into());
     };
     servers_object.insert(normalized_name.to_string(), server_config);
-    fs::write(&settings_path, serde_json::to_string_pretty(&root)?)?;
+    write_atomic(&settings_path, serde_json::to_string_pretty(&root)?)?;
 
     Ok(format!(
         "MCP\n  result:  added\n  server:  {normalized_name}\n  file:    {}\n  next:    run /mcp reload",
@@ -1733,7 +1733,7 @@ fn set_mcp_server_enabled(
         normalized_name.to_string(),
         mcp_server_config_to_json(&scoped.config, enabled),
     );
-    fs::write(&settings_path, serde_json::to_string_pretty(&root)?)?;
+    write_atomic(&settings_path, serde_json::to_string_pretty(&root)?)?;
 
     Ok(format!(
         "MCP\n  result:  {}\n  server:  {normalized_name}\n  file:    {}\n  next:    run /mcp reload",
@@ -1855,7 +1855,7 @@ fn save_credentials(
     }
     let key_name = service.credential_key();
     parsed[key_name] = serde_json::Value::String(api_key.to_string());
-    fs::write(&credentials_path, serde_json::to_string_pretty(&parsed)?)?;
+    write_atomic(&credentials_path, serde_json::to_string_pretty(&parsed)?)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1899,7 +1899,7 @@ fn remove_saved_credentials(
         });
     }
 
-    fs::write(&credentials_path, serde_json::to_string_pretty(&parsed)?)?;
+    write_atomic(&credentials_path, serde_json::to_string_pretty(&parsed)?)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -3852,7 +3852,7 @@ fn restore_snapshot_files(
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(path, content)?;
+            write_atomic(path, content)?;
         } else if path.is_file() || path.is_symlink() {
             fs::remove_file(path)?;
         } else if path.is_dir() {
@@ -5846,7 +5846,7 @@ impl LiveCli {
         requested_path: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let export_path = resolve_export_path(requested_path, self.runtime.session())?;
-        fs::write(
+        write_atomic(
             &export_path,
             render_export_text(self.runtime.session(), Some(&self.session.path)),
         )?;
@@ -8593,7 +8593,7 @@ fn save_archived_tool_result(
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&destination, &loaded.output)?;
+    write_atomic(&destination, &loaded.output)?;
 
     Ok(format!(
         "Archives\n  Result           wrote archived tool output\n  Message          {}\n  Tool call        {}\n  Tool             {}\n  Source           {}\n  Saved to         {}",
@@ -8877,7 +8877,7 @@ fn run_resume_command(
         }),
         SlashCommand::Export { path } => {
             let export_path = resolve_export_path(path.as_deref(), session)?;
-            fs::write(
+            write_atomic(
                 &export_path,
                 render_export_text(session, Some(session_path)),
             )?;

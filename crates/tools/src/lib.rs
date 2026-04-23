@@ -10,7 +10,7 @@ use api::{
     ApiService, InputContentBlock, InputMessage, MessageRequest, NanoGptClient, OutputContentBlock,
     ToolChoice, ToolDefinition,
 };
-use platform::pebble_config_home;
+use platform::{pebble_config_home, write_atomic};
 use plugins::{PluginManager, PluginManagerConfig, PluginTool};
 use reqwest::blocking::Client;
 use runtime::{
@@ -1782,7 +1782,7 @@ fn execute_todo_write(input: TodoWriteInput) -> Result<TodoWriteOutput, String> 
     if let Some(parent) = store_path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    std::fs::write(&store_path, render_todo_markdown(&persisted))
+    write_atomic(&store_path, render_todo_markdown(&persisted))
         .map_err(|error| error.to_string())?;
 
     let verification_nudge_needed = (all_done
@@ -1989,8 +1989,8 @@ fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
     };
 
     let output_contents = render_agent_output(&manifest);
-    std::fs::write(&output_file, output_contents).map_err(|error| error.to_string())?;
-    std::fs::write(
+    write_atomic(&output_file, output_contents).map_err(|error| error.to_string())?;
+    write_atomic(
         &manifest_file,
         serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?,
     )
@@ -2748,7 +2748,7 @@ fn execute_notebook_edit(input: NotebookEditInput) -> Result<NotebookEditOutput,
 
     let updated_file =
         serde_json::to_string_pretty(&notebook).map_err(|error| error.to_string())?;
-    std::fs::write(&path, &updated_file).map_err(|error| error.to_string())?;
+    write_atomic(&path, &updated_file).map_err(|error| error.to_string())?;
 
     Ok(NotebookEditOutput {
         new_source,
@@ -3162,7 +3162,7 @@ fn write_json_object(path: &Path, value: &serde_json::Map<String, Value>) -> Res
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    std::fs::write(
+    write_atomic(
         path,
         serde_json::to_string_pretty(value).map_err(|error| error.to_string())?,
     )

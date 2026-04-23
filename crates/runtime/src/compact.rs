@@ -3,6 +3,8 @@ use std::cmp;
 use std::fs;
 use std::path::PathBuf;
 
+use platform::write_atomic;
+
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
 const COMPACT_CONTINUATION_PREAMBLE: &str =
@@ -551,7 +553,7 @@ fn archive_tool_result_output(message_id: &str, tool_name: &str, output: &str) -
         sanitize_filename_component(tool_name)
     );
     let absolute_path = archive_dir.join(filename);
-    fs::write(&absolute_path, output).ok()?;
+    write_atomic(&absolute_path, output).ok()?;
 
     Some(
         PathBuf::from(".pebble")

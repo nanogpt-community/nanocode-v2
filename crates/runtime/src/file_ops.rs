@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use glob::Pattern;
+use platform::write_atomic;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
@@ -189,7 +190,7 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&absolute_path, content)?;
+    write_atomic(&absolute_path, content)?;
 
     Ok(WriteFileOutput {
         kind: if original_file.is_some() {
@@ -231,7 +232,7 @@ pub fn edit_file(
     } else {
         original_file.replacen(old_string, new_string, 1)
     };
-    fs::write(&absolute_path, &updated)?;
+    write_atomic(&absolute_path, &updated)?;
 
     Ok(EditFileOutput {
         file_path: absolute_path.to_string_lossy().into_owned(),
@@ -1089,7 +1090,7 @@ fn write_patch_file_state(path: &Path, content: Option<&str>) -> io::Result<()> 
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(path, content)
+            write_atomic(path, content)
         }
         None => fs::remove_file(path),
     }

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use platform::write_atomic;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -1094,7 +1095,7 @@ fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<(), PluginErr
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_string_pretty(value)?)?;
+    write_atomic(path, serde_json::to_string_pretty(value)?)?;
     Ok(())
 }
 

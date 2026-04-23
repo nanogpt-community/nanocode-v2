@@ -5,7 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use platform::pebble_config_home;
+use platform::{pebble_config_home, write_atomic};
 use runtime::{compact_session, CompactionConfig, Session};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1017,7 +1017,7 @@ fn scaffold_skill(args: &str, cwd: &Path) -> io::Result<String> {
     let body = format!(
         "# {name}\n\nDescribe when this skill should be used and what it should do.\n\n## Workflow\n\n1. Capture the goal.\n2. Read only the files you need.\n3. Perform the task.\n4. Report the result.\n"
     );
-    fs::write(&skill_file, body)?;
+    write_atomic(&skill_file, body)?;
     Ok(format!(
         "Skills\n  result:  initialized\n  name:    {name}\n  file:    {}",
         skill_file.display()
