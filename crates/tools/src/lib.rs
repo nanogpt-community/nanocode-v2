@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -376,12 +377,12 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "bash",
-            description: "Execute a shell command in the current workspace.",
+            description: "Execute a shell command in the current workspace. The optional timeout is in milliseconds.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "timeout": { "type": "integer", "minimum": 1 },
+                    "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in milliseconds." },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" },
                     "dangerouslyDisableSandbox": { "type": "boolean" }
@@ -476,7 +477,11 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "pattern": { "type": "string" },
                     "path": { "type": "string" },
                     "glob": { "type": "string" },
-                    "output_mode": { "type": "string" },
+                    "output_mode": {
+                        "type": "string",
+                        "enum": ["files_with_matches", "content", "count"],
+                        "description": "Defaults to files_with_matches. Use content for matching lines (head_limit/offset apply to returned lines) or count for total match count."
+                    },
                     "-B": { "type": "integer", "minimum": 0 },
                     "-A": { "type": "integer", "minimum": 0 },
                     "-C": { "type": "integer", "minimum": 0 },
@@ -718,7 +723,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "code": { "type": "string" },
                     "language": { "type": "string" },
-                    "timeout_ms": { "type": "integer", "minimum": 1 }
+                    "timeout_ms": { "type": "integer", "minimum": 1, "description": "Timeout in milliseconds." }
                 },
                 "required": ["code", "language"],
                 "additionalProperties": false
@@ -727,12 +732,12 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "PowerShell",
-            description: "Execute a PowerShell command with optional timeout.",
+            description: "Execute a PowerShell command. The optional timeout is in milliseconds.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "timeout": { "type": "integer", "minimum": 1 },
+                    "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in milliseconds." },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" }
                 },
@@ -1224,6 +1229,8 @@ struct ReplOutput {
     stderr: String,
     #[serde(rename = "exitCode")]
     exit_code: i32,
+    #[serde(rename = "timedOut")]
+    timed_out: bool,
     #[serde(rename = "durationMs")]
     duration_ms: u128,
 }
@@ -2922,20 +2929,66 @@ fn execute_repl(input: ReplInput) -> Result<ReplOutput, String> {
     if input.code.trim().is_empty() {
         return Err(String::from("code must not be empty"));
     }
-    let _ = input.timeout_ms;
     let runtime = resolve_repl_runtime(&input.language)?;
     let started = Instant::now();
-    let output = Command::new(runtime.program)
+    let mut process = Command::new(runtime.program);
+    process
         .args(runtime.args)
         .arg(&input.code)
-        .output()
-        .map_err(|error| error.to_string())?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if let Some(timeout_ms) = input.timeout_ms {
+        let mut child = process.spawn().map_err(|error| error.to_string())?;
+        loop {
+            if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+                let output = child
+                    .wait_with_output()
+                    .map_err(|error| error.to_string())?;
+                return Ok(ReplOutput {
+                    language: input.language,
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    exit_code: status.code().unwrap_or(1),
+                    timed_out: false,
+                    duration_ms: started.elapsed().as_millis(),
+                });
+            }
+            if started.elapsed() >= Duration::from_millis(timeout_ms) {
+                let _ = child.kill();
+                let output = child
+                    .wait_with_output()
+                    .map_err(|error| error.to_string())?;
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                let stderr = if stderr.trim().is_empty() {
+                    format!("Command exceeded timeout of {timeout_ms} ms")
+                } else {
+                    format!(
+                        "{}\nCommand exceeded timeout of {timeout_ms} ms",
+                        stderr.trim_end()
+                    )
+                };
+                return Ok(ReplOutput {
+                    language: input.language,
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr,
+                    exit_code: output.status.code().unwrap_or(1),
+                    timed_out: true,
+                    duration_ms: started.elapsed().as_millis(),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let output = process.output().map_err(|error| error.to_string())?;
 
     Ok(ReplOutput {
         language: input.language,
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         exit_code: output.status.code().unwrap_or(1),
+        timed_out: false,
         duration_ms: started.elapsed().as_millis(),
     })
 }
@@ -4475,7 +4528,11 @@ mod tests {
         .expect("grep content should succeed");
         let grep_content_output: serde_json::Value =
             serde_json::from_str(&grep_content).expect("json");
-        assert_eq!(grep_content_output["numFiles"], 0);
+        assert_eq!(grep_content_output["numFiles"], 1);
+        assert!(grep_content_output["filenames"][0]
+            .as_str()
+            .expect("filename")
+            .ends_with("nested/lib.rs"));
         assert!(grep_content_output["appliedLimit"].is_null());
         assert_eq!(grep_content_output["appliedOffset"], 1);
         assert!(grep_content_output["content"]
@@ -4633,7 +4690,24 @@ mod tests {
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["language"], "python");
         assert_eq!(output["exitCode"], 0);
+        assert_eq!(output["timedOut"], false);
         assert!(output["stdout"].as_str().expect("stdout").contains('2'));
+    }
+
+    #[test]
+    fn repl_enforces_timeout_ms() {
+        let result = execute_tool(
+            "REPL",
+            &json!({"language": "sh", "code": "sleep 1", "timeout_ms": 50}),
+        )
+        .expect("REPL should return timeout output");
+        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
+        assert_eq!(output["language"], "sh");
+        assert_eq!(output["timedOut"], true);
+        assert!(output["stderr"]
+            .as_str()
+            .expect("stderr")
+            .contains("Command exceeded timeout of 50 ms"));
     }
 
     #[test]

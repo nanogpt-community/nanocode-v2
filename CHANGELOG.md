@@ -1,5 +1,13 @@
 # CHANGELOG (STARTING FROM v0.4.0)
 
+## v0.4.3
+
+- Clarify timeout units in built-in `bash`, `REPL`, and `PowerShell` tool schemas and descriptions so model-facing docs explicitly state milliseconds.
+- Enforce `REPL.timeout_ms` for Python, JavaScript/Node, and shell snippets, returning structured output with `timedOut: true` and `Command exceeded timeout of {timeout_ms} ms` on timeout.
+- Harden `grep_search.output_mode` handling by validating supported modes (`files_with_matches`, `content`, and `count`) and returning a clear invalid-input error for unknown values.
+- Update `grep_search` content-mode pagination so `head_limit` and `offset` apply to returned content lines, with `filenames` and `numFiles` derived from the displayed lines.
+- Add targeted tests for REPL timeout enforcement and grep output-mode/pagination semantics.
+
 ## v0.4.2
 
 - Add repo-aware defaults for native search tools: broad `grep_search` and `glob_search` now skip hidden/project-state directories, respect `.gitignore`, and avoid `.git`, `target`, `.pebble/sessions`, `.pebble/tool-results`, `.pebble/agents`, `.sandbox-home`, and `.sandbox-tmp` unless explicitly targeted.

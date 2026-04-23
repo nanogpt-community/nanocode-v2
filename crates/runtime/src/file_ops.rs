@@ -169,6 +169,43 @@ pub struct GrepSearchOutput {
     pub applied_offset: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrepOutputMode {
+    FilesWithMatches,
+    Content,
+    Count,
+}
+
+impl GrepOutputMode {
+    fn parse(value: Option<&str>) -> io::Result<Self> {
+        match value.unwrap_or("files_with_matches") {
+            "files_with_matches" => Ok(Self::FilesWithMatches),
+            "content" => Ok(Self::Content),
+            "count" => Ok(Self::Count),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unsupported grep_search output_mode `{other}` (expected content, files_with_matches, or count)"
+                ),
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FilesWithMatches => "files_with_matches",
+            Self::Content => "content",
+            Self::Count => "count",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GrepContentLine {
+    file_path: String,
+    rendered: String,
+}
+
 pub fn read_file(
     path: &str,
     offset: Option<usize>,
@@ -449,10 +486,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
         .transpose()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     let file_type = input.file_type.as_deref();
-    let output_mode = input
-        .output_mode
-        .clone()
-        .unwrap_or_else(|| String::from("files_with_matches"));
+    let output_mode = GrepOutputMode::parse(input.output_mode.as_deref())?;
     let context = input.context.or(input.context_short).unwrap_or(0);
 
     let mut filenames = Vec::new();
@@ -468,7 +502,7 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
             continue;
         };
 
-        if output_mode == "count" {
+        if output_mode == GrepOutputMode::Count {
             let count = regex.find_iter(&file_contents).count();
             if count > 0 {
                 filenames.push(file_path.to_string_lossy().into_owned());
@@ -490,51 +524,86 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
             continue;
         }
 
-        filenames.push(file_path.to_string_lossy().into_owned());
-        if output_mode == "content" {
+        let file_path = file_path.to_string_lossy().into_owned();
+        filenames.push(file_path.clone());
+        if output_mode == GrepOutputMode::Content {
             for index in matched_lines {
                 let start = index.saturating_sub(input.before.unwrap_or(context));
                 let end = (index + input.after.unwrap_or(context) + 1).min(lines.len());
                 for (current, line) in lines.iter().enumerate().take(end).skip(start) {
                     let prefix = if input.line_numbers.unwrap_or(true) {
-                        format!("{}:{}:", file_path.to_string_lossy(), current + 1)
+                        format!("{file_path}:{}:", current + 1)
                     } else {
-                        format!("{}:", file_path.to_string_lossy())
+                        format!("{file_path}:")
                     };
-                    content_lines.push(format!("{prefix}{line}"));
+                    content_lines.push(GrepContentLine {
+                        file_path: file_path.clone(),
+                        rendered: format!("{prefix}{line}"),
+                    });
                 }
             }
         }
     }
 
+    if output_mode == GrepOutputMode::Content {
+        return Ok(grep_content_output(
+            output_mode,
+            content_lines,
+            input.head_limit,
+            input.offset,
+        ));
+    }
+
     let (filenames, applied_limit, applied_offset) =
         apply_limit(filenames, input.head_limit, input.offset);
-    let content_output = if output_mode == "content" {
-        let (lines, limit, offset) = apply_limit(content_lines, input.head_limit, input.offset);
-        return Ok(GrepSearchOutput {
-            mode: Some(output_mode),
-            num_files: filenames.len(),
-            filenames,
-            num_lines: Some(lines.len()),
-            content: Some(lines.join("\n")),
-            num_matches: None,
-            applied_limit: limit,
-            applied_offset: offset,
-        });
-    } else {
-        None
-    };
 
     Ok(GrepSearchOutput {
-        mode: Some(output_mode.clone()),
+        mode: Some(output_mode.as_str().to_string()),
         num_files: filenames.len(),
         filenames,
-        content: content_output,
+        content: None,
         num_lines: None,
-        num_matches: (output_mode == "count").then_some(total_matches),
+        num_matches: (output_mode == GrepOutputMode::Count).then_some(total_matches),
         applied_limit,
         applied_offset,
     })
+}
+
+fn grep_content_output(
+    output_mode: GrepOutputMode,
+    content_lines: Vec<GrepContentLine>,
+    head_limit: Option<usize>,
+    offset: Option<usize>,
+) -> GrepSearchOutput {
+    let (lines, applied_limit, applied_offset) = apply_limit(content_lines, head_limit, offset);
+    let filenames = unique_grep_content_filenames(&lines);
+    let num_lines = lines.len();
+    let rendered_content = lines
+        .into_iter()
+        .map(|line| line.rendered)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    GrepSearchOutput {
+        mode: Some(output_mode.as_str().to_string()),
+        num_files: filenames.len(),
+        filenames,
+        num_lines: Some(num_lines),
+        content: Some(rendered_content),
+        num_matches: None,
+        applied_limit,
+        applied_offset,
+    }
+}
+
+fn unique_grep_content_filenames(lines: &[GrepContentLine]) -> Vec<String> {
+    let mut filenames = Vec::new();
+    for line in lines {
+        if !filenames.contains(&line.file_path) {
+            filenames.push(line.file_path.clone());
+        }
+    }
+    filenames
 }
 
 fn collect_search_files(base_path: &Path, explicit_path: bool) -> io::Result<Vec<PathBuf>> {
@@ -1924,6 +1993,71 @@ mod tests {
                     &format!("{dir}/explicit.txt"),
                 );
             }
+        });
+    }
+
+    #[test]
+    fn grep_rejects_unknown_output_mode() {
+        with_temp_workspace("grep-invalid-mode", |_| {
+            write_file("demo.txt", "alpha\n").expect("fixture write should succeed");
+
+            let error = grep_search(&grep_input("alpha", None, "bad_mode"))
+                .expect_err("invalid output mode should fail");
+            assert_error_contains(
+                error,
+                "unsupported grep_search output_mode `bad_mode` (expected content, files_with_matches, or count)",
+            );
+        });
+    }
+
+    #[test]
+    fn grep_content_offset_counts_files_from_returned_lines() {
+        with_temp_workspace("grep-content-offset", |workspace| {
+            write_file("a.txt", "alpha one\nalpha two\n").expect("fixture a write");
+            write_file("b.txt", "alpha three\n").expect("fixture b write");
+
+            let mut input = grep_input("alpha", None, "content");
+            input.head_limit = Some(2);
+            input.offset = Some(1);
+            let output = grep_search(&input).expect("content grep should succeed");
+
+            assert_eq!(output.mode.as_deref(), Some("content"));
+            assert_eq!(output.num_lines, Some(2));
+            assert_eq!(output.num_files, 2);
+            assert_eq!(output.applied_offset, Some(1));
+            assert_eq!(output.applied_limit, None);
+            assert_contains_relative_path(&output.filenames, workspace, "a.txt");
+            assert_contains_relative_path(&output.filenames, workspace, "b.txt");
+            let content = output.content.expect("content output should be present");
+            assert!(content.contains("alpha two"));
+            assert!(content.contains("alpha three"));
+            assert!(!content.contains("alpha one"));
+        });
+    }
+
+    #[test]
+    fn grep_count_and_files_with_matches_apply_file_limits() {
+        with_temp_workspace("grep-file-limits", |workspace| {
+            write_file("a.txt", "alpha alpha\n").expect("fixture a write");
+            write_file("b.txt", "alpha\n").expect("fixture b write");
+
+            let count_output = grep_search(&grep_input("alpha", None, "count"))
+                .expect("count grep should succeed");
+            assert_eq!(count_output.mode.as_deref(), Some("count"));
+            assert_eq!(count_output.num_matches, Some(3));
+            assert_contains_relative_path(&count_output.filenames, workspace, "a.txt");
+            assert_contains_relative_path(&count_output.filenames, workspace, "b.txt");
+
+            let mut files_input = grep_input("alpha", None, "files_with_matches");
+            files_input.head_limit = Some(1);
+            files_input.offset = Some(1);
+            let files_output = grep_search(&files_input).expect("files grep should succeed");
+            assert_eq!(files_output.mode.as_deref(), Some("files_with_matches"));
+            assert_eq!(files_output.num_files, 1);
+            assert_eq!(files_output.applied_offset, Some(1));
+            assert_eq!(files_output.applied_limit, None);
+            assert_contains_relative_path(&files_output.filenames, workspace, "b.txt");
+            assert_excludes_relative_path(&files_output.filenames, workspace, "a.txt");
         });
     }
 
