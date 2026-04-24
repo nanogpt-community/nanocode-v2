@@ -79,7 +79,14 @@ pub enum PanelRow {
 /// styling without breaking alignment thanks to [`visible_width`].
 #[must_use]
 pub fn panel(title: &str, rows: &[PanelRow]) -> String {
-    let width = PANEL_WIDTH;
+    panel_with_width(title, rows, PANEL_WIDTH)
+}
+
+/// Build a rounded panel with a caller-selected width. Widths smaller than a
+/// practical minimum are clamped so borders and labels remain readable.
+#[must_use]
+pub fn panel_with_width(title: &str, rows: &[PanelRow], width: usize) -> String {
+    let width = width.max(44);
     let inner = width.saturating_sub(4); // borders + one pad on each side
 
     let mut out = String::new();
@@ -483,6 +490,149 @@ pub fn assistant_lead() -> String {
         "{} {}\n",
         "●".with(palette::BRAND),
         "pebble".bold().with(palette::BRAND),
+    )
+}
+
+/// Render a compact banner for resumed sessions. It avoids repeating the full
+/// welcome card while still orienting the user before the prompt appears.
+#[must_use]
+pub fn resume_banner(info: &ResumeBannerInfo<'_>) -> String {
+    compact_panel(
+        "resumed",
+        &[
+            PanelRow::Field {
+                label: "session".to_string(),
+                value: info.session_id.to_string(),
+            },
+            PanelRow::Field {
+                label: "model".to_string(),
+                value: info.model.to_string(),
+            },
+            PanelRow::Field {
+                label: "mode".to_string(),
+                value: info.collaboration_mode.to_string(),
+            },
+            PanelRow::Field {
+                label: "permissions".to_string(),
+                value: format!(
+                    "{}",
+                    info.permission_mode.to_string().with(palette::PERMISSION)
+                ),
+            },
+            PanelRow::Line(help_hint()),
+        ],
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ResumeBannerInfo<'a> {
+    pub session_id: &'a str,
+    pub model: &'a str,
+    pub collaboration_mode: &'a str,
+    pub permission_mode: &'a str,
+}
+
+/// A narrower panel for command feedback and prompts. These cards are meant
+/// to be glanced at, not studied.
+#[must_use]
+pub fn compact_panel(title: &str, rows: &[PanelRow]) -> String {
+    panel_with_width(title, rows, 60)
+}
+
+/// Render a slightly friendlier status strip with the working directory as an
+/// anchor on the left and dense configuration pills after it.
+#[must_use]
+pub fn prompt_status_line_with_cwd(info: &PromptStatusInfo<'_>, cwd: Option<&str>) -> String {
+    let mut line = String::new();
+    if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
+        let project = cwd.rsplit('/').find(|part| !part.is_empty()).unwrap_or(cwd);
+        line.push_str(&format!(
+            "{} {}  ",
+            "in".with(palette::MUTED),
+            project.bold().with(palette::ACCENT)
+        ));
+    }
+    line.push_str(&prompt_status_line(info));
+    line
+}
+
+/// Render a concise success card for a setting change.
+#[must_use]
+pub fn setting_changed(title: &str, fields: &[(&str, &str)]) -> String {
+    let rows = fields
+        .iter()
+        .map(|(label, value)| PanelRow::Field {
+            label: (*label).to_string(),
+            value: (*value).to_string(),
+        })
+        .collect::<Vec<_>>();
+    compact_panel(&format!("✔ {title}"), &rows)
+}
+
+/// Summary printed at the end of an assistant turn.
+#[must_use]
+pub fn turn_summary(info: &TurnSummaryInfo) -> String {
+    let mut pieces = Vec::new();
+    pieces.push(format!(
+        "{} {}",
+        "steps".with(palette::MUTED),
+        info.iterations
+    ));
+    if info.tool_calls > 0 {
+        pieces.push(format!(
+            "{} {}",
+            "tools".with(palette::MUTED),
+            info.tool_calls.to_string().with(palette::ACCENT)
+        ));
+    }
+    if info.changed_files > 0 {
+        pieces.push(format!(
+            "{} {}",
+            "files".with(palette::MUTED),
+            info.changed_files.to_string().with(palette::WARN)
+        ));
+    }
+    let total_tokens = info
+        .usage
+        .input_tokens
+        .saturating_add(info.usage.output_tokens);
+    if total_tokens > 0 {
+        pieces.push(format!(
+            "{} {}",
+            "tokens".with(palette::MUTED),
+            format_compact_tokens(u64::from(total_tokens)).with(palette::MUTED)
+        ));
+    }
+    format!("{} {}", "✓".with(palette::OK), pieces.join("  "))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TurnSummaryInfo {
+    pub iterations: usize,
+    pub tool_calls: usize,
+    pub changed_files: usize,
+    pub usage: runtime::TokenUsage,
+}
+
+/// Render the current permission request as a clear approval card.
+#[must_use]
+pub fn permission_prompt_header(tool: &str, current: &str, required: &str) -> String {
+    compact_panel(
+        "permission required",
+        &[
+            PanelRow::Field {
+                label: "tool".to_string(),
+                value: tool.to_string(),
+            },
+            PanelRow::Field {
+                label: "current".to_string(),
+                value: current.to_string(),
+            },
+            PanelRow::Field {
+                label: "required".to_string(),
+                value: required.to_string(),
+            },
+        ],
     )
 }
 

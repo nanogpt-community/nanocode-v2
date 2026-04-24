@@ -50,8 +50,33 @@ pub struct ProjectContext {
     pub cwd: PathBuf,
     pub current_date: String,
     pub git_status: Option<String>,
+    pub repository: Option<RepositoryContext>,
     pub instruction_files: Vec<ContextFile>,
     pub memory_files: Vec<ContextFile>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepositoryContext {
+    pub root: PathBuf,
+    pub project_types: Vec<ProjectType>,
+    pub manifests: Vec<PathBuf>,
+    pub important_paths: Vec<PathBuf>,
+    pub recommended_checks: Vec<RecommendedCheck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectType {
+    RustWorkspace,
+    RustPackage,
+    NodePackage,
+    PythonProject,
+    GoModule,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecommendedCheck {
+    pub label: String,
+    pub command: String,
 }
 
 impl ProjectContext {
@@ -62,10 +87,12 @@ impl ProjectContext {
         let cwd = cwd.into();
         let instruction_files = discover_instruction_files(&cwd)?;
         let memory_files = discover_memory_files(&cwd)?;
+        let repository = discover_repository_context(&cwd);
         Ok(Self {
             cwd,
             current_date: current_date.into(),
             git_status: None,
+            repository,
             instruction_files,
             memory_files,
         })
@@ -280,6 +307,178 @@ fn read_git_status(cwd: &Path) -> Option<String> {
     }
 }
 
+fn discover_repository_context(cwd: &Path) -> Option<RepositoryContext> {
+    let root = discover_repository_root(cwd)?;
+    let mut context = RepositoryContext {
+        root: root.clone(),
+        ..RepositoryContext::default()
+    };
+
+    let cargo_toml = root.join("Cargo.toml");
+    if cargo_toml.is_file() {
+        push_unique_path(&mut context.manifests, cargo_toml.clone());
+        let manifest = fs::read_to_string(&cargo_toml).unwrap_or_default();
+        if manifest.contains("[workspace]") {
+            push_unique_project_type(&mut context.project_types, ProjectType::RustWorkspace);
+            context.recommended_checks.extend([
+                RecommendedCheck::new("Format Rust workspace", "cargo fmt --all"),
+                RecommendedCheck::new("Build/check Rust workspace", "cargo check --workspace"),
+                RecommendedCheck::new("Run Rust workspace tests", "cargo test --workspace"),
+                RecommendedCheck::new("Run Rust lints", "cargo clippy --workspace"),
+            ]);
+        } else {
+            push_unique_project_type(&mut context.project_types, ProjectType::RustPackage);
+            context.recommended_checks.extend([
+                RecommendedCheck::new("Format Rust package", "cargo fmt"),
+                RecommendedCheck::new("Build/check Rust package", "cargo check"),
+                RecommendedCheck::new("Run Rust package tests", "cargo test"),
+                RecommendedCheck::new("Run Rust lints", "cargo clippy"),
+            ]);
+        }
+    }
+
+    if root.join("package.json").is_file() {
+        push_unique_project_type(&mut context.project_types, ProjectType::NodePackage);
+        push_unique_path(&mut context.manifests, root.join("package.json"));
+        for (label, script) in discover_package_json_scripts(&root.join("package.json")) {
+            context
+                .recommended_checks
+                .push(RecommendedCheck::new(label, format!("npm run {script}")));
+        }
+    }
+
+    for manifest in ["pyproject.toml", "setup.py", "requirements.txt"] {
+        let path = root.join(manifest);
+        if path.is_file() {
+            push_unique_project_type(&mut context.project_types, ProjectType::PythonProject);
+            push_unique_path(&mut context.manifests, path);
+        }
+    }
+    if context.project_types.contains(&ProjectType::PythonProject) {
+        context.recommended_checks.extend([
+            RecommendedCheck::new("Run Python tests", "pytest"),
+            RecommendedCheck::new("Run Python lints", "ruff check ."),
+        ]);
+    }
+
+    if root.join("go.mod").is_file() {
+        push_unique_project_type(&mut context.project_types, ProjectType::GoModule);
+        push_unique_path(&mut context.manifests, root.join("go.mod"));
+        context.recommended_checks.extend([
+            RecommendedCheck::new("Format Go module", "gofmt -w ."),
+            RecommendedCheck::new("Run Go tests", "go test ./..."),
+        ]);
+    }
+
+    for important in [
+        ".github/workflows",
+        "crates",
+        "src",
+        "tests",
+        "apps",
+        "packages",
+        "cmd",
+    ] {
+        let path = root.join(important);
+        if path.exists() {
+            push_unique_path(&mut context.important_paths, path);
+        }
+    }
+
+    dedupe_checks(&mut context.recommended_checks);
+    if context.project_types.is_empty() && context.manifests.is_empty() {
+        None
+    } else {
+        Some(context)
+    }
+}
+
+impl RecommendedCheck {
+    fn new(label: impl Into<String>, command: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            command: command.into(),
+        }
+    }
+}
+
+fn discover_repository_root(cwd: &Path) -> Option<PathBuf> {
+    let git_root = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|stdout| PathBuf::from(stdout.trim()))
+        .filter(|path| !path.as_os_str().is_empty());
+    if git_root.is_some() {
+        return git_root;
+    }
+
+    cwd.ancestors().find_map(|dir| {
+        [
+            "Cargo.toml",
+            "package.json",
+            "pyproject.toml",
+            "setup.py",
+            "requirements.txt",
+            "go.mod",
+        ]
+        .iter()
+        .any(|manifest| dir.join(manifest).is_file())
+        .then(|| dir.to_path_buf())
+    })
+}
+
+fn discover_package_json_scripts(path: &Path) -> Vec<(&'static str, &'static str)> {
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Vec::new();
+    };
+    let Some(scripts) = json.get("scripts").and_then(|value| value.as_object()) else {
+        return Vec::new();
+    };
+
+    [
+        ("Format Node package", "format"),
+        ("Run Node lints", "lint"),
+        ("Typecheck Node package", "typecheck"),
+        ("Run Node tests", "test"),
+        ("Build Node package", "build"),
+    ]
+    .into_iter()
+    .filter(|(_, script)| scripts.contains_key(*script))
+    .collect()
+}
+
+fn push_unique_project_type(project_types: &mut Vec<ProjectType>, project_type: ProjectType) {
+    if !project_types.contains(&project_type) {
+        project_types.push(project_type);
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.contains(&path) {
+        paths.push(path);
+    }
+}
+
+fn dedupe_checks(checks: &mut Vec<RecommendedCheck>) {
+    let mut deduped = Vec::new();
+    for check in checks.drain(..) {
+        if !deduped
+            .iter()
+            .any(|candidate: &RecommendedCheck| candidate.command == check.command)
+        {
+            deduped.push(check);
+        }
+    }
+    *checks = deduped;
+}
+
 fn render_project_context(project_context: &ProjectContext) -> String {
     let mut lines = vec!["# Project context".to_string()];
     let mut bullets = vec![
@@ -299,12 +498,83 @@ fn render_project_context(project_context: &ProjectContext) -> String {
         ));
     }
     lines.extend(prepend_bullets(bullets));
+    if let Some(repository) = &project_context.repository {
+        lines.push(String::new());
+        lines.push(render_repository_context(repository));
+    }
     if let Some(status) = &project_context.git_status {
         lines.push(String::new());
         lines.push("Git status snapshot:".to_string());
         lines.push(status.clone());
     }
     lines.join("\n")
+}
+
+fn render_repository_context(repository: &RepositoryContext) -> String {
+    let mut lines = vec!["Repository overview:".to_string()];
+    lines.extend(prepend_bullets(vec![format!(
+        "Root: {}",
+        repository.root.display()
+    )]));
+    if !repository.project_types.is_empty() {
+        lines.extend(prepend_bullets(vec![format!(
+            "Detected project types: {}",
+            repository
+                .project_types
+                .iter()
+                .map(ProjectType::label)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )]));
+    }
+    if !repository.manifests.is_empty() {
+        lines.extend(prepend_bullets(vec![format!(
+            "Manifests: {}",
+            render_relative_paths(&repository.manifests, &repository.root).join(", ")
+        )]));
+    }
+    if !repository.important_paths.is_empty() {
+        lines.extend(prepend_bullets(vec![format!(
+            "Important paths: {}",
+            render_relative_paths(&repository.important_paths, &repository.root).join(", ")
+        )]));
+    }
+    if !repository.recommended_checks.is_empty() {
+        lines.push(String::new());
+        lines.push("Recommended checks:".to_string());
+        lines.extend(prepend_bullets(
+            repository
+                .recommended_checks
+                .iter()
+                .map(|check| format!("{}: `{}`", check.label, check.command))
+                .collect(),
+        ));
+    }
+    lines.join("\n")
+}
+
+impl ProjectType {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::RustWorkspace => "Rust workspace",
+            Self::RustPackage => "Rust package",
+            Self::NodePackage => "Node package",
+            Self::PythonProject => "Python project",
+            Self::GoModule => "Go module",
+        }
+    }
+}
+
+fn render_relative_paths(paths: &[PathBuf], root: &Path) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| {
+            path.strip_prefix(root)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        })
+        .collect()
 }
 
 fn render_instruction_files(files: &[ContextFile]) -> String {
@@ -532,8 +802,8 @@ mod tests {
     use super::{
         collapse_blank_lines, display_context_path, normalize_instruction_content,
         render_instruction_content, render_instruction_files, render_memory_files,
-        truncate_instruction_content, ContextFile, ProjectContext, SystemPromptBuilder,
-        SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+        truncate_instruction_content, ContextFile, ProjectContext, ProjectType,
+        SystemPromptBuilder, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
     };
     use crate::{test_env_lock, ConfigLoader};
     use std::fs;
@@ -724,6 +994,78 @@ mod tests {
         assert!(status.contains("## No commits yet on") || status.contains("## "));
         assert!(status.contains("?? PEBBLE.md"));
         assert!(status.contains("?? tracked.txt"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn discovers_rust_workspace_repository_context_and_checks() {
+        let root = temp_dir();
+        let crate_dir = root.join("crates").join("demo");
+        fs::create_dir_all(crate_dir.join("src")).expect("crate src dir");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .expect("write workspace manifest");
+
+        let context =
+            ProjectContext::discover(&crate_dir, "2026-03-31").expect("context should load");
+        let repository = context.repository.expect("repository should be detected");
+
+        assert_eq!(repository.root, root);
+        assert_eq!(repository.project_types, vec![ProjectType::RustWorkspace]);
+        assert_eq!(
+            repository.manifests,
+            vec![repository.root.join("Cargo.toml")]
+        );
+        assert_eq!(
+            repository.important_paths,
+            vec![repository.root.join("crates")]
+        );
+        let commands = repository
+            .recommended_checks
+            .iter()
+            .map(|check| check.command.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commands,
+            vec![
+                "cargo fmt --all",
+                "cargo check --workspace",
+                "cargo test --workspace",
+                "cargo clippy --workspace"
+            ]
+        );
+
+        fs::remove_dir_all(repository.root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn renders_repository_overview_and_recommended_checks() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join("src")).expect("src dir");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("write package manifest");
+
+        let project_context =
+            ProjectContext::discover(&root, "2026-03-31").expect("context should load");
+        let prompt = SystemPromptBuilder::new()
+            .with_project_context(project_context)
+            .render();
+
+        assert!(prompt.contains("Repository overview:"));
+        assert!(prompt.contains("Detected project types: Rust package"));
+        assert!(prompt.contains("Manifests: Cargo.toml"));
+        assert!(prompt.contains("Important paths: src"));
+        assert!(prompt.contains("Recommended checks:"));
+        assert!(prompt.contains("Format Rust package: `cargo fmt`"));
+        assert!(prompt.contains("Build/check Rust package: `cargo check`"));
+        assert!(prompt.contains("Run Rust package tests: `cargo test`"));
+        assert!(prompt.contains("Run Rust lints: `cargo clippy`"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

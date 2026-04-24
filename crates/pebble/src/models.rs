@@ -17,6 +17,7 @@ use platform::{pebble_config_home as resolve_pebble_config_home, write_atomic};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_SYNTHETIC_MODELS_URL: &str = "https://api.synthetic.new/openai/v1/models";
+const DEFAULT_OPENAI_CONTEXT_LENGTH: u64 = 256_000;
 const DEFAULT_VISIBLE_ROWS: usize = 14;
 const AVAILABLE_SERVICES: [ApiService; 4] = [
     ApiService::NanoGpt,
@@ -194,7 +195,10 @@ pub fn context_length_for_model(model: &str) -> Option<u64> {
         }
     }
 
-    let models = fetch_service_models(infer_service_for_model(model)).ok()?;
+    let models = match fetch_service_models(infer_service_for_model(model)) {
+        Ok(models) => models,
+        Err(_) => return default_context_length_for_model(model),
+    };
     let mut state = load_model_state().unwrap_or_default();
     update_model_metadata_cache(
         &mut state,
@@ -207,9 +211,20 @@ pub fn context_length_for_model(model: &str) -> Option<u64> {
         .context_length_by_model
         .get(model)
         .copied()
-        .filter(|value| *value > 0);
+        .filter(|value| *value > 0)
+        .or_else(|| default_context_length_for_model(model));
     let _ = save_model_state(&state);
     resolved
+}
+
+fn default_context_length_for_model(model: &str) -> Option<u64> {
+    let trimmed = model.trim();
+    if infer_service_for_model(trimmed) == ApiService::OpenAiCodex || trimmed.starts_with("openai/")
+    {
+        Some(DEFAULT_OPENAI_CONTEXT_LENGTH)
+    } else {
+        None
+    }
 }
 
 pub fn persist_proxy_tool_calls(enabled: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -534,7 +549,7 @@ fn openai_codex_models() -> Vec<CatalogModel> {
                 "ChatGPT plan-backed Codex model accessed through OpenAI OAuth/device-code authentication."
                     .to_string(),
             ),
-            context_length: None,
+            context_length: Some(DEFAULT_OPENAI_CONTEXT_LENGTH),
             max_output_tokens: None,
             pricing: Some(ModelPricing {
                 prompt: Some(0.0),
@@ -1498,8 +1513,9 @@ mod tests {
     use api::{ApiService, ModelInfo};
 
     use super::{
-        filtered_model_indices, infer_service_for_model, toggle_favorite,
-        update_model_metadata_cache, CatalogModel, ModelState,
+        default_context_length_for_model, filtered_model_indices, infer_service_for_model,
+        openai_codex_models, toggle_favorite, update_model_metadata_cache, CatalogModel,
+        ModelState, DEFAULT_OPENAI_CONTEXT_LENGTH,
     };
 
     #[test]
@@ -1588,6 +1604,31 @@ mod tests {
             state.context_length_by_model.get("openai-codex/gpt-5.4"),
             Some(&393_216)
         );
+    }
+
+    #[test]
+    fn defaults_openai_context_length_to_256k() {
+        assert_eq!(
+            default_context_length_for_model("openai-codex/gpt-5.4"),
+            Some(DEFAULT_OPENAI_CONTEXT_LENGTH)
+        );
+        assert_eq!(
+            default_context_length_for_model("openai/gpt-5.2"),
+            Some(DEFAULT_OPENAI_CONTEXT_LENGTH)
+        );
+        assert_eq!(default_context_length_for_model("anthropic/claude"), None);
+    }
+
+    #[test]
+    fn openai_codex_fallback_catalog_has_default_context_length() {
+        let models = openai_codex_models();
+
+        assert!(models
+            .iter()
+            .any(|model| model.info.id == "openai-codex/gpt-5.4"));
+        assert!(models
+            .iter()
+            .all(|model| { model.info.context_length == Some(DEFAULT_OPENAI_CONTEXT_LENGTH) }));
     }
 
     fn model(id: &str, name: Option<&str>, category: Option<&str>) -> ModelInfo {

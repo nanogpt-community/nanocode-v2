@@ -1517,11 +1517,14 @@ fn handle_model_action(model: Option<String>) -> Result<(), Box<dyn std::error::
         Some(model) => {
             let model = resolve_model_alias(&model).to_string();
             persist_current_model(model.clone())?;
-            println!("Selected model: {model}");
+            println!("{}", ui::setting_changed("model", &[("selected", &model)]));
         }
         None => match open_model_picker()?.selected_model {
-            Some(model) => println!("Selected model: {model}"),
-            None => println!("Model selection cancelled."),
+            Some(model) => println!("{}", ui::setting_changed("model", &[("selected", &model)])),
+            None => println!(
+                "{}",
+                ui::setting_changed("model", &[("result", "selection cancelled")])
+            ),
         },
     }
     Ok(())
@@ -1540,22 +1543,50 @@ fn handle_provider_action(provider: Option<String>) -> Result<(), Box<dyn std::e
     match provider {
         Some(provider) if is_clear_provider_arg(&provider) => {
             persist_provider_for_model(&model, None)?;
-            println!("Cleared provider override for current model: {model}");
+            println!(
+                "{}",
+                ui::setting_changed(
+                    "provider",
+                    &[("model", &model), ("provider", "platform default")],
+                )
+            );
         }
         Some(provider) => {
             validate_provider_for_model(&model, &provider)?;
             persist_provider_for_model(&model, Some(provider.clone()))?;
             println!(
-                "Selected provider override for current model {model}: {provider} (paygo routing enabled)"
+                "{}",
+                ui::setting_changed(
+                    "provider",
+                    &[
+                        ("model", &model),
+                        ("provider", &provider),
+                        ("routing", "paygo routing enabled"),
+                    ],
+                )
             );
         }
         None => match open_provider_picker(&model)?.selected_provider {
             Some(provider) => {
                 println!(
-                    "Selected provider override for current model {model}: {provider} (paygo routing enabled)"
+                    "{}",
+                    ui::setting_changed(
+                        "provider",
+                        &[
+                            ("model", &model),
+                            ("provider", &provider),
+                            ("routing", "paygo routing enabled"),
+                        ],
+                    )
                 )
             }
-            None => println!("Using platform default provider for current model {model}."),
+            None => println!(
+                "{}",
+                ui::setting_changed(
+                    "provider",
+                    &[("model", &model), ("provider", "platform default")],
+                )
+            ),
         },
     }
     Ok(())
@@ -1578,12 +1609,16 @@ fn handle_proxy_action(mode: ProxyCommand) -> Result<(), Box<dyn std::error::Err
         persist_proxy_tool_calls(next)?;
     }
     println!(
-        "Proxy tool-call translation: {}",
-        if next { "enabled" } else { "disabled" }
+        "{}",
+        ui::setting_changed(
+            "proxy tool calls",
+            &[("state", if next { "enabled" } else { "disabled" })],
+        )
     );
     if next {
         println!(
-            "Native tool schemas are disabled; tool use now goes through XML <tool_call> blocks."
+            "{}",
+            ui::dim_note("native tool schemas disabled; XML <tool_call> blocks enabled")
         );
     }
     Ok(())
@@ -1595,7 +1630,10 @@ fn handle_mcp_action(action: McpCommand) -> Result<(), Box<dyn std::error::Error
         McpCommand::Status | McpCommand::Reload => {
             let catalog = load_mcp_catalog(&cwd)?;
             if matches!(action, McpCommand::Reload) {
-                println!("Reloaded MCP config from {}", cwd.display());
+                println!(
+                    "{}",
+                    ui::success_note(&format!("reloaded MCP config from {}", cwd.display()))
+                );
             }
             print_mcp_status(&catalog);
         }
@@ -3132,8 +3170,52 @@ fn resolve_exa_api_key() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn format_resume_report(session_path: &str, message_count: usize, turns: u32) -> String {
-    format!(
-        "Session resumed\n  Session file     {session_path}\n  Messages         {message_count}\n  Turns            {turns}"
+    ui::setting_changed(
+        "session resumed",
+        &[
+            ("file", session_path),
+            ("messages", &message_count.to_string()),
+            ("turns", &turns.to_string()),
+        ],
+    )
+}
+
+fn format_export_report(path: &str, messages: usize) -> String {
+    ui::setting_changed(
+        "export",
+        &[
+            ("result", "wrote transcript"),
+            ("file", path),
+            ("messages", &messages.to_string()),
+        ],
+    )
+}
+
+fn format_compact_report(removed: usize) -> String {
+    ui::setting_changed(
+        "compacted",
+        &[
+            ("result", "session context reduced"),
+            ("messages", &removed.to_string()),
+        ],
+    )
+}
+
+fn format_clear_report(
+    model: &str,
+    collaboration_mode: CollaborationMode,
+    permission_mode: PermissionMode,
+    session_id: &str,
+) -> String {
+    ui::setting_changed(
+        "session cleared",
+        &[
+            ("mode", "fresh session"),
+            ("model", model),
+            ("session mode", collaboration_mode.as_str()),
+            ("permissions", permission_mode.as_str()),
+            ("session", session_id),
+        ],
     )
 }
 
@@ -4333,10 +4415,13 @@ fn render_diff_report() -> Result<String, Box<dyn std::error::Error>> {
     }
 
     if sections.is_empty() {
-        return Ok(
-            "Diff\n  Result           clean working tree\n  Detail           no current changes"
-                .to_string(),
-        );
+        return Ok(ui::setting_changed(
+            "diff",
+            &[
+                ("result", "clean working tree"),
+                ("detail", "no current changes"),
+            ],
+        ));
     }
 
     Ok(format!("Diff\n\n{}", sections.join("\n\n")))
@@ -5047,14 +5132,23 @@ fn run_repl_loop(cli: &mut LiveCli) -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .map(|path| path.display().to_string());
     let provider_label = provider_label_for_service_model(cli.service, &cli.model);
-    let banner = ui::welcome_banner(&ui::BannerInfo {
-        version: VERSION,
-        service: cli.service.display_name(),
-        model: &cli.model,
-        provider: provider_label.as_deref(),
-        permission_mode: cli.permission_mode.as_str(),
-        cwd: cwd_display.as_deref(),
-    });
+    let banner = if cli.runtime.session().messages.is_empty() {
+        ui::welcome_banner(&ui::BannerInfo {
+            version: VERSION,
+            service: cli.service.display_name(),
+            model: &cli.model,
+            provider: provider_label.as_deref(),
+            permission_mode: cli.permission_mode.as_str(),
+            cwd: cwd_display.as_deref(),
+        })
+    } else {
+        ui::resume_banner(&ui::ResumeBannerInfo {
+            session_id: &cli.session.id,
+            model: &cli.model,
+            collaboration_mode: cli.collaboration_mode.as_str(),
+            permission_mode: cli.permission_mode.as_str(),
+        })
+    };
     println!("{banner}");
     println!();
 
@@ -5409,9 +5503,10 @@ impl LiveCli {
             Ok(summary) => {
                 spinner.finish("done", TerminalRenderer::new().color_theme(), &mut stdout)?;
                 let mut session = self.runtime.session().clone();
-                if let Some(snapshot) =
-                    build_turn_snapshot(&cwd, &before_files, before_message_count, &session)
-                {
+                let snapshot =
+                    build_turn_snapshot(&cwd, &before_files, before_message_count, &session);
+                let changed_files = snapshot.as_ref().map_or(0, |snapshot| snapshot.files.len());
+                if let Some(snapshot) = snapshot {
                     append_undo_snapshot(&mut session, snapshot);
                     self.runtime.replace_session(session);
                 }
@@ -5419,6 +5514,15 @@ impl LiveCli {
                 if let Some(event) = summary.auto_compaction {
                     println!("{}", ui::dim_note(&format_auto_compaction_notice(event)));
                 }
+                println!(
+                    "{}",
+                    ui::turn_summary(&ui::TurnSummaryInfo {
+                        iterations: summary.iterations,
+                        tool_calls: collect_tool_uses(&summary).len(),
+                        changed_files,
+                        usage: summary.usage,
+                    })
+                );
                 println!();
                 Ok(())
             }
@@ -5522,7 +5626,7 @@ impl LiveCli {
     /// (mode, reasoning, permissions, provider) take effect immediately.
     fn prompt_status_line(&self) -> String {
         let estimated = self.runtime.estimated_tokens();
-        ui::prompt_status_line(&ui::PromptStatusInfo {
+        let info = ui::PromptStatusInfo {
             model: short_model_name(&self.model),
             permission_mode: self.permission_mode.as_str(),
             collaboration_mode: self.collaboration_mode.as_str(),
@@ -5531,7 +5635,11 @@ impl LiveCli {
             proxy_tool_calls: self.proxy_tool_calls,
             estimated_tokens: (estimated > 0)
                 .then_some(u64::try_from(estimated).unwrap_or(u64::MAX)),
-        })
+        };
+        let cwd = env::current_dir()
+            .ok()
+            .map(|path| path.display().to_string());
+        ui::prompt_status_line_with_cwd(&info, cwd.as_deref())
     }
 
     fn print_status(&self) {
@@ -5579,7 +5687,7 @@ impl LiveCli {
         let removed = result.removed_message_count;
         self.rebuild_runtime(result.compacted_session)?;
         self.persist_session()?;
-        println!("Compacted {removed} messages.");
+        println!("{}", format_compact_report(removed));
         Ok(())
     }
 
@@ -5590,10 +5698,13 @@ impl LiveCli {
         self.model = model.clone();
         self.rebuild_runtime(self.runtime.session().clone())?;
         self.persist_session()?;
-        println!("Switched to service: {}", self.service.display_name());
-        println!("Switched to model: {model}");
+        let service = self.service.display_name().to_string();
+        let mut fields = vec![("service", service.as_str()), ("model", model.as_str())];
         if let Some(provider) = provider_label_for_service_model(self.service, &self.model) {
-            println!("Provider override for current model: {provider}");
+            fields.push(("provider", provider.as_str()));
+            println!("{}", ui::setting_changed("model", &fields));
+        } else {
+            println!("{}", ui::setting_changed("model", &fields));
         }
         Ok(())
     }
@@ -5617,17 +5728,22 @@ impl LiveCli {
         persist_provider_for_model(&self.model, provider)?;
         self.rebuild_runtime(session)?;
         self.persist_session()?;
-        if provider_label == "<platform default>" {
-            println!(
-                "Provider override for current model {}: {}",
-                self.model, provider_label
-            );
+        let routing = if provider_label == "<platform default>" {
+            "platform default"
         } else {
-            println!(
-                "Provider override for current model {}: {} (paygo routing enabled)",
-                self.model, provider_label
-            );
-        }
+            "paygo routing enabled"
+        };
+        println!(
+            "{}",
+            ui::setting_changed(
+                "provider",
+                &[
+                    ("model", self.model.as_str()),
+                    ("provider", provider_label.as_str()),
+                    ("routing", routing),
+                ],
+            )
+        );
         Ok(())
     }
 
@@ -5638,12 +5754,16 @@ impl LiveCli {
         self.rebuild_runtime(session)?;
         self.persist_session()?;
         println!(
-            "Proxy tool-call translation: {}",
-            if enabled { "enabled" } else { "disabled" }
+            "{}",
+            ui::setting_changed(
+                "proxy tool calls",
+                &[("state", if enabled { "enabled" } else { "disabled" })],
+            )
         );
         if enabled {
             println!(
-                "Native tool schemas are disabled; tool use now goes through XML <tool_call> blocks."
+                "{}",
+                ui::dim_note("native tool schemas disabled; XML <tool_call> blocks enabled")
             );
         }
         Ok(())
@@ -5654,7 +5774,7 @@ impl LiveCli {
         self.mcp_catalog = load_mcp_catalog(&env::current_dir()?)?;
         self.rebuild_runtime(session)?;
         self.persist_session()?;
-        println!("Reloaded MCP config.");
+        println!("{}", ui::success_note("reloaded MCP config"));
         self.print_mcp_status();
         Ok(())
     }
@@ -5672,12 +5792,18 @@ impl LiveCli {
         mode: Option<PermissionMode>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(mode) = mode else {
-            println!("Permission mode: {}", self.permission_mode.as_str());
+            println!(
+                "{}",
+                ui::setting_changed("permissions", &[("mode", self.permission_mode.as_str())])
+            );
             return Ok(());
         };
         if mode == self.permission_mode {
             self.persist_runtime_defaults()?;
-            println!("Permission mode: {}", self.permission_mode.as_str());
+            println!(
+                "{}",
+                ui::setting_changed("permissions", &[("mode", self.permission_mode.as_str())])
+            );
             return Ok(());
         }
 
@@ -5685,7 +5811,10 @@ impl LiveCli {
         self.rebuild_runtime(self.runtime.session().clone())?;
         self.persist_runtime_defaults()?;
         self.persist_session()?;
-        println!("Permission mode: {}", self.permission_mode.as_str());
+        println!(
+            "{}",
+            ui::setting_changed("permissions", &[("mode", self.permission_mode.as_str())])
+        );
         Ok(())
     }
 
@@ -5824,7 +5953,14 @@ impl LiveCli {
     fn clear_session(&mut self, confirm: bool) -> Result<(), Box<dyn std::error::Error>> {
         if !confirm {
             println!(
-                "clear: confirmation required; run /clear --confirm to start a fresh session."
+                "{}",
+                ui::setting_changed(
+                    "clear session",
+                    &[
+                        ("result", "confirmation required"),
+                        ("run", "/clear --confirm"),
+                    ],
+                )
             );
             return Ok(());
         }
@@ -5833,11 +5969,13 @@ impl LiveCli {
         self.rebuild_runtime(Session::new())?;
         self.persist_session()?;
         println!(
-            "Session cleared\n  Mode             fresh session\n  Preserved model  {}\n  Session mode     {}\n  Permission mode  {}\n  Session          {}",
-            self.model,
-            self.collaboration_mode.as_str(),
-            self.permission_mode.as_str(),
-            self.session.id,
+            "{}",
+            format_clear_report(
+                &self.model,
+                self.collaboration_mode,
+                self.permission_mode,
+                &self.session.id,
+            )
         );
         Ok(())
     }
@@ -5886,9 +6024,11 @@ impl LiveCli {
             render_export_text(self.runtime.session(), Some(&self.session.path)),
         )?;
         println!(
-            "Export\n  Result           wrote transcript\n  File             {}\n  Messages         {}",
-            export_path.display(),
-            self.runtime.session().messages.len(),
+            "{}",
+            format_export_report(
+                &export_path.display().to_string(),
+                self.runtime.session().messages.len()
+            )
         );
         Ok(())
     }
@@ -5896,7 +6036,10 @@ impl LiveCli {
     fn undo_turn(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let mut session = self.runtime.session().clone();
         let Some(snapshot) = pop_undo_snapshot(&mut session) else {
-            println!("Undo\n  Result           nothing to undo");
+            println!(
+                "{}",
+                ui::setting_changed("undo", &[("result", "nothing to undo")])
+            );
             return Ok(());
         };
         restore_snapshot_files(&env::current_dir()?, &snapshot, SnapshotDirection::Before)?;
@@ -5907,9 +6050,15 @@ impl LiveCli {
         self.runtime.replace_session(session);
         self.persist_session()?;
         println!(
-            "Undo\n  Result           restored previous turn\n  Messages removed {}\n  Files restored   {}",
-            snapshot.messages.len(),
-            snapshot.files.len()
+            "{}",
+            ui::setting_changed(
+                "undo",
+                &[
+                    ("result", "restored previous turn"),
+                    ("messages removed", &snapshot.messages.len().to_string()),
+                    ("files restored", &snapshot.files.len().to_string()),
+                ],
+            )
         );
         Ok(())
     }
@@ -5917,7 +6066,10 @@ impl LiveCli {
     fn redo_turn(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let mut session = self.runtime.session().clone();
         let Some(snapshot) = pop_redo_snapshot(&mut session) else {
-            println!("Redo\n  Result           nothing to redo");
+            println!(
+                "{}",
+                ui::setting_changed("redo", &[("result", "nothing to redo")])
+            );
             return Ok(());
         };
         restore_snapshot_files(&env::current_dir()?, &snapshot, SnapshotDirection::After)?;
@@ -5929,9 +6081,15 @@ impl LiveCli {
         self.runtime.replace_session(session);
         self.persist_session()?;
         println!(
-            "Redo\n  Result           replayed turn\n  Messages restored {}\n  Files restored    {}",
-            snapshot.messages.len(),
-            snapshot.files.len()
+            "{}",
+            ui::setting_changed(
+                "redo",
+                &[
+                    ("result", "replayed turn"),
+                    ("messages restored", &snapshot.messages.len().to_string()),
+                    ("files restored", &snapshot.files.len().to_string()),
+                ],
+            )
         );
         Ok(())
     }
@@ -5978,10 +6136,15 @@ impl LiveCli {
         self.restore_session_runtime(handle.clone(), forked)?;
         self.persist_session()?;
         println!(
-            "Session forked\n  Source           {}\n  Active session   {}\n  File             {}",
-            source_id,
-            handle.id,
-            handle.path.display()
+            "{}",
+            ui::setting_changed(
+                "session forked",
+                &[
+                    ("source", source_id.as_str()),
+                    ("active", handle.id.as_str()),
+                    ("file", &handle.path.display().to_string()),
+                ],
+            )
         );
         Ok(())
     }
@@ -6010,8 +6173,11 @@ impl LiveCli {
         self.runtime.replace_session(session);
         self.persist_session()?;
         println!(
-            "Session renamed\n  Active session   {}\n  Title            {}",
-            self.session.id, title
+            "{}",
+            ui::setting_changed(
+                "session renamed",
+                &[("active", self.session.id.as_str()), ("title", title)],
+            )
         );
         Ok(())
     }
@@ -6055,10 +6221,15 @@ impl LiveCli {
                 self.session = handle;
                 self.persist_session()?;
                 println!(
-                    "Session switched\n  Active session   {}\n  File             {}\n  Messages         {}",
-                    self.session.id,
-                    self.session.path.display(),
-                    message_count,
+                    "{}",
+                    ui::setting_changed(
+                        "session switched",
+                        &[
+                            ("active", self.session.id.as_str()),
+                            ("file", &self.session.path.display().to_string()),
+                            ("messages", &message_count.to_string()),
+                        ],
+                    )
                 );
             }
             Some("timeline") => println!("{}", self.render_timeline()),
@@ -6125,12 +6296,18 @@ fn handle_proxy_runtime_command(
     match mode {
         ProxyCommand::Status => {
             println!(
-                "Proxy tool-call translation: {}",
-                if cli.proxy_tool_calls {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
+                "{}",
+                ui::setting_changed(
+                    "proxy tool calls",
+                    &[(
+                        "state",
+                        if cli.proxy_tool_calls {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                    )],
+                )
             );
             Ok(())
         }
@@ -6191,10 +6368,14 @@ impl CliPermissionPrompter {
 impl PermissionPrompter for CliPermissionPrompter {
     fn decide(&mut self, request: &PermissionRequest) -> PermissionPromptDecision {
         println!();
-        println!("Permission approval required");
-        println!("  Tool             {}", request.tool_name);
-        println!("  Current mode     {}", self.current_mode.as_str());
-        println!("  Required mode    {}", request.required_mode.as_str());
+        println!(
+            "{}",
+            ui::permission_prompt_header(
+                &request.tool_name,
+                self.current_mode.as_str(),
+                request.required_mode.as_str(),
+            )
+        );
         if let Some(preview) = render_permission_diff_preview(request) {
             println!("{preview}");
         } else {
@@ -6203,7 +6384,7 @@ impl PermissionPrompter for CliPermissionPrompter {
                 truncate_for_summary(&request.input, 1_000)
             );
         }
-        print!("Approve this tool call? [y/N]: ");
+        print!("{} ", "Approve? [y/N]".to_string().with(ui::palette::WARN));
         let _ = io::stdout().flush();
 
         let mut response = String::new();
@@ -8208,16 +8389,22 @@ fn reasoning_effort_label(reasoning_effort: Option<ReasoningEffort>) -> &'static
 }
 
 fn format_mode_report(collaboration_mode: CollaborationMode) -> String {
-    format!(
-        "Mode\n  Active mode      {}\n  Toggle           press Tab on an empty prompt or use /mode build|plan",
-        collaboration_mode.as_str()
+    ui::setting_changed(
+        "mode",
+        &[
+            ("active", collaboration_mode.as_str()),
+            ("toggle", "Tab on empty prompt or /mode build|plan"),
+        ],
     )
 }
 
 fn format_mode_switch_report(collaboration_mode: CollaborationMode) -> String {
-    format!(
-        "Mode updated\n  Result           {}\n  Applies to       subsequent requests",
-        collaboration_mode.as_str()
+    ui::setting_changed(
+        "mode updated",
+        &[
+            ("result", collaboration_mode.as_str()),
+            ("applies", "subsequent requests"),
+        ],
     )
 }
 
@@ -8225,10 +8412,13 @@ fn format_reasoning_report(
     configured: Option<ReasoningEffort>,
     effective: Option<ReasoningEffort>,
 ) -> String {
-    format!(
-        "Reasoning\n  Configured       {}\n  Effective        {}\n\nUsage\n  Inspect with     /reasoning\n  Set with         /reasoning default|minimal|low|medium|high|xhigh",
-        reasoning_effort_label(configured),
-        reasoning_effort_label(effective),
+    ui::setting_changed(
+        "reasoning",
+        &[
+            ("configured", reasoning_effort_label(configured)),
+            ("effective", reasoning_effort_label(effective)),
+            ("set", "/reasoning default|minimal|low|medium|high|xhigh"),
+        ],
     )
 }
 
@@ -8236,24 +8426,33 @@ fn format_reasoning_switch_report(
     configured: Option<ReasoningEffort>,
     effective: Option<ReasoningEffort>,
 ) -> String {
-    format!(
-        "Reasoning updated\n  Configured       {}\n  Effective        {}\n  Applies to       subsequent requests",
-        reasoning_effort_label(configured),
-        reasoning_effort_label(effective),
+    ui::setting_changed(
+        "reasoning updated",
+        &[
+            ("configured", reasoning_effort_label(configured)),
+            ("effective", reasoning_effort_label(effective)),
+            ("applies", "subsequent requests"),
+        ],
     )
 }
 
 fn format_fast_mode_report(fast_mode: FastMode) -> String {
-    format!(
-        "Fast Mode\n  Active mode      {}\n\nUsage\n  Inspect with     /fast\n  Toggle with      /fast on or /fast off",
-        fast_mode.as_str()
+    ui::setting_changed(
+        "fast mode",
+        &[
+            ("active", fast_mode.as_str()),
+            ("toggle", "/fast on or /fast off"),
+        ],
     )
 }
 
 fn format_fast_mode_switch_report(fast_mode: FastMode) -> String {
-    format!(
-        "Fast mode updated\n  Result           {}\n  Applies to       subsequent requests",
-        fast_mode.as_str()
+    ui::setting_changed(
+        "fast mode updated",
+        &[
+            ("result", fast_mode.as_str()),
+            ("applies", "subsequent requests"),
+        ],
     )
 }
 
@@ -8436,16 +8635,44 @@ fn render_archived_tool_results_report(
         "show" => render_archived_tool_result_show(session, session_path, target),
         "page" => page_archived_tool_result(session, session_path, target),
         "save" => save_archived_tool_result(session, session_path, target),
-        other => Ok(format!(
-            "Archives\n  Result           unsupported action `{other}`\n  Usage            /archives [list|show <message-id-or-tool-call-id>|page <message-id-or-tool-call-id>|save <message-id-or-tool-call-id> [file]]"
-        )),
+        other => Ok(archive_report(&[
+            ("result", format!("unsupported action `{other}`")),
+            (
+                "usage",
+                "/archives [list|show <id>|page <id>|save <id> [file]]".to_string(),
+            ),
+        ])),
     }
+}
+
+fn archive_report(fields: &[(&str, String)]) -> String {
+    let rows = fields
+        .iter()
+        .map(|(label, value)| ui::PanelRow::Field {
+            label: (*label).to_string(),
+            value: value.clone(),
+        })
+        .collect::<Vec<_>>();
+    ui::compact_panel("archives", &rows)
+}
+
+fn archive_report_with_body(fields: &[(&str, String)], body: &str) -> String {
+    let mut rows = fields
+        .iter()
+        .map(|(label, value)| ui::PanelRow::Field {
+            label: (*label).to_string(),
+            value: value.clone(),
+        })
+        .collect::<Vec<_>>();
+    rows.push(ui::PanelRow::Blank);
+    rows.push(ui::PanelRow::Line(body.to_string()));
+    ui::compact_panel("archives", &rows)
 }
 
 fn render_archived_tool_results_list(session: &Session, session_path: Option<&Path>) -> String {
     let summary = summarize_archived_tool_results(session, session_path);
     if summary.entries.is_empty() {
-        return "Archives\n  Result           no archived tool outputs".to_string();
+        return archive_report(&[("result", "no archived tool outputs".to_string())]);
     }
 
     let mut lines = vec![
@@ -8490,20 +8717,25 @@ fn render_archived_tool_result_show(
     target: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let Some(target) = parse_archived_tool_result_target(target) else {
-        return Ok(
-            "Archives\n  Result           missing target\n  Usage            /archives show <message-id-or-tool-call-id>"
-                .to_string(),
-        );
+        return Ok(archive_report(&[
+            ("result", "missing target".to_string()),
+            (
+                "usage",
+                "/archives show <message-id-or-tool-call-id>".to_string(),
+            ),
+        ]));
     };
 
     match load_archived_tool_result(session, session_path, target) {
-        Ok(loaded) => Ok(format!(
-            "Archives\n  Result           showing archived tool output\n  Message          {}\n  Tool call        {}\n  Tool             {}\n  File             {}\n\n{}",
-            loaded.entry.message_id,
-            loaded.entry.tool_use_id,
-            loaded.entry.tool_name,
-            loaded.resolved_path.display(),
-            loaded.output
+        Ok(loaded) => Ok(archive_report_with_body(
+            &[
+                ("result", "showing archived tool output".to_string()),
+                ("message", loaded.entry.message_id),
+                ("tool call", loaded.entry.tool_use_id),
+                ("tool", loaded.entry.tool_name),
+                ("file", loaded.resolved_path.display().to_string()),
+            ],
+            &loaded.output,
         )),
         Err(report) => Ok(report),
     }
@@ -8515,10 +8747,13 @@ fn page_archived_tool_result(
     target: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let Some(target) = parse_archived_tool_result_target(target) else {
-        return Ok(
-            "Archives\n  Result           missing target\n  Usage            /archives page <message-id-or-tool-call-id>"
-                .to_string(),
-        );
+        return Ok(archive_report(&[
+            ("result", "missing target".to_string()),
+            (
+                "usage",
+                "/archives page <message-id-or-tool-call-id>".to_string(),
+            ),
+        ]));
     };
 
     let loaded = match load_archived_tool_result(session, session_path, target) {
@@ -8527,13 +8762,18 @@ fn page_archived_tool_result(
     };
 
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return Ok(format!(
-            "Archives\n  Result           pager unavailable outside an interactive terminal\n  Message          {}\n  Tool call        {}\n  Tool             {}\n  File             {}\n\n{}",
-            loaded.entry.message_id,
-            loaded.entry.tool_use_id,
-            loaded.entry.tool_name,
-            loaded.resolved_path.display(),
-            loaded.output
+        return Ok(archive_report_with_body(
+            &[
+                (
+                    "result",
+                    "pager unavailable outside an interactive terminal".to_string(),
+                ),
+                ("message", loaded.entry.message_id),
+                ("tool call", loaded.entry.tool_use_id),
+                ("tool", loaded.entry.tool_name),
+                ("file", loaded.resolved_path.display().to_string()),
+            ],
+            &loaded.output,
         ));
     }
 
@@ -8543,13 +8783,15 @@ fn page_archived_tool_result(
         .unwrap_or_else(|| "less -FRX".to_string());
     let mut parts = pager_command.split_whitespace();
     let Some(program) = parts.next() else {
-        return Ok(format!(
-            "Archives\n  Result           pager unavailable\n  Message          {}\n  Tool call        {}\n  Tool             {}\n  File             {}\n\n{}",
-            loaded.entry.message_id,
-            loaded.entry.tool_use_id,
-            loaded.entry.tool_name,
-            loaded.resolved_path.display(),
-            loaded.output
+        return Ok(archive_report_with_body(
+            &[
+                ("result", "pager unavailable".to_string()),
+                ("message", loaded.entry.message_id),
+                ("tool call", loaded.entry.tool_use_id),
+                ("tool", loaded.entry.tool_name),
+                ("file", loaded.resolved_path.display().to_string()),
+            ],
+            &loaded.output,
         ));
     };
     let args = parts.collect::<Vec<_>>();
@@ -8561,13 +8803,15 @@ fn page_archived_tool_result(
     {
         Ok(child) => child,
         Err(_) => {
-            return Ok(format!(
-                "Archives\n  Result           pager unavailable\n  Message          {}\n  Tool call        {}\n  Tool             {}\n  File             {}\n\n{}",
-                loaded.entry.message_id,
-                loaded.entry.tool_use_id,
-                loaded.entry.tool_name,
-                loaded.resolved_path.display(),
-                loaded.output
+            return Ok(archive_report_with_body(
+                &[
+                    ("result", "pager unavailable".to_string()),
+                    ("message", loaded.entry.message_id),
+                    ("tool call", loaded.entry.tool_use_id),
+                    ("tool", loaded.entry.tool_name),
+                    ("file", loaded.resolved_path.display().to_string()),
+                ],
+                &loaded.output,
             ));
         }
     };
@@ -8584,22 +8828,22 @@ fn page_archived_tool_result(
     }
     let status = child.wait()?;
     if !status.success() {
-        return Ok(format!(
-            "Archives\n  Result           pager exited unsuccessfully\n  Message          {}\n  Tool call        {}\n  Tool             {}\n  File             {}",
-            loaded.entry.message_id,
-            loaded.entry.tool_use_id,
-            loaded.entry.tool_name,
-            loaded.resolved_path.display(),
-        ));
+        return Ok(archive_report(&[
+            ("result", "pager exited unsuccessfully".to_string()),
+            ("message", loaded.entry.message_id),
+            ("tool call", loaded.entry.tool_use_id),
+            ("tool", loaded.entry.tool_name),
+            ("file", loaded.resolved_path.display().to_string()),
+        ]));
     }
 
-    Ok(format!(
-        "Archives\n  Result           viewed in pager\n  Message          {}\n  Tool call        {}\n  Tool             {}\n  File             {}",
-        loaded.entry.message_id,
-        loaded.entry.tool_use_id,
-        loaded.entry.tool_name,
-        loaded.resolved_path.display(),
-    ))
+    Ok(archive_report(&[
+        ("result", "viewed in pager".to_string()),
+        ("message", loaded.entry.message_id),
+        ("tool call", loaded.entry.tool_use_id),
+        ("tool", loaded.entry.tool_name),
+        ("file", loaded.resolved_path.display().to_string()),
+    ]))
 }
 
 fn save_archived_tool_result(
@@ -8608,10 +8852,13 @@ fn save_archived_tool_result(
     target: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let Some((target, path)) = parse_archived_tool_result_save_args(target) else {
-        return Ok(
-            "Archives\n  Result           missing target\n  Usage            /archives save <message-id-or-tool-call-id> [file]"
-                .to_string(),
-        );
+        return Ok(archive_report(&[
+            ("result", "missing target".to_string()),
+            (
+                "usage",
+                "/archives save <message-id-or-tool-call-id> [file]".to_string(),
+            ),
+        ]));
     };
 
     let loaded = match load_archived_tool_result(session, session_path, target) {
@@ -8630,14 +8877,14 @@ fn save_archived_tool_result(
     }
     write_atomic(&destination, &loaded.output)?;
 
-    Ok(format!(
-        "Archives\n  Result           wrote archived tool output\n  Message          {}\n  Tool call        {}\n  Tool             {}\n  Source           {}\n  Saved to         {}",
-        loaded.entry.message_id,
-        loaded.entry.tool_use_id,
-        loaded.entry.tool_name,
-        loaded.resolved_path.display(),
-        destination.display(),
-    ))
+    Ok(archive_report(&[
+        ("result", "wrote archived tool output".to_string()),
+        ("message", loaded.entry.message_id),
+        ("tool call", loaded.entry.tool_use_id),
+        ("tool", loaded.entry.tool_name),
+        ("source", loaded.resolved_path.display().to_string()),
+        ("saved to", destination.display().to_string()),
+    ]))
 }
 
 fn resolve_archived_output_path(
@@ -8698,30 +8945,35 @@ fn load_archived_tool_result(
         .into_iter()
         .find(|entry| entry.message_id == target || entry.tool_use_id == target)
     else {
-        return Err(format!(
-            "Archives\n  Result           no archived tool output matched `{target}`"
-        ));
+        return Err(archive_report(&[(
+            "result",
+            format!("no archived tool output matched `{target}`"),
+        )]));
     };
 
     let Some(archived_output_path) = entry.archived_output_path.as_deref() else {
-        return Err(format!(
-            "Archives\n  Result           archived output unavailable\n  Message          {}\n  Tool call        {}\n  Tool             {}",
-            entry.message_id, entry.tool_use_id, entry.tool_name
-        ));
+        return Err(archive_report(&[
+            ("result", "archived output unavailable".to_string()),
+            ("message", entry.message_id),
+            ("tool call", entry.tool_use_id),
+            ("tool", entry.tool_name),
+        ]));
     };
 
     let resolved_path = resolve_archived_output_path(archived_output_path, session_path)
-        .ok_or_else(|| "Archives\n  Result           unable to resolve archive path".to_string())?;
+        .ok_or_else(|| {
+            archive_report(&[("result", "unable to resolve archive path".to_string())])
+        })?;
     let output = match fs::read_to_string(&resolved_path) {
         Ok(output) => output,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(format!(
-                "Archives\n  Result           archive file missing\n  Message          {}\n  Tool call        {}\n  Tool             {}\n  File             {}",
-                entry.message_id,
-                entry.tool_use_id,
-                entry.tool_name,
-                resolved_path.display(),
-            ));
+            return Err(archive_report(&[
+                ("result", "archive file missing".to_string()),
+                ("message", entry.message_id),
+                ("tool call", entry.tool_use_id),
+                ("tool", entry.tool_name),
+                ("file", resolved_path.display().to_string()),
+            ]));
         }
         Err(error) => return Err(error.to_string()),
     };
@@ -8789,12 +9041,22 @@ fn run_resume_command(
             Ok(ResumeCommandOutcome {
                 session: result.compacted_session,
                 message: Some(if skipped {
-                    format!(
-                        "Compact\n  Result           skipped\n  Reason           session below compaction threshold\n  Messages kept    {kept}"
+                    ui::setting_changed(
+                        "compact",
+                        &[
+                            ("result", "skipped"),
+                            ("reason", "session below compaction threshold"),
+                            ("messages kept", &kept.to_string()),
+                        ],
                     )
                 } else {
-                    format!(
-                        "Compact\n  Result           compacted\n  Messages removed {removed}\n  Messages kept    {kept}"
+                    ui::setting_changed(
+                        "compact",
+                        &[
+                            ("result", "compacted"),
+                            ("messages removed", &removed.to_string()),
+                            ("messages kept", &kept.to_string()),
+                        ],
                     )
                 }),
             })
@@ -8812,17 +9074,21 @@ fn run_resume_command(
             if !confirm {
                 return Ok(ResumeCommandOutcome {
                     session: session.clone(),
-                    message: Some(
-                        "clear: confirmation required; rerun with /clear --confirm".to_string(),
-                    ),
+                    message: Some(ui::setting_changed(
+                        "clear session",
+                        &[
+                            ("result", "confirmation required"),
+                            ("run", "/clear --confirm"),
+                        ],
+                    )),
                 });
             }
             let cleared = Session::new();
             Ok(ResumeCommandOutcome {
                 session: cleared,
-                message: Some(format!(
-                    "Cleared resumed session file {}.",
-                    session_path.display()
+                message: Some(ui::setting_changed(
+                    "session cleared",
+                    &[("file", &session_path.display().to_string())],
                 )),
             })
         }
@@ -8921,9 +9187,8 @@ fn run_resume_command(
             )?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(format!(
-                    "Export\n  Result           wrote transcript\n  File             {}\n  Messages         {}",
-                    export_path.display(),
+                message: Some(format_export_report(
+                    &export_path.display().to_string(),
                     session.messages.len(),
                 )),
             })

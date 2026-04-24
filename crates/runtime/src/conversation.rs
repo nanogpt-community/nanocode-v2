@@ -892,6 +892,7 @@ mod tests {
                 cwd: PathBuf::from("/tmp/project"),
                 current_date: "2026-03-31".to_string(),
                 git_status: None,
+                repository: None,
                 instruction_files: Vec::new(),
                 memory_files: Vec::new(),
             })
