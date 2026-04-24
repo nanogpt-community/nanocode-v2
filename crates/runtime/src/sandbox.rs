@@ -1,6 +1,8 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -161,8 +163,8 @@ pub fn resolve_sandbox_status(config: &SandboxConfig, cwd: &Path) -> SandboxStat
 #[must_use]
 pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) -> SandboxStatus {
     let container = detect_container_environment();
-    let namespace_supported = cfg!(target_os = "linux") && command_exists("unshare");
-    let network_supported = namespace_supported;
+    let namespace_supported = linux_namespace_sandbox_supported();
+    let network_supported = linux_network_sandbox_supported();
     let filesystem_active =
         request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off;
     let mut fallback_reasons = Vec::new();
@@ -280,6 +282,56 @@ fn normalize_mounts(mounts: &[String], cwd: &Path) -> Vec<String> {
 fn command_exists(command: &str) -> bool {
     env::var_os("PATH")
         .is_some_and(|paths| env::split_paths(&paths).any(|path| path.join(command).exists()))
+}
+
+fn linux_namespace_sandbox_supported() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        cfg!(target_os = "linux")
+            && unshare_probe(&[
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--ipc",
+                "--pid",
+                "--uts",
+                "--fork",
+                "sh",
+                "-lc",
+                "true",
+            ])
+    })
+}
+
+fn linux_network_sandbox_supported() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        cfg!(target_os = "linux")
+            && unshare_probe(&[
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--ipc",
+                "--pid",
+                "--uts",
+                "--fork",
+                "--net",
+                "sh",
+                "-lc",
+                "true",
+            ])
+    })
+}
+
+fn unshare_probe(args: &[&str]) -> bool {
+    command_exists("unshare")
+        && Command::new("unshare")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
 }
 
 #[cfg(test)]
