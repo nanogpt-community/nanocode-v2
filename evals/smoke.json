@@ -1,0 +1,13 @@
+{
+  "name": "smoke",
+  "cases": [
+    {
+      "id": "direct-answer",
+      "prompt": "Reply exactly with: pebble-smoke-ok",
+      "required_answer_substrings": ["pebble-smoke-ok"],
+      "max_iterations": 1,
+      "max_tool_calls": 0,
+      "max_api_calls": 1
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+[
+  {
+    "description": "MCP docs::search - Search project documentation",
+    "input_schema": {
+      "properties": {
+        "query": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object"
+    },
+    "name": "mcp__docs__search",
+    "required_permission": "DangerFullAccess"
+  }
+]

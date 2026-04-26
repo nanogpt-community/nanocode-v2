@@ -8,6 +8,7 @@
 //! a grab-bag of ad-hoc `println!`s.
 
 use crossterm::style::{Color, Stylize};
+use std::fmt::Write as _;
 
 /// Width of framed panels (banner, status cards, tool-call boxes).
 pub const PANEL_WIDTH: usize = 72;
@@ -276,20 +277,12 @@ pub fn prompt_string() -> String {
 /// so users never have to `/status` to know what they're about to send.
 #[must_use]
 pub fn prompt_status_line(info: &PromptStatusInfo<'_>) -> String {
-    let mut segments = Vec::new();
-
-    segments.push(styled_pill("model", info.model, palette::ACCENT));
-    segments.push(styled_pill("mode", info.collaboration_mode, palette::BRAND));
-    segments.push(styled_pill(
-        "reasoning",
-        info.reasoning_effort,
-        palette::BRAND,
-    ));
-    segments.push(styled_pill(
-        "perms",
-        info.permission_mode,
-        palette::PERMISSION,
-    ));
+    let mut segments = vec![
+        styled_pill("model", info.model, palette::ACCENT),
+        styled_pill("mode", info.collaboration_mode, palette::BRAND),
+        styled_pill("reasoning", info.reasoning_effort, palette::BRAND),
+        styled_pill("perms", info.permission_mode, palette::PERMISSION),
+    ];
     if info.fast_mode {
         segments.push(styled_pill("fast", "on", palette::OK));
     }
@@ -297,11 +290,11 @@ pub fn prompt_status_line(info: &PromptStatusInfo<'_>) -> String {
         segments.push(styled_pill("proxy", "on", palette::INFO));
     }
     if let Some(tokens) = info.estimated_tokens {
-        segments.push(styled_pill(
-            "ctx",
-            &format_compact_tokens(tokens),
-            palette::MUTED,
-        ));
+        let context_value = info.context_window.map_or_else(
+            || format_compact_tokens(tokens),
+            format_context_window_usage,
+        );
+        segments.push(styled_pill("ctx", &context_value, palette::MUTED));
     }
 
     segments.join(" ")
@@ -324,6 +317,28 @@ fn format_compact_tokens(tokens: u64) -> String {
     }
 }
 
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn format_context_window_usage(info: ContextWindowInfo) -> String {
+    let percent = if info.max_tokens == 0 {
+        0.0
+    } else {
+        (info.used_tokens as f64 / info.max_tokens as f64) * 100.0
+    };
+    format!(
+        "{}/{} {:.1}%",
+        format_compact_tokens(info.used_tokens),
+        format_compact_tokens(info.max_tokens),
+        percent
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextWindowInfo {
+    pub used_tokens: u64,
+    pub max_tokens: u64,
+}
+
 /// Inputs for [`prompt_status_line`].
 #[derive(Debug, Clone, Copy)]
 pub struct PromptStatusInfo<'a> {
@@ -334,6 +349,7 @@ pub struct PromptStatusInfo<'a> {
     pub fast_mode: bool,
     pub proxy_tool_calls: bool,
     pub estimated_tokens: Option<u64>,
+    pub context_window: Option<ContextWindowInfo>,
 }
 
 /// Render the header that precedes a tool call in the transcript.
@@ -546,11 +562,12 @@ pub fn prompt_status_line_with_cwd(info: &PromptStatusInfo<'_>, cwd: Option<&str
     let mut line = String::new();
     if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
         let project = cwd.rsplit('/').find(|part| !part.is_empty()).unwrap_or(cwd);
-        line.push_str(&format!(
+        let _ = write!(
+            line,
             "{} {}  ",
             "in".with(palette::MUTED),
             project.bold().with(palette::ACCENT)
-        ));
+        );
     }
     line.push_str(&prompt_status_line(info));
     line
@@ -603,6 +620,13 @@ pub fn turn_summary(info: &TurnSummaryInfo) -> String {
             format_compact_tokens(u64::from(total_tokens)).with(palette::MUTED)
         ));
     }
+    if let Some(context_window) = info.context_window {
+        pieces.push(format!(
+            "{} {}",
+            "ctx".with(palette::MUTED),
+            format_context_window_usage(context_window).with(palette::MUTED)
+        ));
+    }
     format!("{} {}", "✓".with(palette::OK), pieces.join("  "))
 }
 
@@ -612,6 +636,7 @@ pub struct TurnSummaryInfo {
     pub tool_calls: usize,
     pub changed_files: usize,
     pub usage: runtime::TokenUsage,
+    pub context_window: Option<ContextWindowInfo>,
 }
 
 /// Render the current permission request as a clear approval card.
@@ -710,6 +735,10 @@ mod tests {
             fast_mode: true,
             proxy_tool_calls: false,
             estimated_tokens: Some(12_000),
+            context_window: Some(ContextWindowInfo {
+                used_tokens: 12_000,
+                max_tokens: 240_000,
+            }),
         });
         assert!(line.contains("glm-5.1"));
         assert!(line.contains("read-only"));
@@ -717,5 +746,7 @@ mod tests {
         assert!(line.contains("medium"));
         assert!(line.contains("fast"));
         assert!(line.contains("12.0k"));
+        assert!(line.contains("240.0k"));
+        assert!(line.contains("5.0%"));
     }
 }

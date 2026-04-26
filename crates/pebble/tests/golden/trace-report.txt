@@ -1,0 +1,34 @@
+Pebble Trace
+  file crates/pebble/tests/golden/traces/tool-permission.json
+  schema_version 2
+  started_at_unix_ms 1710000000000
+  duration 88ms
+  messages 2 -> 7
+  events api=2 tool=1 permission=1 compaction=1 errors=1
+  totals api=51ms tool=8ms tool_errors=0 denied_permissions=0 peak_estimated_tokens=13001
+  user_input chars=36 sha256=aaaaaaaaaaaa
+    Inspect the repository and read README
+
+  Suggested Eval
+    command pebble eval capture crates/pebble/tests/golden/traces/tool-permission.json --suite evals/regressions.json --name read-file
+    tools read_file
+    perms read_file=allow
+    limits iterations=1 tool_calls=1 api_calls=2
+
+  API Calls
+    #1  iter=0 messages=3 est_tokens=12345 duration=30ms events=5 usage=680
+    #2  iter=1 messages=5 est_tokens=13001 duration=21ms events=3 usage=unknown
+
+  Tool Calls
+    #1  iter=0 read_file id=toolu_read_1 duration=8ms permission=allow status=ok
+        input chars=24 sha256=111111111111 {"path":"README.md"}
+        output chars=45 sha256=999999999999 # Pebble Agentic code harness for local work.
+
+  Permissions
+    iter=0 read_file id=toolu_read_1 outcome=allow reason=workspace read
+
+  Compactions
+    trigger=estimate removed_messages=4 pruned_tool_results=1 estimated_tokens_after=9000
+
+  Errors
+    - recoverable retry after transient API error

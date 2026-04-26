@@ -15,6 +15,7 @@ mod prompt;
 mod remote;
 mod sandbox;
 mod session;
+mod trace;
 mod usage;
 
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
@@ -26,12 +27,13 @@ pub use compact::{
     CompactionResult, PreparedCompaction,
 };
 pub use config::{
-    default_config_home, ConfigEntry, ConfigError, ConfigLoader, ConfigSource,
-    McpClaudeAiProxyServerConfig, McpConfigCollection, McpOAuthConfig, McpRemoteServerConfig,
-    McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpStdioStderrMode, McpTransport,
-    McpWebSocketServerConfig, OAuthConfig, ResolvedPermissionMode, RuntimeCompactionConfig,
-    RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig,
-    ScopedMcpServerConfig, PEBBLE_SETTINGS_SCHEMA_NAME,
+    default_config_home, ConfigCheckIssue, ConfigCheckReport, ConfigEntry, ConfigError,
+    ConfigLoader, ConfigSource, McpClaudeAiProxyServerConfig, McpConfigCollection, McpOAuthConfig,
+    McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig, McpStdioServerConfig,
+    McpStdioStderrMode, McpTransport, McpWebSocketServerConfig, OAuthConfig,
+    ResolvedPermissionMode, RuntimeCompactionConfig, RuntimeConfig, RuntimeFeatureConfig,
+    RuntimeHookConfig, RuntimePluginConfig, RuntimeRetentionConfig, ScopedMcpServerConfig,
+    PEBBLE_SETTINGS_SCHEMA_NAME,
 };
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
@@ -91,6 +93,10 @@ pub use sandbox::{
 pub use session::{
     ContentBlock, ConversationMessage, EditHistoryEntry, EditHistoryFile, MessageRole, Session,
     SessionError, SessionMetadata, SessionTurnSnapshot,
+};
+pub use trace::{
+    ApiCallTrace, CompactionTrace, PermissionTrace, ToolCallTrace, TracePayloadSummary, TurnTrace,
+    LEGACY_TURN_TRACE_SCHEMA_VERSION, TURN_TRACE_SCHEMA_VERSION,
 };
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,

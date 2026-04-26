@@ -39,3 +39,6 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace -- --test-threads=1
+
+      - name: Run harness safety checks
+        run: cargo run -p pebble -- ci check

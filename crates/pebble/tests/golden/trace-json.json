@@ -1,0 +1,113 @@
+{
+  "kind": "trace",
+  "suggested_eval": {
+    "case": {
+      "forbidden_tools": [],
+      "id": "read-file",
+      "max_api_calls": 2,
+      "max_iterations": 1,
+      "max_tool_calls": 1,
+      "prompt": "Inspect the repository and read README",
+      "require_successful_tool": true,
+      "required_answer_substrings": [],
+      "required_permission_outcomes": [
+        {
+          "outcome": "allow",
+          "tool_name": "read_file"
+        }
+      ],
+      "required_tool_sequence": [
+        "read_file"
+      ],
+      "required_tools": [
+        "read_file"
+      ]
+    },
+    "command": "pebble eval capture crates/pebble/tests/golden/traces/tool-permission.json --suite evals/regressions.json --name read-file"
+  },
+  "trace": {
+    "api_calls": [
+      {
+        "duration_ms": 30,
+        "error": null,
+        "iteration": 0,
+        "request_estimated_tokens": 12345,
+        "request_message_count": 3,
+        "result_event_count": 5,
+        "usage": {
+          "cache_creation_input_tokens": 10,
+          "cache_read_input_tokens": 0,
+          "input_tokens": 600,
+          "output_tokens": 70
+        }
+      },
+      {
+        "duration_ms": 21,
+        "error": null,
+        "iteration": 1,
+        "request_estimated_tokens": 13001,
+        "request_message_count": 5,
+        "result_event_count": 3,
+        "usage": null
+      }
+    ],
+    "compactions": [
+      {
+        "estimated_tokens_after": 9000,
+        "pruned_tool_result_count": 1,
+        "removed_message_count": 4,
+        "trigger": "estimate"
+      }
+    ],
+    "duration_ms": 88,
+    "errors": [
+      "recoverable retry after transient API error"
+    ],
+    "final_message_count": 7,
+    "initial_message_count": 2,
+    "permissions": [
+      {
+        "iteration": 0,
+        "outcome": "allow",
+        "reason": "workspace read",
+        "tool_name": "read_file",
+        "tool_use_id": "toolu_read_1"
+      }
+    ],
+    "schema_version": 2,
+    "started_at_unix_ms": 1710000000000,
+    "tool_calls": [
+      {
+        "duration_ms": 8,
+        "effective_input": null,
+        "input": {
+          "chars": 24,
+          "preview": "{\"path\":\"README.md\"}",
+          "redacted": false,
+          "sha256": "1111111111112222222222223333333333334444444444445555555555556666",
+          "truncated": false
+        },
+        "is_error": false,
+        "iteration": 0,
+        "output": {
+          "chars": 45,
+          "preview": "# Pebble\n\nAgentic code harness for local work.",
+          "redacted": false,
+          "sha256": "9999999999998888888888887777777777776666666666665555555555554444",
+          "truncated": false
+        },
+        "permission_outcome": "allow",
+        "tool_name": "read_file",
+        "tool_use_id": "toolu_read_1"
+      }
+    ],
+    "user_input": {
+      "chars": 36,
+      "preview": "Inspect the repository and read README",
+      "redacted": false,
+      "sha256": "aaaaaaaaaaaabbbbbbbbbbbbccccccccccccddddddddddddeeeeeeeeeeeeffffffff",
+      "truncated": false
+    }
+  },
+  "trace_path": "crates/pebble/tests/golden/traces/tool-permission.json"
+}

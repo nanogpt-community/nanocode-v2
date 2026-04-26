@@ -1,0 +1,25 @@
+== read_file ==
+  ⎿ src/main.rs
+    range: lines 10–12 of 120
+
+== bash ==
+  ⎿ ok: 0
+  ⎿ stdout
+    alpha
+    beta
+    gamma
+
+== grep_search ==
+  ⎿ matched: 2 files · 3 matches
+  ⎿ hits
+    src/app.rs:10:context window
+    src/ui.rs:20:context window
+    README.md:3:context window
+
+== apply_patch ==
+  ⎿ mode: apply
+    summary: 2 files changed
+  ⎿ files
+    update   crates/pebble/src/app.rs
+    add      crates/pebble/src/golden_tests.rs
+

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::time::Instant;
 
 use crate::compact::{
     compact_session_with_summary, estimate_session_tokens, prepare_compaction,
@@ -11,6 +12,9 @@ use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
 use crate::session::{ContentBlock, ConversationMessage, Session};
+use crate::trace::{
+    ApiCallTrace, CompactionTrace, PermissionTrace, ToolCallTrace, TracePayloadSummary, TurnTrace,
+};
 use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 200_000;
@@ -95,6 +99,7 @@ pub struct TurnSummary {
     pub iterations: usize,
     pub usage: TokenUsage,
     pub auto_compaction: Option<AutoCompactionEvent>,
+    pub trace: TurnTrace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -271,9 +276,11 @@ where
         user_input: impl Into<String>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
+        let user_input = user_input.into();
+        let mut trace = TurnTrace::start(&user_input, self.session.messages.len());
         self.session
             .messages
-            .push(ConversationMessage::user_text(user_input.into()));
+            .push(ConversationMessage::user_text(user_input));
 
         let mut assistant_messages = Vec::new();
         let mut tool_results = Vec::new();
@@ -293,25 +300,67 @@ where
             let events = loop {
                 if !compacted_for_overflow {
                     if let Some(event) = self.maybe_auto_compact_by_estimate() {
+                        trace
+                            .compactions
+                            .push(self.compaction_trace("estimate", event));
                         auto_compaction_event.merge(event);
                     }
                 }
 
+                let request_message_count = self.session.messages.len();
+                let request_estimated_tokens = self.estimated_tokens();
                 let request = ApiRequest {
                     system_prompt: self.system_prompt.clone(),
                     messages: self.session.messages.clone(),
                 };
+                let started = Instant::now();
 
                 match self.api_client.stream(request) {
-                    Ok(events) => break events,
+                    Ok(events) => {
+                        trace.api_calls.push(ApiCallTrace {
+                            iteration: iterations,
+                            request_message_count,
+                            request_estimated_tokens,
+                            duration_ms: started.elapsed().as_millis(),
+                            result_event_count: Some(events.len()),
+                            usage: usage_from_events(&events),
+                            error: None,
+                        });
+                        break events;
+                    }
                     Err(error) if context_length_exceeded_error(&error) => {
+                        trace.api_calls.push(ApiCallTrace {
+                            iteration: iterations,
+                            request_message_count,
+                            request_estimated_tokens,
+                            duration_ms: started.elapsed().as_millis(),
+                            result_event_count: None,
+                            usage: None,
+                            error: Some(error.to_string()),
+                        });
                         let Some(event) = self.force_compact_for_context_overflow() else {
+                            trace.record_error(error.to_string());
                             return Err(error);
                         };
+                        trace
+                            .compactions
+                            .push(self.compaction_trace("context_overflow", event));
                         compacted_for_overflow = true;
                         auto_compaction_event.merge(event);
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        trace.api_calls.push(ApiCallTrace {
+                            iteration: iterations,
+                            request_message_count,
+                            request_estimated_tokens,
+                            duration_ms: started.elapsed().as_millis(),
+                            result_event_count: None,
+                            usage: None,
+                            error: Some(error.to_string()),
+                        });
+                        trace.record_error(error.to_string());
+                        return Err(error);
+                    }
                 }
             };
             let (assistant_message, usage) = build_assistant_message(events)?;
@@ -394,9 +443,19 @@ where
                         )
                     }
                 };
+                let (permission_label, permission_reason) =
+                    permission_trace_parts(&permission_outcome);
+                trace.permissions.push(PermissionTrace {
+                    iteration: iterations,
+                    tool_use_id: tool_use_id.clone(),
+                    tool_name: tool_name.clone(),
+                    outcome: permission_label.clone(),
+                    reason: permission_reason,
+                });
 
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
+                        let tool_started = Instant::now();
                         let (mut output, mut is_error) =
                             match self.tool_executor.execute(&tool_name, &effective_input) {
                                 Ok(output) => (output, false),
@@ -427,15 +486,37 @@ where
                             output,
                             post_hook_result.is_denied() || post_hook_result.is_cancelled(),
                         );
+                        trace.tool_calls.push(ToolCallTrace {
+                            iteration: iterations,
+                            tool_use_id: tool_use_id.clone(),
+                            tool_name: tool_name.clone(),
+                            input: TracePayloadSummary::from_text(&input),
+                            effective_input: (effective_input != input)
+                                .then(|| TracePayloadSummary::from_text(&effective_input)),
+                            output: TracePayloadSummary::from_text(&output),
+                            duration_ms: tool_started.elapsed().as_millis(),
+                            permission_outcome: permission_label,
+                            is_error,
+                        });
 
                         ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
                     }
-                    PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
-                        tool_use_id,
-                        tool_name,
-                        merge_hook_feedback(pre_hook_result.messages(), reason, true),
-                        true,
-                    ),
+                    PermissionOutcome::Deny { reason } => {
+                        let output = merge_hook_feedback(pre_hook_result.messages(), reason, true);
+                        trace.tool_calls.push(ToolCallTrace {
+                            iteration: iterations,
+                            tool_use_id: tool_use_id.clone(),
+                            tool_name: tool_name.clone(),
+                            input: TracePayloadSummary::from_text(&input),
+                            effective_input: (effective_input != input)
+                                .then(|| TracePayloadSummary::from_text(&effective_input)),
+                            output: TracePayloadSummary::from_text(&output),
+                            duration_ms: 0,
+                            permission_outcome: permission_label,
+                            is_error: true,
+                        });
+                        ConversationMessage::tool_result(tool_use_id, tool_name, output, true)
+                    }
                 };
                 self.session.messages.push(result_message.clone());
                 tool_results.push(result_message);
@@ -444,10 +525,14 @@ where
 
         if auto_compaction_event.is_empty() {
             if let Some(event) = self.maybe_auto_compact(max_turn_input_tokens) {
+                trace
+                    .compactions
+                    .push(self.compaction_trace("usage", event));
                 auto_compaction_event.merge(event);
             }
         }
         let auto_compaction = (!auto_compaction_event.is_empty()).then_some(auto_compaction_event);
+        trace.finish(self.session.messages.len());
 
         Ok(TurnSummary {
             assistant_messages,
@@ -455,6 +540,7 @@ where
             iterations,
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
+            trace,
         })
     }
 
@@ -570,6 +656,19 @@ where
         }
 
         (!event.is_empty()).then_some(event)
+    }
+
+    fn compaction_trace(
+        &self,
+        trigger: impl Into<String>,
+        event: AutoCompactionEvent,
+    ) -> CompactionTrace {
+        CompactionTrace {
+            trigger: trigger.into(),
+            removed_message_count: event.removed_message_count,
+            pruned_tool_result_count: event.pruned_tool_result_count,
+            estimated_tokens_after: self.estimated_tokens(),
+        }
     }
 
     fn apply_configured_compaction_defaults(
@@ -713,6 +812,20 @@ fn build_assistant_message(
         ConversationMessage::assistant_with_usage(blocks, usage),
         usage,
     ))
+}
+
+fn usage_from_events(events: &[AssistantEvent]) -> Option<TokenUsage> {
+    events.iter().find_map(|event| match event {
+        AssistantEvent::Usage(usage) => Some(*usage),
+        _ => None,
+    })
+}
+
+fn permission_trace_parts(outcome: &PermissionOutcome) -> (String, Option<String>) {
+    match outcome {
+        PermissionOutcome::Allow => ("allow".to_string(), None),
+        PermissionOutcome::Deny { reason } => ("deny".to_string(), Some(reason.clone())),
+    }
 }
 
 fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
@@ -916,6 +1029,12 @@ mod tests {
         assert_eq!(runtime.session().messages.len(), 4);
         assert_eq!(summary.usage.output_tokens, 10);
         assert_eq!(summary.auto_compaction, None);
+        assert_eq!(summary.trace.api_calls.len(), 2);
+        assert_eq!(summary.trace.tool_calls.len(), 1);
+        assert_eq!(summary.trace.permissions.len(), 1);
+        assert_eq!(summary.trace.tool_calls[0].tool_name, "add");
+        assert_eq!(summary.trace.tool_calls[0].permission_outcome, "allow");
+        assert!(!summary.trace.tool_calls[0].is_error);
         assert!(matches!(
             runtime.session().messages[1].blocks[1],
             ContentBlock::ToolUse { .. }

@@ -1,5 +1,18 @@
 # CHANGELOG (STARTING FROM v0.4.0)
 
+## v0.4.7
+
+- Add structured turn tracing with redacted API call, tool call, permission, compaction, usage, and context-window metadata, plus trace/replay commands with text and JSON output.
+- Add an eval harness with suite validation, run reports, history indexing, report comparison, failed-case replay, and trace capture into regression suites.
+- Add golden trace regression fixtures for trace rendering, replay output, MCP tool specs, tool previews, and context-window percentage output.
+- Add `pebble ci check` and `pebble ci history` to run local harness safety checks for golden regressions, config validation, eval suite validation, and diagnostics bundle redaction; CI failures can now include per-step stdout/stderr artifacts.
+- Add `pebble release check` as a ship-readiness rollup over git status, Pebble version, latest saved CI/eval reports, config status, golden trace status, diagnostics redaction status, and saved report/artifact paths.
+- Add redacted diagnostics bundles under `.pebble/diagnostics/` with doctor, config, system, session, trace, eval, and MCP status summaries.
+- Add `pebble config check` and `/config check` to validate settings files, map schema/shape errors back to source files, and support JSON output.
+- Add retention settings and garbage collection for generated trace, eval, and CI artifacts.
+- Split the Pebble CLI implementation into focused modules for MCP handling, runtime API streaming, session storage, tool rendering, trace viewing, eval execution, and report formatting.
+- Expand README and GitHub Actions coverage for the new diagnostics, eval, CI, release, trace, replay, and retention workflows.
+
 ## v0.4.4
 
 - Fix CI instability in tools tests by resolving non-Windows bash commands through `/bin/sh` when available, avoiding sensitivity to tests that temporarily mutate `PATH`.

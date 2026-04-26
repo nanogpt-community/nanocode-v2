@@ -1,0 +1,18 @@
+Pebble Replay
+  file crates/pebble/tests/golden/traces/tool-permission.json
+  schema_version 2
+  started_at_unix_ms 1710000000000
+  duration 88ms
+
+  Timeline
+     1. user         input chars=36 sha256=aaaaaaaaaaaa
+        Inspect the repository and read README
+     2. api          iter=0 messages=3 est_tokens=12345 duration=30ms events=5 usage=680
+     3. permission   iter=0 tool=read_file id=toolu_read_1 outcome=allow reason=workspace read
+     4. tool         iter=0 read_file id=toolu_read_1 duration=8ms permission=allow status=ok
+        {"path":"README.md"}
+     5. tool_result  read_file id=toolu_read_1 output_chars=45 sha256=999999999999
+        # Pebble Agentic code harness for local work.
+     6. api          iter=1 messages=5 est_tokens=13001 duration=21ms events=3 usage=unknown
+     7. compaction   trigger=estimate removed_messages=4 pruned_tool_results=1 estimated_tokens_after=9000
+     8. error        recoverable retry after transient API error

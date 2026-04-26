@@ -31,6 +31,27 @@ pub struct ConfigEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigCheckIssue {
+    pub path: Option<PathBuf>,
+    pub field_path: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigCheckReport {
+    pub discovered_entries: Vec<ConfigEntry>,
+    pub loaded_entries: Vec<ConfigEntry>,
+    pub issues: Vec<ConfigCheckIssue>,
+}
+
+impl ConfigCheckReport {
+    #[must_use]
+    pub fn is_ok(&self) -> bool {
+        self.issues.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
     merged: BTreeMap<String, JsonValue>,
     loaded_entries: Vec<ConfigEntry>,
@@ -56,6 +77,7 @@ pub struct RuntimeFeatureConfig {
     permission_mode: Option<ResolvedPermissionMode>,
     sandbox: SandboxConfig,
     compaction: RuntimeCompactionConfig,
+    retention: RuntimeRetentionConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -82,6 +104,29 @@ impl Default for RuntimeCompactionConfig {
             tail_turns: None,
             preserve_recent_tokens: None,
             reserved: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeRetentionConfig {
+    pub trace_days: Option<usize>,
+    pub max_trace_files: Option<usize>,
+    pub eval_days: Option<usize>,
+    pub max_eval_reports: Option<usize>,
+    pub ci_days: Option<usize>,
+    pub max_ci_reports: Option<usize>,
+}
+
+impl Default for RuntimeRetentionConfig {
+    fn default() -> Self {
+        Self {
+            trace_days: Some(30),
+            max_trace_files: Some(1_000),
+            eval_days: Some(90),
+            max_eval_reports: Some(200),
+            ci_days: Some(30),
+            max_ci_reports: Some(100),
         }
     }
 }
@@ -271,6 +316,7 @@ impl ConfigLoader {
             permission_mode: parse_optional_permission_mode(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             compaction: parse_optional_compaction_config(&merged_value)?,
+            retention: parse_optional_retention_config(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -278,6 +324,46 @@ impl ConfigLoader {
             loaded_entries,
             feature_config,
         })
+    }
+
+    #[must_use]
+    pub fn check(&self) -> ConfigCheckReport {
+        let discovered_entries = self.discover();
+        let mut loaded_entries = Vec::new();
+        let mut parsed_entries = Vec::new();
+        let mut issues = Vec::new();
+
+        for entry in &discovered_entries {
+            match read_optional_json_object(&entry.path) {
+                Ok(Some(value)) => {
+                    loaded_entries.push(entry.clone());
+                    parsed_entries.push((entry.clone(), value));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    issues.push(config_check_issue_from_error(
+                        error,
+                        &parsed_entries,
+                        Some(&entry.path),
+                    ));
+                }
+            }
+        }
+
+        if issues.is_empty() {
+            match self.load() {
+                Ok(config) => loaded_entries = config.loaded_entries().to_vec(),
+                Err(error) => {
+                    issues.push(config_check_issue_from_error(error, &parsed_entries, None));
+                }
+            }
+        }
+
+        ConfigCheckReport {
+            discovered_entries,
+            loaded_entries,
+            issues,
+        }
     }
 }
 
@@ -355,6 +441,11 @@ impl RuntimeConfig {
     pub fn compaction(&self) -> RuntimeCompactionConfig {
         self.feature_config.compaction
     }
+
+    #[must_use]
+    pub fn retention(&self) -> RuntimeRetentionConfig {
+        self.feature_config.retention
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -408,6 +499,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn compaction(&self) -> RuntimeCompactionConfig {
         self.compaction
+    }
+
+    #[must_use]
+    pub fn retention(&self) -> RuntimeRetentionConfig {
+        self.retention
     }
 }
 
@@ -537,6 +633,141 @@ fn read_optional_json_object(
         )));
     };
     Ok(Some(object.clone()))
+}
+
+fn config_check_issue_from_error(
+    error: ConfigError,
+    parsed_entries: &[(ConfigEntry, BTreeMap<String, JsonValue>)],
+    default_path: Option<&Path>,
+) -> ConfigCheckIssue {
+    match error {
+        ConfigError::Io(error) => ConfigCheckIssue {
+            path: default_path.map(Path::to_path_buf),
+            field_path: None,
+            message: error.to_string(),
+        },
+        ConfigError::Parse(message) => {
+            config_check_issue_from_parse_message(&message, parsed_entries, default_path)
+        }
+    }
+}
+
+fn config_check_issue_from_parse_message(
+    message: &str,
+    parsed_entries: &[(ConfigEntry, BTreeMap<String, JsonValue>)],
+    default_path: Option<&Path>,
+) -> ConfigCheckIssue {
+    let (explicit_path, mut remainder) = split_explicit_config_path(message, parsed_entries);
+    let mut stripped_path = explicit_path.is_some();
+    let mut path = explicit_path;
+    if path.is_none() {
+        if let Some(default_path) = default_path {
+            let prefix = format!("{}: ", default_path.display());
+            if let Some(stripped) = remainder.strip_prefix(&prefix) {
+                path = Some(default_path.to_path_buf());
+                remainder = stripped;
+                stripped_path = true;
+            }
+        }
+    }
+    let path = path
+        .or_else(|| default_path.map(Path::to_path_buf))
+        .or_else(|| inferred_error_path(message, parsed_entries));
+    let field_path = field_path_from_config_error(remainder);
+    let message = if stripped_path {
+        remainder.to_string()
+    } else {
+        message.to_string()
+    };
+
+    ConfigCheckIssue {
+        path,
+        field_path,
+        message,
+    }
+}
+
+fn split_explicit_config_path<'a>(
+    message: &'a str,
+    parsed_entries: &[(ConfigEntry, BTreeMap<String, JsonValue>)],
+) -> (Option<PathBuf>, &'a str) {
+    let mut entries = parsed_entries
+        .iter()
+        .map(|(entry, _)| entry)
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.path.display().to_string().len()));
+    for entry in entries {
+        let prefix = format!("{}: ", entry.path.display());
+        if let Some(remainder) = message.strip_prefix(&prefix) {
+            return (Some(entry.path.clone()), remainder);
+        }
+    }
+    (None, message)
+}
+
+fn inferred_error_path(
+    message: &str,
+    parsed_entries: &[(ConfigEntry, BTreeMap<String, JsonValue>)],
+) -> Option<PathBuf> {
+    let field_path = field_path_from_config_error(message)?;
+    parsed_entries
+        .iter()
+        .rev()
+        .find(|(_, object)| object_contains_field_path(object, &field_path))
+        .map(|(entry, _)| entry.path.clone())
+}
+
+fn field_path_from_config_error(message: &str) -> Option<String> {
+    let (context, detail) = message.split_once(": ")?;
+    let mut field_path = normalize_config_context(context)?;
+    if let Some(field) = detail
+        .strip_prefix("field ")
+        .and_then(|detail| detail.split_whitespace().next())
+    {
+        field_path = append_config_field(&field_path, field);
+    } else if let Some(entry) = detail
+        .strip_prefix("entry ")
+        .and_then(|detail| detail.split_whitespace().next())
+    {
+        field_path = append_config_field(&field_path, entry);
+    }
+    Some(field_path)
+}
+
+fn normalize_config_context(context: &str) -> Option<String> {
+    let context = context
+        .strip_prefix("merged settings.")
+        .or_else(|| context.strip_prefix("settings."))
+        .or_else(|| context.strip_prefix("merged settings"))
+        .unwrap_or(context)
+        .trim_matches('.');
+    if context.is_empty() || context.contains("top-level settings") {
+        None
+    } else {
+        Some(context.to_string())
+    }
+}
+
+fn append_config_field(context: &str, field: &str) -> String {
+    if context.ends_with(field) {
+        context.to_string()
+    } else {
+        format!("{context}.{field}")
+    }
+}
+
+fn object_contains_field_path(object: &BTreeMap<String, JsonValue>, field_path: &str) -> bool {
+    let mut segments = field_path.split('.');
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    let mut current = object.get(first);
+    for segment in segments {
+        current = current
+            .and_then(JsonValue::as_object)
+            .and_then(|object| object.get(segment));
+    }
+    current.is_some()
 }
 
 fn merge_mcp_servers(
@@ -681,6 +912,41 @@ fn parse_optional_compaction_config(
     )?);
     config.reserved = optional_u32(compaction, "reserved", "merged settings.compaction")?;
     apply_compaction_env_overrides(&mut config);
+    Ok(config)
+}
+
+fn parse_optional_retention_config(
+    root: &JsonValue,
+) -> Result<RuntimeRetentionConfig, ConfigError> {
+    let mut config = RuntimeRetentionConfig::default();
+    let Some(object) = root.as_object() else {
+        return Ok(config);
+    };
+    let Some(retention_value) = object.get("retention") else {
+        return Ok(config);
+    };
+    let retention = expect_object(retention_value, "merged settings.retention")?;
+    config.trace_days = optional_usize(retention, "trace_days", "merged settings.retention")?.or(
+        optional_usize(retention, "traceDays", "merged settings.retention")?,
+    );
+    config.max_trace_files =
+        optional_usize(retention, "max_trace_files", "merged settings.retention")?.or(
+            optional_usize(retention, "maxTraceFiles", "merged settings.retention")?,
+        );
+    config.eval_days = optional_usize(retention, "eval_days", "merged settings.retention")?.or(
+        optional_usize(retention, "evalDays", "merged settings.retention")?,
+    );
+    config.max_eval_reports =
+        optional_usize(retention, "max_eval_reports", "merged settings.retention")?.or(
+            optional_usize(retention, "maxEvalReports", "merged settings.retention")?,
+        );
+    config.ci_days = optional_usize(retention, "ci_days", "merged settings.retention")?.or(
+        optional_usize(retention, "ciDays", "merged settings.retention")?,
+    );
+    config.max_ci_reports =
+        optional_usize(retention, "max_ci_reports", "merged settings.retention")?.or(
+            optional_usize(retention, "maxCiReports", "merged settings.retention")?,
+        );
     Ok(config)
 }
 
@@ -1102,6 +1368,64 @@ mod tests {
     }
 
     #[test]
+    fn config_check_reports_json_shape_errors_with_file_path() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".pebble");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(home.join("settings.json"), "[]").expect("write bad settings");
+
+        let report = ConfigLoader::new(&cwd, &home).check();
+
+        assert!(!report.is_ok());
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(report.issues[0].path, Some(home.join("settings.json")));
+        assert!(report.issues[0]
+            .message
+            .contains("top-level settings value must be a JSON object"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn config_check_maps_merged_field_errors_to_source_file() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".pebble");
+        fs::create_dir_all(cwd.join(".pebble")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"retention":{"traceDays":30}}"#,
+        )
+        .expect("write user settings");
+        fs::write(
+            cwd.join(".pebble").join("settings.local.json"),
+            r#"{"retention":{"traceDays":"soon"}}"#,
+        )
+        .expect("write local settings");
+
+        let report = ConfigLoader::new(&cwd, &home).check();
+
+        assert!(!report.is_ok());
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(
+            report.issues[0].path,
+            Some(cwd.join(".pebble").join("settings.local.json"))
+        );
+        assert_eq!(
+            report.issues[0].field_path.as_deref(),
+            Some("retention.traceDays")
+        );
+        assert!(report.issues[0]
+            .message
+            .contains("field traceDays must be an integer"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn loads_and_merges_pebble_config_files_by_precedence() {
         let root = temp_dir();
         let cwd = root.join("project");
@@ -1235,6 +1559,44 @@ mod tests {
         assert_eq!(compaction.tail_turns, Some(3));
         assert_eq!(compaction.preserve_recent_tokens, Some(1234));
         assert_eq!(compaction.reserved, Some(9000));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn parses_retention_config() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".pebble");
+        fs::create_dir_all(cwd.join(".pebble")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        fs::write(
+            cwd.join(".pebble").join("settings.json"),
+            r#"{
+              "retention": {
+                "traceDays": 7,
+                "maxTraceFiles": 12,
+                "evalDays": 30,
+                "maxEvalReports": 4,
+                "ciDays": 14,
+                "maxCiReports": 8
+              }
+            }"#,
+        )
+        .expect("write project settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        let retention = loaded.retention();
+
+        assert_eq!(retention.trace_days, Some(7));
+        assert_eq!(retention.max_trace_files, Some(12));
+        assert_eq!(retention.eval_days, Some(30));
+        assert_eq!(retention.max_eval_reports, Some(4));
+        assert_eq!(retention.ci_days, Some(14));
+        assert_eq!(retention.max_ci_reports, Some(8));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

@@ -237,9 +237,9 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "config",
         aliases: &[],
         summary: "Inspect Pebble config files or merged sections",
-        argument_hint: Some("[env|hooks|model|plugins]"),
+        argument_hint: Some("[check|env|hooks|model|plugins]"),
         category: SlashCommandCategory::Workspace,
-        detail: "Shows merged runtime config and which config files were loaded.",
+        detail: "Shows merged runtime config, validates settings, and lists which config files were loaded.",
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -1570,7 +1570,7 @@ mod tests {
         assert!(help.contains("aliases: bypass"));
         assert!(help.contains("/clear [--confirm]"));
         assert!(help.contains("/resume [session-id-or-path]"));
-        assert!(help.contains("/config [env|hooks|model|plugins]"));
+        assert!(help.contains("/config [check|env|hooks|model|plugins]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));

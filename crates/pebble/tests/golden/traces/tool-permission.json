@@ -1,0 +1,84 @@
+{
+  "schema_version": 2,
+  "started_at_unix_ms": 1710000000000,
+  "duration_ms": 88,
+  "initial_message_count": 2,
+  "final_message_count": 7,
+  "user_input": {
+    "chars": 36,
+    "sha256": "aaaaaaaaaaaabbbbbbbbbbbbccccccccccccddddddddddddeeeeeeeeeeeeffffffff",
+    "preview": "Inspect the repository and read README",
+    "truncated": false,
+    "redacted": false
+  },
+  "api_calls": [
+    {
+      "iteration": 0,
+      "request_message_count": 3,
+      "request_estimated_tokens": 12345,
+      "duration_ms": 30,
+      "result_event_count": 5,
+      "usage": {
+        "input_tokens": 600,
+        "output_tokens": 70,
+        "cache_creation_input_tokens": 10,
+        "cache_read_input_tokens": 0
+      },
+      "error": null
+    },
+    {
+      "iteration": 1,
+      "request_message_count": 5,
+      "request_estimated_tokens": 13001,
+      "duration_ms": 21,
+      "result_event_count": 3,
+      "usage": null,
+      "error": null
+    }
+  ],
+  "permissions": [
+    {
+      "iteration": 0,
+      "tool_use_id": "toolu_read_1",
+      "tool_name": "read_file",
+      "outcome": "allow",
+      "reason": "workspace read"
+    }
+  ],
+  "tool_calls": [
+    {
+      "iteration": 0,
+      "tool_use_id": "toolu_read_1",
+      "tool_name": "read_file",
+      "input": {
+        "chars": 24,
+        "sha256": "1111111111112222222222223333333333334444444444445555555555556666",
+        "preview": "{\"path\":\"README.md\"}",
+        "truncated": false,
+        "redacted": false
+      },
+      "effective_input": null,
+      "output": {
+        "chars": 45,
+        "sha256": "9999999999998888888888887777777777776666666666665555555555554444",
+        "preview": "# Pebble\n\nAgentic code harness for local work.",
+        "truncated": false,
+        "redacted": false
+      },
+      "duration_ms": 8,
+      "permission_outcome": "allow",
+      "is_error": false
+    }
+  ],
+  "compactions": [
+    {
+      "trigger": "estimate",
+      "removed_message_count": 4,
+      "pruned_tool_result_count": 1,
+      "estimated_tokens_after": 9000
+    }
+  ],
+  "errors": [
+    "recoverable retry after transient API error"
+  ]
+}

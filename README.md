@@ -13,6 +13,7 @@ Pebble is designed around an interactive REPL, local tools, managed sessions, MC
 
 <img width="1571" height="504" alt="CleanShot 2026-04-21 at 21 54 52" src="https://github.com/user-attachments/assets/21eeb498-7f84-4c72-8fc2-718176ddf0ad" />
 
+
 Check the [Changelog](CHANGELOG.md) for update/patch notes
 
 
@@ -139,6 +140,137 @@ pebble "Inspect the current Rust workspace and explain the top-level crates"
 ```bash
 pebble --allowedTools read,glob "Summarize Cargo.toml"
 ```
+
+### Eval suites and traces
+
+Validate a suite without calling a model:
+
+```bash
+pebble eval --check evals/smoke.json
+```
+
+Run a suite and fail the process if any case fails:
+
+```bash
+pebble eval --fail-on-failures evals/smoke.json
+```
+
+Show recent eval trends:
+
+```bash
+pebble eval history
+pebble eval history --suite smoke --model zai-org/glm-5.1
+```
+
+Eval history is rebuilt from `.pebble/evals/*.json` and persisted to
+`.pebble/evals/index.json` after each run.
+
+Replay failed eval cases from a saved report:
+
+```bash
+pebble eval replay .pebble/evals/<report>.json
+pebble eval replay .pebble/evals/<report>.json --case handles-denied-write
+```
+
+Eval replay loads each case's saved trace and shows assertion failures, failure
+categories, final answer preview, artifacts, and the trace timeline.
+
+Trace, replay, eval history, eval compare, and eval replay support `--json` for
+machine-readable diagnostics:
+
+```bash
+pebble trace .pebble/runs/<trace>.json --json
+pebble eval replay .pebble/evals/<report>.json --json
+```
+
+Promote a saved trace into a regression eval:
+
+```bash
+pebble eval capture .pebble/runs/<trace>.json --suite evals/regressions.json --name "handles denied write"
+```
+
+Captured cases use the trace input preview as the prompt and generate
+assertions for required tools, tool order, permission outcomes, API/tool call
+limits, and successful tool usage when present. Existing case IDs are protected
+unless `--force` is passed.
+
+Inspect a saved turn trace:
+
+```bash
+pebble trace .pebble/runs/<trace>.json
+```
+
+Replay a saved trace timeline without calling the model or tools:
+
+```bash
+pebble replay .pebble/runs/<trace>.json
+```
+
+Golden trace regressions protect the trace/replay renderers, JSON reports,
+context-window percentage display, compact tool previews, and MCP tool spec
+projection:
+
+```bash
+cargo test -p pebble golden
+PEBBLE_UPDATE_GOLDENS=1 cargo test -p pebble golden
+```
+
+Use `PEBBLE_UPDATE_GOLDENS=1` only when the output change is intentional.
+
+Trace previews are redacted before persistence and again when loading older
+trace files. Common API keys, bearer tokens, passwords, private keys, and
+credential-bearing URLs are replaced with `[REDACTED]` markers.
+
+Trace and eval report JSON files include a `schema_version` field. Files
+written before schema versioning are treated as version 1 when loaded; newly
+written files use the current schema version.
+
+Prune generated trace and eval artifacts:
+
+```bash
+pebble gc --dry-run
+pebble gc
+```
+
+Retention defaults keep trace JSON files for 30 days or the newest 1000 files,
+eval reports for 90 days or the newest 200 reports, and CI check reports for 30
+days or the newest 100 reports. Override them in `.pebble/settings.json`:
+
+```json
+{
+  "retention": {
+    "traceDays": 14,
+    "maxTraceFiles": 500,
+    "evalDays": 60,
+    "maxEvalReports": 100,
+    "ciDays": 14,
+    "maxCiReports": 50
+  }
+}
+```
+
+Validate settings without starting a REPL:
+
+```bash
+pebble config check
+pebble config check --json
+```
+
+Config checks report malformed JSON, non-object settings files, bad field
+types, unsupported option values, and the settings file/field path responsible
+when Pebble can infer it.
+
+Collect a redacted local support snapshot:
+
+```bash
+pebble doctor bundle
+```
+
+The diagnostics bundle is written under `.pebble/diagnostics/` and includes
+offline doctor checks, config validation, local system metadata, session
+metadata, recent trace/eval summaries, and MCP discovery status. It excludes
+API keys, credentials, raw config contents, full prompts, assistant responses,
+tool inputs, tool outputs, and live API/network probes.
 
 ## Core REPL commands
 
@@ -444,6 +576,33 @@ cargo run -p pebble --
 ```bash
 cargo test --workspace -- --test-threads=1
 ```
+
+CI also runs the agent-harness safety checks that protect user-visible
+diagnostics and regression tooling:
+
+```bash
+cargo run -p pebble -- ci check
+cargo run -p pebble -- ci check --json
+cargo run -p pebble -- ci check --json --save-report
+cargo run -p pebble -- ci history
+cargo run -p pebble -- ci history --json --limit 20
+cargo run -p pebble -- release check
+cargo run -p pebble -- release check --json --save-report
+```
+
+That shared entrypoint runs golden trace regressions, config schema validation,
+eval suite validation, and a diagnostics bundle redaction-contract check.
+`--json` emits step status, durations, and the diagnostics bundle path for
+tooling. `--save-report` writes the final JSON report under `.pebble/ci/` and
+includes the report path in the output. `ci history` summarizes saved reports
+without rerunning the checks. Captured CI failures include a per-step artifact
+path with stdout/stderr logs when available.
+
+`release check` is the ship-readiness rollup. It summarizes the current git
+branch/commit/dirty state, Pebble version, latest saved CI report, latest eval
+history entry, config validation status, golden trace regression status,
+diagnostics redaction status, and paths to saved reports/bundles/artifacts.
+Use `--save-report` to write the JSON rollup under `.pebble/release/`.
 
 ### Project config files
 

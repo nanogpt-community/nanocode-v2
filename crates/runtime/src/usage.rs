@@ -1,4 +1,5 @@
 use crate::session::Session;
+use serde::{Deserialize, Serialize};
 
 const DEFAULT_INPUT_COST_PER_MILLION: f64 = 15.0;
 const DEFAULT_OUTPUT_COST_PER_MILLION: f64 = 75.0;
@@ -25,7 +26,7 @@ impl ModelPricing {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
